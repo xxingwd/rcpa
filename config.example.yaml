@@ -1,0 +1,72 @@
+# Optional example config. RCPA creates data/config.yaml automatically if it is missing.
+# Keep real keys in environment variables or a local, ignored config file.
+
+server:
+  host: 0.0.0.0
+  port: 15000
+  tls:
+    enabled: false
+    cert_file: ''
+    key_file: ''
+
+providers:
+- name: primary-provider
+  protocol: completions
+  base_url: https://api.example.com
+  api_key: ${RCPA_PROVIDER_API_KEY}
+  models:
+  - name: upstream-model-name
+    status: enabled
+    pricing:
+      input_per_1k: 0.0
+      output_per_1k: 0.0
+    aliases:
+    - public-model-name
+  weight: 10
+  max_connections: 100
+  timeout_secs: 300
+  headers: {}
+  api_version: null
+  status: enabled
+  priority: 0
+  group: default
+
+routing:
+  strategy: weighted_round_robin
+  sticky:
+    enabled: true
+    ttl_secs: 300
+  default_model: null
+
+retry:
+  max_attempts: 3
+  initial_backoff_ms: 100
+  max_backoff_ms: 10000
+  retryable_statuses:
+  - 429
+  - 502
+  - 503
+  - 504
+
+cost:
+  currency: USD
+  default_input_per_1k: 0.0
+  default_output_per_1k: 0.0
+  models: {}
+
+admin:
+  token: ${RCPA_ADMIN_TOKEN}
+
+auth:
+  enabled: true
+  keys:
+  - id: local-dev
+    name: local-dev
+    key: ${RCPA_CLIENT_API_KEY}
+    models: []
+    model_aliases: {}
+    status: enabled
+    labels: null
+
+database:
+  path: data/rcpa.db
