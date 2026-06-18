@@ -1,6 +1,6 @@
 [package]
 name = "rcpa"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
 description = "Rust Cloud Proxy API - LLM gateway"
 readme = "README.md"
