@@ -29,11 +29,9 @@ COPY --from=backend-build /app/target/release/rcpa /app/rcpa
 COPY --from=frontend-build /app/frontend/dist /app/frontend/dist
 COPY config.example.yaml /app/config.example.yaml
 
-RUN mkdir -p /data
-
-VOLUME ["/data"]
+RUN mkdir -p /root/.rcpa
 
 EXPOSE 15000
 
 ENTRYPOINT ["/app/rcpa"]
-CMD ["--config", "/data/config.yaml", "--log-level", "info"]
+CMD ["--log-level", "info"]

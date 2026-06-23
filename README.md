@@ -48,11 +48,11 @@ Build and run:
 ```bash
 docker build -t rcpa:local .
 docker run --rm -p 15000:15000 \
-  -v "$PWD/data:/data" \
+  -v "$HOME/.rcpa:/root/.rcpa" \
   rcpa:local
 ```
 
-The image stores runtime files in `/data`: `/data/config.yaml`, `/data/rcpa.db`, and `/data/logs/`. If `/data/config.yaml` is missing, RCPA creates it automatically.
+The image stores runtime files in `/root/.rcpa`: `/root/.rcpa/config.yaml`, `/root/.rcpa/rcpa.db`, and `/root/.rcpa/logs/`. If `/root/.rcpa/config.yaml` is missing, RCPA creates it automatically.
 
 ## Release Layout
 
