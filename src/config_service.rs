@@ -359,7 +359,7 @@ impl ConfigSnapshot {
 fn provider_view(provider: &ProviderConfig) -> ProviderView {
     ProviderView {
         name: provider.name.clone(),
-        adapter: provider.adapter,
+        adapter: provider.effective_adapter(),
         protocols: provider.protocols.clone(),
         base_url: provider.base_url.clone(),
         api_key: provider.api_key.clone(),

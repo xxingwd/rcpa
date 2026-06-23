@@ -291,7 +291,6 @@ mod tests {
     fn streaming_chat_request_includes_usage_option() {
         let provider = OpenAIProvider::new(&ProviderConfig {
             name: "openai".to_string(),
-            adapter: crate::config::ProviderAdapterKind::Openai,
             protocols: vec![crate::config::ProviderProtocol::Completions],
             base_url: "https://api.openai.com".to_string(),
             api_key: "sk-test".to_string(),

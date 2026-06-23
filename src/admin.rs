@@ -9,8 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::config::{
-    AppConfig, AuthKey, ModelPricing, ModelRule, ProviderAdapterKind, ProviderConfig,
-    ProviderProtocol,
+    AppConfig, AuthKey, ModelPricing, ModelRule, ProviderConfig, ProviderProtocol,
 };
 use crate::error::AppError;
 use crate::server::AppState;
@@ -456,7 +455,6 @@ pub async fn get_analytics_totals(
 #[derive(Debug, Deserialize)]
 pub struct CreateProviderPayload {
     pub name: String,
-    pub adapter: ProviderAdapterKind,
     pub protocols: Vec<ProviderProtocol>,
     pub base_url: String,
     pub api_key: String,
@@ -486,7 +484,6 @@ pub async fn create_provider(
 ) -> Result<impl IntoResponse, AppError> {
     check_admin(&state, &headers)?;
     let provider_name = payload.name.clone();
-    let adapter = payload.adapter;
     let protocols = payload.protocols.clone();
     let base_url = payload.base_url.clone();
     let api_key = payload.api_key.clone();
@@ -509,7 +506,6 @@ pub async fn create_provider(
                 .map(|provider| provider.status.clone());
             let provider = ProviderConfig {
                 name: provider_name.clone(),
-                adapter,
                 protocols: protocols.clone(),
                 base_url: base_url.clone(),
                 api_key: api_key.clone(),

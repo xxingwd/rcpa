@@ -501,7 +501,6 @@ mod tests {
     fn test_provider(name: &str) -> ProviderConfig {
         ProviderConfig {
             name: name.to_string(),
-            adapter: crate::config::ProviderAdapterKind::Openai,
             protocols: vec![crate::config::ProviderProtocol::Completions],
             base_url: "https://api.example.com".to_string(),
             api_key: "test-secret".to_string(),

@@ -57,7 +57,7 @@ impl ProviderRegistry {
                 continue;
             }
 
-            let provider: Arc<dyn ProviderAdapter> = match provider_config.adapter {
+            let provider: Arc<dyn ProviderAdapter> = match provider_config.effective_adapter() {
                 ProviderAdapterKind::Openai => {
                     Arc::new(openai::OpenAIProvider::new(provider_config)?)
                 }

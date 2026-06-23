@@ -81,7 +81,6 @@ impl std::fmt::Display for ProviderProtocol {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub name: String,
-    pub adapter: ProviderAdapterKind,
     pub protocols: Vec<ProviderProtocol>,
     pub base_url: String,
     pub api_key: String,
@@ -160,6 +159,14 @@ impl ModelRule {
 impl ProviderConfig {
     pub fn is_enabled(&self) -> bool {
         self.status == "enabled"
+    }
+
+    pub fn effective_adapter(&self) -> ProviderAdapterKind {
+        if self.protocols.contains(&ProviderProtocol::Messages) {
+            ProviderAdapterKind::Anthropic
+        } else {
+            ProviderAdapterKind::Openai
+        }
     }
 
     pub fn supports_protocol(&self, protocol: ProviderProtocol) -> bool {
@@ -718,11 +725,11 @@ fn validate_provider_config(provider: &ProviderConfig) -> anyhow::Result<()> {
                 protocol
             );
         }
-        if !provider.adapter.supports_protocol(*protocol) {
+        if !provider.effective_adapter().supports_protocol(*protocol) {
             anyhow::bail!(
                 "Provider '{}' adapter '{}' does not support protocol '{}'",
                 provider.name,
-                provider.adapter,
+                provider.effective_adapter(),
                 protocol
             );
         }
@@ -789,7 +796,10 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.yaml");
         let config = AppConfig::load(path.to_str().unwrap()).unwrap();
         assert_eq!(config.providers.len(), 1);
-        assert_eq!(config.providers[0].adapter, ProviderAdapterKind::Openai);
+        assert_eq!(
+            config.providers[0].effective_adapter(),
+            ProviderAdapterKind::Openai
+        );
         assert_eq!(
             config.providers[0].protocols,
             vec![ProviderProtocol::Completions]
@@ -943,7 +953,6 @@ mod tests {
     fn test_provider() -> ProviderConfig {
         ProviderConfig {
             name: "primary-provider".into(),
-            adapter: ProviderAdapterKind::Openai,
             protocols: vec![ProviderProtocol::Completions],
             base_url: "https://api.example.com".into(),
             api_key: "test-secret".into(),

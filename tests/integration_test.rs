@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use rcpa::config::{
-    AdminConfig, AppConfig, AuthConfig, AuthKey, CostConfig, ModelRule, ProviderAdapterKind,
+    AdminConfig, AppConfig, AuthConfig, AuthKey, CostConfig, ModelRule,
     ProviderConfig, ProviderProtocol, RetryConfig, RoutingConfig, ServerConfig, StickyConfig,
     TlsConfig,
 };
@@ -237,25 +237,17 @@ fn enabled_model(name: &str) -> ModelRule {
 }
 
 fn provider(name: &str, protocol: &str, base_url: &str, models: Vec<ModelRule>) -> ProviderConfig {
-    provider_with_protocols(
-        name,
-        adapter_for_protocol(protocol),
-        vec![provider_protocol(protocol)],
-        base_url,
-        models,
-    )
+    provider_with_protocols(name, vec![provider_protocol(protocol)], base_url, models)
 }
 
 fn provider_with_protocols(
     name: &str,
-    adapter: ProviderAdapterKind,
     protocols: Vec<ProviderProtocol>,
     base_url: &str,
     models: Vec<ModelRule>,
 ) -> ProviderConfig {
     ProviderConfig {
         name: name.to_string(),
-        adapter,
         protocols,
         base_url: base_url.to_string(),
         api_key: "sk-mock-key".to_string(),
@@ -277,13 +269,6 @@ fn provider_protocol(value: &str) -> ProviderProtocol {
         "responses" => ProviderProtocol::Responses,
         "messages" => ProviderProtocol::Messages,
         other => panic!("unknown provider protocol {other}"),
-    }
-}
-
-fn adapter_for_protocol(value: &str) -> ProviderAdapterKind {
-    match provider_protocol(value) {
-        ProviderProtocol::Completions | ProviderProtocol::Responses => ProviderAdapterKind::Openai,
-        ProviderProtocol::Messages => ProviderAdapterKind::Anthropic,
     }
 }
 
@@ -404,7 +389,6 @@ async fn test_multi_protocol_provider_routes_responses_requests() {
     let mut config = test_config();
     config.providers = vec![provider_with_protocols(
         "openai-multi",
-        ProviderAdapterKind::Openai,
         vec![ProviderProtocol::Completions, ProviderProtocol::Responses],
         &mock_base_url,
         vec![enabled_model("gpt-4o")],
