@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { apiFetch } from '../utils/api';
 import { modelDisplayName } from '../utils/display';
 import { Button } from './ui/button';
@@ -7,6 +7,7 @@ import { Label } from './ui/label';
 import { Card, CardContent, CardHeader, CardTitle } from './ui/card';
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from './ui/table';
 import { Badge } from './ui/badge';
+import { Checkbox } from './ui/checkbox';
 import {
   Dialog,
   DialogContent,
@@ -32,8 +33,26 @@ const emptyModel = {
   aliases: '',
 };
 
+const ADAPTER_OPTIONS = [
+  { value: 'openai', protocols: ['completions', 'responses'] },
+  { value: 'anthropic', protocols: ['messages'] },
+];
+
 function modelNames(provider) {
   return Array.isArray(provider.models) ? provider.models : [];
+}
+
+function adapterProtocols(adapter) {
+  return ADAPTER_OPTIONS.find((option) => option.value === adapter)?.protocols || [];
+}
+
+function normalizeProtocols(adapter, values) {
+  const allowed = adapterProtocols(adapter);
+  const filtered = (Array.isArray(values) ? values : []).filter((value) => allowed.includes(value));
+  if (filtered.length > 0) {
+    return filtered;
+  }
+  return allowed.length > 0 ? [allowed[0]] : [];
 }
 
 export default function ProvidersView({ showToast }) {
@@ -42,7 +61,8 @@ export default function ProvidersView({ showToast }) {
   const [editingProvider, setEditingProvider] = useState(null);
 
   const [name, setName] = useState('');
-  const [protocol, setProtocol] = useState('completions');
+  const [adapter, setAdapter] = useState('openai');
+  const [protocols, setProtocols] = useState(['completions']);
   const [url, setUrl] = useState('');
   const [apiKey, setApiKey] = useState('');
   const [weight, setWeight] = useState(10);
@@ -52,6 +72,8 @@ export default function ProvidersView({ showToast }) {
   const [group, setGroup] = useState('default');
   const [apiVersion, setApiVersion] = useState('');
   const [formModels, setFormModels] = useState([]);
+
+  const availableProtocols = useMemo(() => adapterProtocols(adapter), [adapter]);
 
   const fetchProviders = useCallback(async () => {
     try {
@@ -65,12 +87,15 @@ export default function ProvidersView({ showToast }) {
     }
   }, [showToast]);
 
-  useEffect(() => { fetchProviders(); }, [fetchProviders]);
+  useEffect(() => {
+    fetchProviders();
+  }, [fetchProviders]);
 
   const openCreateModal = () => {
     setEditingProvider(null);
     setName('');
-    setProtocol('completions');
+    setAdapter('openai');
+    setProtocols(['completions']);
     setUrl('');
     setApiKey('');
     setWeight(10);
@@ -84,9 +109,11 @@ export default function ProvidersView({ showToast }) {
   };
 
   const openEditModal = (provider) => {
+    const nextAdapter = provider.adapter || 'openai';
     setEditingProvider(provider);
     setName(provider.name);
-    setProtocol(provider.protocol);
+    setAdapter(nextAdapter);
+    setProtocols(normalizeProtocols(nextAdapter, provider.protocols));
     setUrl(provider.base_url);
     setApiKey(provider.api_key || '');
     setWeight(provider.weight);
@@ -95,37 +122,51 @@ export default function ProvidersView({ showToast }) {
     setPriority(provider.priority);
     setGroup(provider.group);
     setApiVersion(provider.api_version || '');
-    setFormModels(modelNames(provider).map((model) => {
-      return {
-        name: model.name,
-        status: model.status || 'enabled',
-        inputPrice: model.pricing?.input_per_1k?.toString() || '',
-        outputPrice: model.pricing?.output_per_1k?.toString() || '',
-        aliases: Array.isArray(model.aliases) ? model.aliases.join(', ') : '',
-      };
-    }));
+    setFormModels(modelNames(provider).map((model) => ({
+      name: model.name,
+      status: model.status || 'enabled',
+      inputPrice: model.pricing?.input_per_1k?.toString() || '',
+      outputPrice: model.pricing?.output_per_1k?.toString() || '',
+      aliases: Array.isArray(model.aliases) ? model.aliases.join(', ') : '',
+    })));
     setIsModalOpen(true);
   };
 
   const addModelRow = () => setFormModels([...formModels, { ...emptyModel }]);
+
   const removeModelRow = (i) => setFormModels(formModels.filter((_, idx) => idx !== i));
+
   const handleModelChange = (i, field, value) => {
     const next = [...formModels];
     next[i] = { ...next[i], [field]: value };
     setFormModels(next);
   };
 
+  const handleAdapterChange = (value) => {
+    setAdapter(value);
+    setProtocols((current) => normalizeProtocols(value, current));
+  };
+
+  const toggleProtocol = (value, checked) => {
+    setProtocols((current) => {
+      const next = checked
+        ? Array.from(new Set([...current, value]))
+        : current.filter((item) => item !== value);
+      return normalizeProtocols(adapter, next);
+    });
+  };
+
   const buildModelRules = () => formModels
     .map((model) => {
-      const name = model.name.trim();
-      if (!name) return null;
+      const trimmedName = model.name.trim();
+      if (!trimmedName) return null;
       const input = parseFloat(model.inputPrice);
       const output = parseFloat(model.outputPrice);
       const pricing = Number.isFinite(input) && Number.isFinite(output)
         ? { input_per_1k: input, output_per_1k: output }
         : null;
       return {
-        name,
+        name: trimmedName,
         status: model.status || 'enabled',
         pricing,
         aliases: model.aliases.split(',').map((value) => value.trim()).filter(Boolean),
@@ -149,9 +190,16 @@ export default function ProvidersView({ showToast }) {
       return;
     }
 
+    const selectedProtocols = normalizeProtocols(adapter, protocols);
+    if (selectedProtocols.length === 0) {
+      showToast('请至少选择一个协议', 'error');
+      return;
+    }
+
     const payload = {
       name: providerName,
-      protocol,
+      adapter,
+      protocols: selectedProtocols,
       base_url: baseUrl,
       api_key: key,
       models,
@@ -251,7 +299,7 @@ export default function ProvidersView({ showToast }) {
           <TableHeader>
             <TableRow>
               <TableHead>供应商</TableHead>
-              <TableHead>协议</TableHead>
+              <TableHead>适配器 / 协议</TableHead>
               <TableHead>状态</TableHead>
               <TableHead>权重</TableHead>
               <TableHead>并发 / 超时</TableHead>
@@ -266,7 +314,16 @@ export default function ProvidersView({ showToast }) {
                 return (
                   <TableRow key={provider.name}>
                     <TableCell className="font-semibold">{provider.name}</TableCell>
-                    <TableCell><Badge variant="outline" className="font-mono">{provider.protocol}</Badge></TableCell>
+                    <TableCell>
+                      <div className="flex flex-wrap gap-1.5">
+                        <Badge variant="outline" className="font-mono">{provider.adapter}</Badge>
+                        {(provider.protocols || []).map((value) => (
+                          <Badge key={value} variant="secondary" className="font-mono">
+                            {value}
+                          </Badge>
+                        ))}
+                      </div>
+                    </TableCell>
                     <TableCell>
                       <Badge variant={isEnabled ? 'success' : 'destructive'}>
                         {isEnabled ? '启用' : '禁用'}
@@ -334,7 +391,7 @@ export default function ProvidersView({ showToast }) {
               <span>{editingProvider ? '编辑供应商' : '注册新供应商'}</span>
             </DialogTitle>
             <DialogDescription>
-              配置供应商的连接信息、模型列表、模型别名和计费规则。
+              配置供应商的连接信息、协议能力、模型列表、模型别名和计费规则。
             </DialogDescription>
           </DialogHeader>
 
@@ -342,20 +399,35 @@ export default function ProvidersView({ showToast }) {
             <div className="grid grid-cols-2 gap-4">
               <div className="space-y-2">
                 <Label className="text-xs uppercase tracking-wider text-muted-foreground">供应商名称 *</Label>
-                <Input type="text" value={name} onChange={(e) => setName(e.target.value)} placeholder="primary-completions" required disabled={!!editingProvider} />
+                <Input type="text" value={name} onChange={(e) => setName(e.target.value)} placeholder="primary-provider" required disabled={!!editingProvider} />
               </div>
               <div className="space-y-2">
-                <Label className="text-xs uppercase tracking-wider text-muted-foreground">协议 *</Label>
-                <Select value={protocol} onValueChange={setProtocol}>
+                <Label className="text-xs uppercase tracking-wider text-muted-foreground">适配器 *</Label>
+                <Select value={adapter} onValueChange={handleAdapterChange}>
                   <SelectTrigger>
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="completions">completions</SelectItem>
-                    <SelectItem value="responses">responses</SelectItem>
-                    <SelectItem value="messages">messages</SelectItem>
+                    {ADAPTER_OPTIONS.map((option) => (
+                      <SelectItem key={option.value} value={option.value}>{option.value}</SelectItem>
+                    ))}
                   </SelectContent>
                 </Select>
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <Label className="text-xs uppercase tracking-wider text-muted-foreground">协议能力 *</Label>
+              <div className="flex flex-wrap gap-3 rounded-lg border border-border bg-muted/40 p-3">
+                {availableProtocols.map((value) => (
+                  <label key={value} className="flex items-center gap-2 text-sm">
+                    <Checkbox
+                      checked={protocols.includes(value)}
+                      onCheckedChange={(checked) => toggleProtocol(value, checked === true)}
+                    />
+                    <span className="font-mono">{value}</span>
+                  </label>
+                ))}
               </div>
             </div>
 

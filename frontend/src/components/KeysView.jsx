@@ -209,17 +209,20 @@ export default function KeysView({ showToast }) {
   const handleSaveKey = async (e) => {
     e.preventDefault();
     const { allowedModels, modelAliases } = buildKeyModelPayload();
+    const payload = {
+      name: name.trim() || null,
+      allowed_models: editingKey
+        ? allowedModels
+        : (allowedModels.length > 0 ? allowedModels : null),
+      labels: labels.trim() || null,
+      model_aliases: modelAliases,
+    };
 
     try {
       const res = await apiFetch(editingKey ? `/v1/admin/keys/${encodeURIComponent(editingKey.id)}` : '/v1/admin/keys', {
         method: editingKey ? 'PUT' : 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name: name.trim() || null,
-          allowed_models: allowedModels.length > 0 ? allowedModels : null,
-          labels: labels.trim() || null,
-          model_aliases: modelAliases,
-        }),
+        body: JSON.stringify(payload),
       });
       if (res.ok) {
         showToast(editingKey ? 'API 密钥配置已更新' : 'API 密钥生成成功', 'success');

@@ -30,4 +30,4 @@ const Badge = React.forwardRef(({ className, variant, ...props }, ref) => (
 ));
 Badge.displayName = "Badge";
 
-export { Badge, badgeVariants };
+export { Badge };

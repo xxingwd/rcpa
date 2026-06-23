@@ -11,7 +11,7 @@ pub async fn list_models(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
-    let auth_result = auth::authenticate_llm_api_key(&state, &headers)?;
+    let auth_result = auth::authenticate(&state, &headers)?;
 
     let snapshot = state.config_service.snapshot();
     let mut available: BTreeMap<String, String> = BTreeMap::new();

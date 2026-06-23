@@ -13,6 +13,7 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY tests ./tests
+COPY migrations ./migrations
 COPY config.example.yaml ./
 
 RUN cargo build --release

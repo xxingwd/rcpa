@@ -4,11 +4,14 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::config::{AppConfig, AuthKey, ModelPricing, ModelRule, ProviderConfig};
+use crate::config::{
+    AppConfig, AuthKey, ModelPricing, ModelRule, ProviderAdapterKind, ProviderConfig,
+    ProviderProtocol,
+};
 use crate::error::AppError;
 use crate::server::AppState;
 
@@ -35,10 +38,31 @@ pub struct CreateKeyPayload {
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateKeyPayload {
-    pub name: Option<String>,
-    pub labels: Option<String>,
-    pub allowed_models: Option<Vec<KeyModelPayload>>,
-    pub model_aliases: Option<HashMap<String, String>>,
+    #[serde(default, deserialize_with = "deserialize_patch_field")]
+    pub name: PatchField<String>,
+    #[serde(default, deserialize_with = "deserialize_patch_field")]
+    pub labels: PatchField<String>,
+    #[serde(default, deserialize_with = "deserialize_patch_field")]
+    pub allowed_models: PatchField<Vec<KeyModelPayload>>,
+    #[serde(default, deserialize_with = "deserialize_patch_field")]
+    pub model_aliases: PatchField<HashMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub enum PatchField<T> {
+    #[default]
+    Missing,
+    Null,
+    Value(T),
+}
+
+fn deserialize_patch_field<'de, D, T>(deserializer: D) -> Result<PatchField<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+        .map(|value| value.map(PatchField::Value).unwrap_or(PatchField::Null))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -89,16 +113,12 @@ fn ensure_model_name_is_canonical(value: &str, field: &str) -> Result<(), AppErr
     Ok(())
 }
 
-fn available_model_target_names(config: &AppConfig) -> HashSet<String> {
-    config.key_visible_model_names()
-}
-
 fn validate_key_model_config(
     config: &AppConfig,
     allowed_models: &[ModelRule],
     model_aliases: &HashMap<String, String>,
 ) -> Result<(), AppError> {
-    let target_names = available_model_target_names(config);
+    let target_names = config.key_visible_model_names();
     let private_alias_names: HashSet<String> = model_aliases.keys().cloned().collect();
 
     for (alias, target) in model_aliases {
@@ -243,12 +263,16 @@ pub async fn update_key(
         .iter()
         .find(|key| key.id == id)
         .ok_or_else(|| AppError::BadRequest(format!("API key '{}' not found", id)))?;
-    let allowed_models =
-        key_model_payloads_to_rules(payload.allowed_models.clone().unwrap_or_default());
-    let model_aliases = payload
-        .model_aliases
-        .clone()
-        .unwrap_or_else(|| existing_key.model_aliases.clone());
+    let allowed_models = match &payload.allowed_models {
+        PatchField::Value(models) => key_model_payloads_to_rules(models.clone()),
+        PatchField::Null => Vec::new(),
+        PatchField::Missing => existing_key.models.clone(),
+    };
+    let model_aliases = match &payload.model_aliases {
+        PatchField::Value(aliases) => aliases.clone(),
+        PatchField::Null => HashMap::new(),
+        PatchField::Missing => existing_key.model_aliases.clone(),
+    };
     validate_key_model_config(&snapshot.raw_config, &allowed_models, &model_aliases)?;
 
     state
@@ -260,16 +284,22 @@ pub async fn update_key(
                 .iter_mut()
                 .find(|key| key.id == id)
                 .ok_or_else(|| anyhow::anyhow!("API key '{}' not found", id))?;
-            key.name = payload
-                .name
-                .clone()
-                .filter(|value| !value.trim().is_empty());
+            match &payload.name {
+                PatchField::Value(name) => {
+                    key.name = Some(name.clone()).filter(|value| !value.trim().is_empty());
+                }
+                PatchField::Null => key.name = None,
+                PatchField::Missing => {}
+            }
             key.models = allowed_models;
             key.model_aliases = model_aliases;
-            key.labels = payload
-                .labels
-                .clone()
-                .filter(|value| !value.trim().is_empty());
+            match &payload.labels {
+                PatchField::Value(labels) => {
+                    key.labels = Some(labels.clone()).filter(|value| !value.trim().is_empty());
+                }
+                PatchField::Null => key.labels = None,
+                PatchField::Missing => {}
+            }
             Ok(())
         })
         .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -341,19 +371,28 @@ pub struct TimeRangeQuery {
     pub to: Option<String>,
 }
 
+impl TimeRangeQuery {
+    fn resolve_range(&self) -> (String, String) {
+        let from = self
+            .from
+            .clone()
+            .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
+        let to = self
+            .to
+            .clone()
+            .unwrap_or_else(|| "2099-12-31T23:59:59Z".to_string());
+        (from, to)
+    }
+}
+
 pub async fn get_analytics_by_model(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Query(query): Query<TimeRangeQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     check_admin(&state, &headers)?;
-    let from = query
-        .from
-        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
-    let to = query
-        .to
-        .unwrap_or_else(|| "2099-12-31T23:59:59Z".to_string());
-    let data = state.store.aggregate_by_model(&from, &to)?;
+    let (from, to) = query.resolve_range();
+    let data = state.store.aggregate_by_model(&from, &to).await?;
     Ok(Json(data))
 }
 
@@ -363,13 +402,8 @@ pub async fn get_analytics_by_provider(
     Query(query): Query<TimeRangeQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     check_admin(&state, &headers)?;
-    let from = query
-        .from
-        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
-    let to = query
-        .to
-        .unwrap_or_else(|| "2099-12-31T23:59:59Z".to_string());
-    let data = state.store.aggregate_by_provider(&from, &to)?;
+    let (from, to) = query.resolve_range();
+    let data = state.store.aggregate_by_provider(&from, &to).await?;
     Ok(Json(data))
 }
 
@@ -379,13 +413,8 @@ pub async fn get_analytics_by_key(
     Query(query): Query<TimeRangeQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     check_admin(&state, &headers)?;
-    let from = query
-        .from
-        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
-    let to = query
-        .to
-        .unwrap_or_else(|| "2099-12-31T23:59:59Z".to_string());
-    let data = state.store.aggregate_by_key(&from, &to)?;
+    let (from, to) = query.resolve_range();
+    let data = state.store.aggregate_by_key(&from, &to).await?;
     Ok(Json(data))
 }
 
@@ -395,13 +424,8 @@ pub async fn get_analytics_by_hour(
     Query(query): Query<TimeRangeQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     check_admin(&state, &headers)?;
-    let from = query
-        .from
-        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
-    let to = query
-        .to
-        .unwrap_or_else(|| "2099-12-31T23:59:59Z".to_string());
-    let data = state.store.aggregate_by_hour(&from, &to)?;
+    let (from, to) = query.resolve_range();
+    let data = state.store.aggregate_by_hour(&from, &to).await?;
     Ok(Json(data))
 }
 
@@ -411,13 +435,8 @@ pub async fn get_analytics_by_day(
     Query(query): Query<TimeRangeQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     check_admin(&state, &headers)?;
-    let from = query
-        .from
-        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
-    let to = query
-        .to
-        .unwrap_or_else(|| "2099-12-31T23:59:59Z".to_string());
-    let data = state.store.aggregate_by_day(&from, &to)?;
+    let (from, to) = query.resolve_range();
+    let data = state.store.aggregate_by_day(&from, &to).await?;
     Ok(Json(data))
 }
 
@@ -427,13 +446,8 @@ pub async fn get_analytics_totals(
     Query(query): Query<TimeRangeQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     check_admin(&state, &headers)?;
-    let from = query
-        .from
-        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
-    let to = query
-        .to
-        .unwrap_or_else(|| "2099-12-31T23:59:59Z".to_string());
-    let data = state.store.total_stats(&from, &to)?;
+    let (from, to) = query.resolve_range();
+    let data = state.store.total_stats(&from, &to).await?;
     Ok(Json(data))
 }
 
@@ -442,7 +456,8 @@ pub async fn get_analytics_totals(
 #[derive(Debug, Deserialize)]
 pub struct CreateProviderPayload {
     pub name: String,
-    pub protocol: String,
+    pub adapter: ProviderAdapterKind,
+    pub protocols: Vec<ProviderProtocol>,
     pub base_url: String,
     pub api_key: String,
     pub models: Vec<ModelRule>,
@@ -471,7 +486,8 @@ pub async fn create_provider(
 ) -> Result<impl IntoResponse, AppError> {
     check_admin(&state, &headers)?;
     let provider_name = payload.name.clone();
-    let protocol = payload.protocol.clone();
+    let adapter = payload.adapter;
+    let protocols = payload.protocols.clone();
     let base_url = payload.base_url.clone();
     let api_key = payload.api_key.clone();
     let models = payload.models.clone();
@@ -493,7 +509,8 @@ pub async fn create_provider(
                 .map(|provider| provider.status.clone());
             let provider = ProviderConfig {
                 name: provider_name.clone(),
-                protocol: protocol.clone(),
+                adapter,
+                protocols: protocols.clone(),
                 base_url: base_url.clone(),
                 api_key: api_key.clone(),
                 models: models.clone(),
@@ -906,7 +923,9 @@ pub struct QueryLogsQuery {
     pub api_key_id: Option<String>,
     pub model: Option<String>,
     pub provider_name: Option<String>,
-    pub provider: Option<String>,
+    pub protocol: Option<String>,
+    pub session_hash: Option<String>,
+    pub success: Option<i64>,
     pub status_code: Option<i64>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
@@ -938,7 +957,7 @@ fn key_display_name(snapshot: &crate::config_service::ConfigSnapshot, api_key_id
             key.name
                 .as_deref()
                 .filter(|name| !name.trim().is_empty())
-                .unwrap_or(&key.key)
+                .unwrap_or(&key.id)
                 .to_string()
         })
         .unwrap_or_else(|| api_key_id.to_string())
@@ -967,15 +986,17 @@ pub async fn list_request_logs(
         from: query.from,
         to: query.to,
         api_key_id: query.api_key_id,
+        session_hash: query.session_hash,
         model: query.model,
         provider_name: query.provider_name,
-        provider: query.provider,
+        protocol: query.protocol,
         status_code: query.status_code,
+        success: query.success,
         limit: Some(limit),
         offset: Some(offset),
     };
-    let logs = state.store.query_request_logs(&filter)?;
-    let total = state.store.count_request_logs(&filter)?;
+    let logs = state.store.query_request_logs(&filter).await?;
+    let total = state.store.count_request_logs(&filter).await?;
     let snapshot = state.config_service.snapshot();
     let items = logs
         .into_iter()
@@ -1010,7 +1031,8 @@ pub async fn get_request_log_detail(
     check_admin(&state, &headers)?;
     let log = state
         .store
-        .get_request_log_detail(&id)?
+        .get_request_log_detail(&id)
+        .await?
         .ok_or_else(|| AppError::NotFound(format!("Log entry '{}' not found", id)))?;
 
     let request_body = body_bytes_to_json(log.request_body.as_deref());

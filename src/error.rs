@@ -4,6 +4,7 @@ use axum::{
     Json,
 };
 use serde_json::json;
+use std::borrow::Cow;
 use std::time::Duration;
 
 /// Unified error type for the entire application
@@ -24,6 +25,8 @@ pub enum AppError {
     #[error("Provider error from '{provider_name}': {message}")]
     ProviderError {
         provider_name: String,
+        status_code: Option<StatusCode>,
+        error_code: Option<String>,
         message: String,
     },
 
@@ -57,7 +60,9 @@ impl AppError {
             AppError::ModelNotFound(_) => StatusCode::NOT_FOUND,
             AppError::NotFound(_) => StatusCode::NOT_FOUND,
             AppError::NoProviderAvailable(_) => StatusCode::SERVICE_UNAVAILABLE,
-            AppError::ProviderError { .. } => StatusCode::BAD_GATEWAY,
+            AppError::ProviderError { status_code, .. } => {
+                status_code.unwrap_or(StatusCode::BAD_GATEWAY)
+            }
             AppError::ProviderTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
             AppError::ProtocolError(_) => StatusCode::UNPROCESSABLE_ENTITY,
             AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
@@ -69,20 +74,23 @@ impl AppError {
     }
 
     /// Error code string for metrics/analytics
-    pub fn error_code(&self) -> &'static str {
+    pub fn error_code(&self) -> Cow<'static, str> {
         match self {
-            AppError::Unauthorized(_) => "unauthorized",
-            AppError::ModelNotFound(_) => "model_not_found",
-            AppError::NotFound(_) => "not_found",
-            AppError::NoProviderAvailable(_) => "no_provider",
-            AppError::ProviderError { .. } => "provider_error",
-            AppError::ProviderTimeout(_) => "provider_timeout",
-            AppError::ProtocolError(_) => "protocol_error",
-            AppError::BadRequest(_) => "bad_request",
-            AppError::ConfigError(_) => "config_error",
-            AppError::Internal(_) => "internal_error",
-            AppError::StreamError(_) => "stream_error",
-            AppError::ServiceUnavailable(_) => "service_unavailable",
+            AppError::Unauthorized(_) => Cow::Borrowed("unauthorized"),
+            AppError::ModelNotFound(_) => Cow::Borrowed("model_not_found"),
+            AppError::NotFound(_) => Cow::Borrowed("not_found"),
+            AppError::NoProviderAvailable(_) => Cow::Borrowed("no_provider"),
+            AppError::ProviderError { error_code, .. } => error_code
+                .as_ref()
+                .map(|code| Cow::Owned(code.clone()))
+                .unwrap_or_else(|| Cow::Borrowed("provider_error")),
+            AppError::ProviderTimeout(_) => Cow::Borrowed("provider_timeout"),
+            AppError::ProtocolError(_) => Cow::Borrowed("protocol_error"),
+            AppError::BadRequest(_) => Cow::Borrowed("bad_request"),
+            AppError::ConfigError(_) => Cow::Borrowed("config_error"),
+            AppError::Internal(_) => Cow::Borrowed("internal_error"),
+            AppError::StreamError(_) => Cow::Borrowed("stream_error"),
+            AppError::ServiceUnavailable(_) => Cow::Borrowed("service_unavailable"),
         }
     }
 }
@@ -93,7 +101,12 @@ impl IntoResponse for AppError {
         let code = self.error_code();
         let message = self.to_string();
 
-        tracing::warn!(error_code = code, status = status.as_u16(), "{}", message);
+        tracing::warn!(
+            error_code = code.as_ref(),
+            status = status.as_u16(),
+            "{}",
+            message
+        );
 
         let body = json!({
             "error": {
@@ -113,11 +126,9 @@ pub type AppResult<T> = Result<T, AppError>;
 impl From<crate::store::StoreError> for AppError {
     fn from(e: crate::store::StoreError) -> Self {
         match e {
-            crate::store::StoreError::NotFound(msg) => AppError::ModelNotFound(msg),
-            crate::store::StoreError::Conflict(msg) => AppError::BadRequest(msg),
+            crate::store::StoreError::NotFound(msg) => AppError::NotFound(msg),
             crate::store::StoreError::InvalidData(msg) => AppError::BadRequest(msg),
-            crate::store::StoreError::Sqlite(err) => AppError::Internal(err.to_string()),
-            crate::store::StoreError::Internal(msg) => AppError::Internal(msg),
+            crate::store::StoreError::Sql(err) => AppError::Internal(err.to_string()),
         }
     }
 }

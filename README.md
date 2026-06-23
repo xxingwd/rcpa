@@ -18,7 +18,7 @@ Start the server:
 cargo run -- --log-level info
 ```
 
-On first start, RCPA creates `data/config.yaml`, `data/rcpa.db`, and `data/logs/`.
+On first start, RCPA creates `~/.rcpa/config.yaml`, `~/.rcpa/rcpa.db`, and `~/.rcpa/logs/`.
 
 The admin UI is served from `frontend/dist`, so build the frontend before running a packaged binary:
 

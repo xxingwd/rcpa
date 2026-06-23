@@ -11,7 +11,9 @@ server:
 
 providers:
 - name: primary-provider
-  protocol: completions
+  adapter: openai
+  protocols:
+  - completions
   base_url: https://api.example.com
   api_key: ${RCPA_PROVIDER_API_KEY}
   models:
@@ -69,4 +71,4 @@ auth:
     labels: null
 
 database:
-  path: data/rcpa.db
+  path: ~/.rcpa/rcpa.db

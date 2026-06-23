@@ -30,10 +30,59 @@ pub struct TlsConfig {
     pub key_file: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAdapterKind {
+    Openai,
+    Anthropic,
+}
+
+impl ProviderAdapterKind {
+    pub fn supports_protocol(self, protocol: ProviderProtocol) -> bool {
+        match self {
+            ProviderAdapterKind::Openai => {
+                matches!(
+                    protocol,
+                    ProviderProtocol::Completions | ProviderProtocol::Responses
+                )
+            }
+            ProviderAdapterKind::Anthropic => matches!(protocol, ProviderProtocol::Messages),
+        }
+    }
+}
+
+impl std::fmt::Display for ProviderAdapterKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProviderAdapterKind::Openai => write!(f, "openai"),
+            ProviderAdapterKind::Anthropic => write!(f, "anthropic"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderProtocol {
+    Completions,
+    Responses,
+    Messages,
+}
+
+impl std::fmt::Display for ProviderProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProviderProtocol::Completions => write!(f, "completions"),
+            ProviderProtocol::Responses => write!(f, "responses"),
+            ProviderProtocol::Messages => write!(f, "messages"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub name: String,
-    pub protocol: String,
+    pub adapter: ProviderAdapterKind,
+    pub protocols: Vec<ProviderProtocol>,
     pub base_url: String,
     pub api_key: String,
     pub models: Vec<ModelRule>,
@@ -113,6 +162,10 @@ impl ProviderConfig {
         self.status == "enabled"
     }
 
+    pub fn supports_protocol(&self, protocol: ProviderProtocol) -> bool {
+        self.protocols.contains(&protocol)
+    }
+
     pub fn enabled_model_names(&self) -> Vec<String> {
         self.models
             .iter()
@@ -173,6 +226,8 @@ pub struct RoutingConfig {
 pub struct StickyConfig {
     pub enabled: bool,
     pub ttl_secs: u64,
+    #[serde(default)]
+    pub fallback_retry_interval_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,8 +298,19 @@ fn default_db_path() -> String {
     "rcpa.db".to_string()
 }
 
+pub fn expand_tilde(path: &Path) -> PathBuf {
+    if path.starts_with("~") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(path.strip_prefix("~").unwrap());
+        }
+    }
+    path.to_path_buf()
+}
+
 pub fn data_dir_for_config(path: &Path) -> PathBuf {
-    path.parent()
+    let expanded = expand_tilde(path);
+    expanded
+        .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."))
@@ -252,7 +318,8 @@ pub fn data_dir_for_config(path: &Path) -> PathBuf {
 
 impl AppConfig {
     pub fn ensure_config_file(path: &Path) -> anyhow::Result<Option<BootstrapConfigInfo>> {
-        if path.exists() {
+        let expanded_path = expand_tilde(path);
+        if expanded_path.exists() {
             return Ok(None);
         }
 
@@ -264,10 +331,10 @@ impl AppConfig {
 
         let config = Self::bootstrap_config(database_path.clone());
         let content = serde_yaml::to_string(&config)?;
-        std::fs::write(path, content)?;
+        std::fs::write(&expanded_path, content)?;
 
         Ok(Some(BootstrapConfigInfo {
-            path: path.to_path_buf(),
+            path: expanded_path,
             database_path,
             log_dir,
         }))
@@ -290,6 +357,7 @@ impl AppConfig {
                 sticky: StickyConfig {
                     enabled: true,
                     ttl_secs: 300,
+                    fallback_retry_interval_secs: None,
                 },
                 default_model: None,
             },
@@ -371,12 +439,14 @@ pub fn wildcard_match(pattern: &str, input: &str) -> bool {
 
 impl AppConfig {
     pub fn load(path: &str) -> anyhow::Result<Self> {
-        let content = std::fs::read_to_string(path)?;
+        let expanded_path = expand_tilde(Path::new(path));
+        let content = std::fs::read_to_string(expanded_path)?;
         Self::from_yaml_expanded(&content)
     }
 
     pub fn load_raw(path: &std::path::Path) -> anyhow::Result<Self> {
-        let content = std::fs::read_to_string(path)?;
+        let expanded_path = expand_tilde(path);
+        let content = std::fs::read_to_string(expanded_path)?;
         let config: Self = serde_yaml::from_str(&content)?;
         config.validate()?;
         Ok(config)
@@ -414,28 +484,18 @@ impl AppConfig {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        validate_server_config(&self.server)?;
+        validate_routing_config(&self.routing)?;
+        validate_retry_config(&self.retry)?;
+        validate_cost_config(&self.cost)?;
+        validate_database_config(&self.database)?;
+
         if self.admin.token.trim().is_empty() {
             anyhow::bail!("Admin token cannot be empty");
         }
 
         for provider in &self.providers {
-            validate_model_name(&provider.name, "provider name")?;
-            match provider.protocol.as_str() {
-                "completions" | "responses" | "messages" => {}
-                other => anyhow::bail!(
-                    "Provider '{}' has invalid protocol '{}'; expected completions, responses, or messages",
-                    provider.name,
-                    other
-                ),
-            }
-            match provider.status.as_str() {
-                "enabled" | "disabled" => {}
-                other => anyhow::bail!(
-                    "Provider '{}' has invalid status '{}'",
-                    provider.name,
-                    other
-                ),
-            }
+            validate_provider_config(provider)?;
             for model in &provider.models {
                 validate_model_name(&model.name, "provider model")?;
                 match model.status.as_str() {
@@ -453,6 +513,12 @@ impl AppConfig {
                         provider.name,
                         model.name
                     );
+                }
+                if let Some(pricing) = &model.pricing {
+                    validate_pricing(
+                        pricing,
+                        &format!("Provider '{}' model '{}'", provider.name, model.name),
+                    )?;
                 }
                 let mut seen_aliases = HashSet::new();
                 for alias in &model.aliases {
@@ -543,6 +609,148 @@ fn validate_model_name(value: &str, field: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_server_config(server: &ServerConfig) -> anyhow::Result<()> {
+    if server.host.trim().is_empty() {
+        anyhow::bail!("Server host cannot be empty");
+    }
+    if server.tls.enabled {
+        if server.tls.cert_file.trim().is_empty() {
+            anyhow::bail!("TLS cert_file is required when TLS is enabled");
+        }
+        if server.tls.key_file.trim().is_empty() {
+            anyhow::bail!("TLS key_file is required when TLS is enabled");
+        }
+    }
+    Ok(())
+}
+
+fn validate_routing_config(routing: &RoutingConfig) -> anyhow::Result<()> {
+    routing
+        .strategy
+        .parse::<crate::routing::Strategy>()
+        .map_err(|err| anyhow::anyhow!(err))?;
+    if routing.sticky.enabled && routing.sticky.ttl_secs == 0 {
+        anyhow::bail!("Routing sticky ttl_secs must be greater than 0 when sticky is enabled");
+    }
+    if let Some(default_model) = &routing.default_model {
+        validate_model_name(default_model, "default model")?;
+    }
+    Ok(())
+}
+
+fn validate_retry_config(retry: &RetryConfig) -> anyhow::Result<()> {
+    if retry.max_attempts == 0 {
+        anyhow::bail!("Retry max_attempts must be greater than 0");
+    }
+    if retry.initial_backoff_ms > retry.max_backoff_ms {
+        anyhow::bail!("Retry initial_backoff_ms must not exceed max_backoff_ms");
+    }
+    for status in &retry.retryable_statuses {
+        if !(400..=599).contains(status) {
+            anyhow::bail!(
+                "Retry status '{}' is invalid; expected an HTTP 4xx or 5xx status",
+                status
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_cost_config(cost: &CostConfig) -> anyhow::Result<()> {
+    if cost.currency.trim().is_empty() {
+        anyhow::bail!("Cost currency cannot be empty");
+    }
+    if cost.default_input_per_1k < 0.0 {
+        anyhow::bail!("Default input price must be non-negative");
+    }
+    if cost.default_output_per_1k < 0.0 {
+        anyhow::bail!("Default output price must be non-negative");
+    }
+    for (model, pricing) in &cost.models {
+        validate_model_name(model, "cost model")?;
+        validate_pricing(pricing, &format!("Cost model '{}'", model))?;
+    }
+    Ok(())
+}
+
+fn validate_database_config(database: &DatabaseConfig) -> anyhow::Result<()> {
+    if database.path.trim().is_empty() {
+        anyhow::bail!("Database path cannot be empty");
+    }
+    Ok(())
+}
+
+fn validate_provider_config(provider: &ProviderConfig) -> anyhow::Result<()> {
+    validate_model_name(&provider.name, "provider name")?;
+    if provider.base_url.trim().is_empty() {
+        anyhow::bail!("Provider '{}' base_url cannot be empty", provider.name);
+    }
+    if provider.api_key.trim().is_empty() {
+        anyhow::bail!("Provider '{}' api_key cannot be empty", provider.name);
+    }
+    if provider.weight == 0 {
+        anyhow::bail!("Provider '{}' weight must be greater than 0", provider.name);
+    }
+    if provider.max_connections == 0 {
+        anyhow::bail!(
+            "Provider '{}' max_connections must be greater than 0",
+            provider.name
+        );
+    }
+    if provider.timeout_secs == 0 {
+        anyhow::bail!(
+            "Provider '{}' timeout_secs must be greater than 0",
+            provider.name
+        );
+    }
+    if provider.protocols.is_empty() {
+        anyhow::bail!(
+            "Provider '{}' must declare at least one supported protocol",
+            provider.name
+        );
+    }
+    let mut seen_protocols = HashSet::new();
+    for protocol in &provider.protocols {
+        if !seen_protocols.insert(*protocol) {
+            anyhow::bail!(
+                "Provider '{}' defines duplicate protocol '{}'",
+                provider.name,
+                protocol
+            );
+        }
+        if !provider.adapter.supports_protocol(*protocol) {
+            anyhow::bail!(
+                "Provider '{}' adapter '{}' does not support protocol '{}'",
+                provider.name,
+                provider.adapter,
+                protocol
+            );
+        }
+    }
+    match provider.status.as_str() {
+        "enabled" | "disabled" => {}
+        other => anyhow::bail!(
+            "Provider '{}' has invalid status '{}'",
+            provider.name,
+            other
+        ),
+    }
+    if provider.group.trim().is_empty() {
+        anyhow::bail!("Provider '{}' group cannot be empty", provider.name);
+    }
+    Ok(())
+}
+
+fn validate_pricing(pricing: &ModelPricing, owner: &str) -> anyhow::Result<()> {
+    if pricing.input_per_1k < 0.0 {
+        anyhow::bail!("{} input price must be non-negative", owner);
+    }
+    if pricing.output_per_1k < 0.0 {
+        anyhow::bail!("{} output price must be non-negative", owner);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -581,7 +789,11 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.yaml");
         let config = AppConfig::load(path.to_str().unwrap()).unwrap();
         assert_eq!(config.providers.len(), 1);
-        assert_eq!(config.providers[0].protocol, "completions");
+        assert_eq!(config.providers[0].adapter, ProviderAdapterKind::Openai);
+        assert_eq!(
+            config.providers[0].protocols,
+            vec![ProviderProtocol::Completions]
+        );
         assert_eq!(
             config.providers[0].actual_model_for("public-model-name"),
             Some("upstream-model-name".into())
@@ -689,10 +901,50 @@ mod tests {
         assert!(config.validate().is_ok());
     }
 
+    #[test]
+    fn test_validate_rejects_invalid_runtime_config() {
+        let mut config = test_config();
+        config.routing.strategy = "missing-strategy".into();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("Unknown routing strategy"));
+
+        let mut config = test_config();
+        config.routing.sticky.enabled = true;
+        config.routing.sticky.ttl_secs = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("ttl_secs"));
+
+        let mut config = test_config();
+        config.retry.max_attempts = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("max_attempts"));
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_provider_runtime_config() {
+        let mut config = test_config();
+        let mut provider = test_provider();
+        provider.weight = 0;
+        config.providers.push(provider);
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("weight"));
+
+        let mut config = test_config();
+        let mut provider = test_provider();
+        provider.models[0].pricing = Some(ModelPricing {
+            input_per_1k: -1.0,
+            output_per_1k: 0.0,
+        });
+        config.providers.push(provider);
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("input price"));
+    }
+
     fn test_provider() -> ProviderConfig {
         ProviderConfig {
             name: "primary-provider".into(),
-            protocol: "completions".into(),
+            adapter: ProviderAdapterKind::Openai,
+            protocols: vec![ProviderProtocol::Completions],
             base_url: "https://api.example.com".into(),
             api_key: "test-secret".into(),
             models: vec![ModelRule::enabled("gpt-4o")],

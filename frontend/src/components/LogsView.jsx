@@ -40,6 +40,15 @@ function formatJson(value) {
   return JSON.stringify(value, null, 2);
 }
 
+function parseJsonString(value) {
+  if (typeof value !== 'string') return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
 function cacheRate(inputTokens, cachedTokens) {
   const input = Number(inputTokens ?? 0);
   return input > 0 ? Number(cachedTokens ?? 0) / input : 0;
@@ -72,6 +81,7 @@ export default function LogsView({ showToast }) {
   const [filterKeyId, setFilterKeyId] = useState(searchParams.get('key') || 'all');
   const [filterModel, setFilterModel] = useState(searchParams.get('model') || 'all');
   const [filterProviderName, setFilterProviderName] = useState(searchParams.get('provider_name') || 'all');
+  const [filterProtocol, setFilterProtocol] = useState(searchParams.get('protocol') || 'all');
   const [page, setPage] = useState(() => Math.max(1, Number(searchParams.get('page') || 1) || 1));
   const [total, setTotal] = useState(0);
   const [refreshIntervalMs, setRefreshIntervalMs] = useState(() => localStorage.getItem('rcpa_logs_refresh_ms') || '5000');
@@ -124,6 +134,9 @@ export default function LogsView({ showToast }) {
       if (filterProviderName !== 'all') {
         params.set('provider_name', filterProviderName);
       }
+      if (filterProtocol !== 'all') {
+        params.set('protocol', filterProtocol);
+      }
       const res = await apiFetch(`/v1/admin/logs?${params.toString()}`);
       if (res.ok) {
         const data = await res.json();
@@ -136,7 +149,7 @@ export default function LogsView({ showToast }) {
     } finally {
       fetchInFlightRef.current = false;
     }
-  }, [filterKeyId, filterModel, filterProviderName, page, showToast]);
+  }, [filterKeyId, filterModel, filterProviderName, filterProtocol, page, showToast]);
 
   useEffect(() => {
     fetchFilters();
@@ -162,9 +175,10 @@ export default function LogsView({ showToast }) {
     if (filterKeyId !== 'all') next.set('key', filterKeyId);
     if (filterModel !== 'all') next.set('model', filterModel);
     if (filterProviderName !== 'all') next.set('provider_name', filterProviderName);
+    if (filterProtocol !== 'all') next.set('protocol', filterProtocol);
     if (page > 1) next.set('page', String(page));
     setSearchParams(next, { replace: true });
-  }, [filterKeyId, filterModel, filterProviderName, page, setSearchParams]);
+  }, [filterKeyId, filterModel, filterProviderName, filterProtocol, page, setSearchParams]);
 
   useEffect(() => {
     if (!filtersInitializedRef.current) {
@@ -173,7 +187,7 @@ export default function LogsView({ showToast }) {
     }
 
     setPage(1);
-  }, [filterKeyId, filterModel, filterProviderName]);
+  }, [filterKeyId, filterModel, filterProviderName, filterProtocol]);
 
   const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
@@ -200,6 +214,21 @@ export default function LogsView({ showToast }) {
       ...providersList.map((provider) => ({ value: provider.name, label: provider.name })),
     ];
   }, [providersList]);
+
+  const protocolOptions = useMemo(() => {
+    const values = new Set(
+      providersList.flatMap((provider) => (
+        Array.isArray(provider.protocols) ? provider.protocols : []
+      )).filter(Boolean)
+    );
+    logs.forEach((log) => {
+      if (log?.protocol) values.add(log.protocol);
+    });
+    return [
+      { value: 'all', label: '全部协议' },
+      ...Array.from(values).sort().map((protocol) => ({ value: protocol, label: protocol })),
+    ];
+  }, [logs, providersList]);
 
   const modelOptions = useMemo(() => {
     const seen = new Set();
@@ -302,6 +331,19 @@ export default function LogsView({ showToast }) {
               </SelectTrigger>
               <SelectContent>
                 {providerNameOptions.map((option) => (
+                  <SelectItem key={option.value} value={option.value} className="text-xs">
+                    {option.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+
+            <Select value={filterProtocol} onValueChange={setFilterProtocol}>
+              <SelectTrigger className="h-8 w-[132px] text-xs">
+                <SelectValue placeholder="全部协议" />
+              </SelectTrigger>
+              <SelectContent>
+                {protocolOptions.map((option) => (
                   <SelectItem key={option.value} value={option.value} className="text-xs">
                     {option.label}
                   </SelectItem>
@@ -573,7 +615,7 @@ export default function LogsView({ showToast }) {
                 </CopyableHoverText>
               </div>
               <div><span className="text-muted-foreground">供应商：</span>{detail.provider_name}</div>
-              <div><span className="text-muted-foreground">接口：</span>{detail.operation} / {detail.provider}</div>
+              <div><span className="text-muted-foreground">接口：</span>{detail.operation} / {detail.protocol}</div>
               <div><span className="text-muted-foreground">时间：</span>{detail.created_at}</div>
             </div>
 
@@ -584,6 +626,11 @@ export default function LogsView({ showToast }) {
                 <div className="text-xs text-muted-foreground mt-1 break-all">{detail.error}</div>
               </div>
             )}
+
+            <div>
+              <div className="text-[0.65rem] uppercase tracking-wider text-muted-foreground font-semibold mb-2">元数据 JSON</div>
+              <CodeBlock className="max-h-[420px]">{formatJson(parseJsonString(detail.metadata_json)) || '{}'}</CodeBlock>
+            </div>
 
             <div>
               <div className="text-[0.65rem] uppercase tracking-wider text-muted-foreground font-semibold mb-2">请求 JSON</div>

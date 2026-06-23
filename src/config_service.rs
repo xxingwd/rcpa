@@ -6,7 +6,10 @@ use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 use serde::Serialize;
 
-use crate::config::{wildcard_match, AppConfig, AuthKey, ModelPricing, ModelRule, ProviderConfig};
+use crate::config::{
+    wildcard_match, AppConfig, AuthKey, ModelPricing, ModelRule, ProviderAdapterKind,
+    ProviderConfig, ProviderProtocol,
+};
 use crate::provider::ProviderRegistry;
 
 #[derive(Clone)]
@@ -28,7 +31,8 @@ pub struct ConfigSnapshot {
 #[derive(Debug, Clone, Serialize)]
 pub struct ProviderView {
     pub name: String,
-    pub protocol: String,
+    pub adapter: ProviderAdapterKind,
+    pub protocols: Vec<ProviderProtocol>,
     pub base_url: String,
     pub api_key: String,
     pub models: Vec<ModelRule>,
@@ -65,7 +69,7 @@ pub struct ModelCatalogEntry {
     pub name: String,
     pub kind: String,
     pub provider_name: Option<String>,
-    pub protocol: Option<String>,
+    pub protocols: Vec<ProviderProtocol>,
     #[serde(skip_serializing)]
     pub target_model: Option<String>,
     #[serde(skip_serializing)]
@@ -114,6 +118,7 @@ impl ConfigService {
         let raw_config: AppConfig = serde_yaml::from_str(content)?;
         raw_config.validate()?;
         let next_snapshot = ConfigSnapshot::build(raw_config)?;
+        validate_hot_reload_transition(&self.snapshot(), &next_snapshot)?;
         let tmp = self.path.with_extension("yaml.tmp");
         std::fs::write(&tmp, content)?;
         std::fs::rename(tmp, &self.path)?;
@@ -131,6 +136,7 @@ impl ConfigService {
         f(&mut raw_config)?;
         raw_config.validate()?;
         let next_snapshot = ConfigSnapshot::build(raw_config.clone())?;
+        validate_hot_reload_transition(&self.snapshot(), &next_snapshot)?;
         self.write_raw_config(&raw_config)?;
         let next = Arc::new(next_snapshot);
         self.snapshot.store(next.clone());
@@ -144,6 +150,18 @@ impl ConfigService {
         std::fs::rename(tmp, &self.path)?;
         Ok(())
     }
+}
+
+fn validate_hot_reload_transition(
+    current: &ConfigSnapshot,
+    next: &ConfigSnapshot,
+) -> anyhow::Result<()> {
+    if current.config.database.path != next.config.database.path {
+        anyhow::bail!(
+            "database.path cannot be changed by hot reload; restart with the new database path"
+        );
+    }
+    Ok(())
 }
 
 impl ConfigSnapshot {
@@ -257,9 +275,14 @@ impl ConfigSnapshot {
             .unwrap_or(false)
     }
 
-    pub fn provider_protocol(&self, provider_name: &str) -> Option<&str> {
+    pub fn provider_supports_protocol(
+        &self,
+        provider_name: &str,
+        protocol: ProviderProtocol,
+    ) -> bool {
         self.find_provider(provider_name)
-            .map(|provider| provider.protocol.as_str())
+            .map(|provider| provider.supports_protocol(protocol))
+            .unwrap_or(false)
     }
 
     pub fn providers_for_model(&self, model: &str) -> Vec<String> {
@@ -280,21 +303,6 @@ impl ConfigSnapshot {
         !self.providers_for_model(model).is_empty()
     }
 
-    pub fn list_models(&self) -> Vec<(String, String)> {
-        let mut values = Vec::new();
-        for provider in &self.config.providers {
-            if !provider.is_enabled() {
-                continue;
-            }
-            for model in provider.models.iter().filter(|model| model.is_enabled()) {
-                for public_name in model.public_names() {
-                    values.push((public_name, provider.name.clone()));
-                }
-            }
-        }
-        values
-    }
-
     pub fn model_catalog(&self) -> Vec<ModelCatalogEntry> {
         let mut values = Vec::new();
         for provider in &self.raw_config.providers {
@@ -309,7 +317,7 @@ impl ConfigSnapshot {
                         name: selectable_name.clone(),
                         kind: "model".to_string(),
                         provider_name: Some(provider.name.clone()),
-                        protocol: Some(provider.protocol.clone()),
+                        protocols: provider.protocols.clone(),
                         target_model: Some(model.name.clone()),
                         model_name: model.name.clone(),
                         aliases: aliases.clone(),
@@ -332,30 +340,9 @@ impl ConfigSnapshot {
         self.config.key_visible_model_names()
     }
 
-    pub fn model_catalog_entry_for_name(&self, name: &str) -> Option<ModelCatalogEntry> {
-        self.model_catalog()
-            .into_iter()
-            .find(|entry| entry.selectable_names.iter().any(|item| item == name))
-    }
-
-    pub fn visible_model_owner(&self, name: &str) -> Option<String> {
-        self.model_catalog()
-            .into_iter()
-            .find(|entry| entry.selectable_names.iter().any(|item| item == name))
-            .and_then(|entry| entry.provider_name)
-    }
-
-    pub fn valid_model_target_names(&self) -> HashSet<String> {
-        self.key_visible_model_names()
-    }
-
-    pub fn resolve_key_alias(
-        &self,
-        requested: &str,
-        key: &AuthKey,
-    ) -> Option<(String, Option<String>)> {
+    pub fn resolve_key_alias(&self, requested: &str, key: &AuthKey) -> Option<String> {
         let target = key.model_aliases.get(requested)?;
-        Some((target.clone(), None))
+        Some(target.clone())
     }
 
     pub fn provider_model_pricing(&self, provider_name: &str, model: &str) -> Option<ModelPricing> {
@@ -372,7 +359,8 @@ impl ConfigSnapshot {
 fn provider_view(provider: &ProviderConfig) -> ProviderView {
     ProviderView {
         name: provider.name.clone(),
-        protocol: provider.protocol.clone(),
+        adapter: provider.adapter,
+        protocols: provider.protocols.clone(),
         base_url: provider.base_url.clone(),
         api_key: provider.api_key.clone(),
         models: provider.models.clone(),
@@ -397,12 +385,4 @@ fn auth_key_view(key: &AuthKey) -> AuthKeyView {
         allowed_models: key.models.clone(),
         model_aliases: key.model_aliases.clone(),
     }
-}
-
-pub fn normalize_model_rules(models: Vec<String>) -> Vec<ModelRule> {
-    models.into_iter().map(ModelRule::enabled).collect()
-}
-
-pub fn model_names(models: &[ModelRule]) -> HashSet<String> {
-    models.iter().map(|model| model.name.clone()).collect()
 }

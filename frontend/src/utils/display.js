@@ -43,9 +43,8 @@ export function formatCostCny(cents) {
 
 export function keyDisplayName(key, fallback = '') {
   if (key?.name && key.name.trim()) return key.name;
-  if (key?.key && key.key.trim()) return key.key;
-  if (typeof fallback === 'string' && fallback.trim()) return fallback;
   if (key?.id && key.id.trim()) return key.id;
+  if (typeof fallback === 'string' && fallback.trim()) return fallback;
   return '';
 }
 

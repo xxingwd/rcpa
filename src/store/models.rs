@@ -1,16 +1,18 @@
 use serde::{Deserialize, Serialize};
 
 /// Database representation of a request log entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct DbRequestLog {
     pub id: String,
     pub request_id: String,
     pub api_key_id: String,
+    pub session_hash: Option<String>,
     pub provider_name: String,
-    pub provider: String,
+    pub protocol: String,
     pub model: String,
     pub operation: String,
     pub status_code: i64,
+    pub success: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub total_tokens: i64,
@@ -19,25 +21,31 @@ pub struct DbRequestLog {
     pub cost_cents: i64,
     pub latency_ms: i64,
     pub first_byte_latency_ms: i64,
+    pub metadata_json: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[sqlx(default)]
     pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[sqlx(default)]
     pub error: Option<String>,
     pub created_at: String,
     /// Only populated by detail query; always None in list results.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[sqlx(default)]
     pub request_body: Option<Vec<u8>>,
     /// Only populated by detail query; always None in list results.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[sqlx(default)]
     pub response_body: Option<Vec<u8>>,
 }
 
 /// Aggregated statistics result row.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct AggregateRow {
     pub group_key: String,
     pub request_count: i64,
     pub success_count: i64,
     pub error_count: i64,
-    pub success_rate: f64,
     pub total_input_tokens: i64,
     pub total_output_tokens: i64,
     pub total_cached_tokens: i64,
@@ -48,8 +56,18 @@ pub struct AggregateRow {
     pub avg_first_byte_latency_ms: f64,
 }
 
+impl AggregateRow {
+    pub fn success_rate(&self) -> f64 {
+        if self.request_count > 0 {
+            self.success_count as f64 / self.request_count as f64
+        } else {
+            0.0
+        }
+    }
+}
+
 /// Overall total statistics.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TotalStats {
     pub request_count: i64,
     pub success_count: i64,
@@ -75,10 +93,12 @@ pub struct RequestLogFilter {
     pub from: Option<String>,
     pub to: Option<String>,
     pub api_key_id: Option<String>,
+    pub session_hash: Option<String>,
     pub model: Option<String>,
     pub provider_name: Option<String>,
-    pub provider: Option<String>,
+    pub protocol: Option<String>,
     pub status_code: Option<i64>,
+    pub success: Option<i64>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }

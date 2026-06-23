@@ -147,40 +147,45 @@ async fn stats_handler(
 ) -> axum::Json<serde_json::Value> {
     let from = "1970-01-01T00:00:00Z";
     let to = "9999-12-31T23:59:59Z";
-    let stats = state
-        .store
-        .dashboard_stats(from, to)
-        .map(serde_json::to_value)
-        .and_then(|value| value.map_err(|err| crate::store::StoreError::Internal(err.to_string())))
-        .unwrap_or_else(|err| {
+    let stats = match state.store.dashboard_stats(from, to).await {
+        Ok(stats) => serde_json::to_value(stats).unwrap_or_else(|err| {
+            tracing::error!(error = %err, "Failed to serialize dashboard stats");
+            default_dashboard_stats()
+        }),
+        Err(err) => {
             tracing::error!(error = %err, "Failed to load dashboard stats");
-            serde_json::json!({
-                "requests": {
-                    "total": 0,
-                    "success": 0,
-                    "errors": 0,
-                    "error_rate": 0.0,
-                    "success_rate": 0.0,
-                },
-                "tokens": {
-                    "input": 0,
-                    "output": 0,
-                    "cached": 0,
-                    "cache_write": 0,
-                    "cache_hit_rate": 0.0,
-                    "total": 0,
-                    "avg_per_request": 0.0,
-                },
-                "latency": {
-                    "avg_ms": 0.0,
-                    "max_ms": 0,
-                    "first_byte_avg_ms": 0.0,
-                    "first_byte_max_ms": 0,
-                },
-                "cost": {
-                    "total_cents": 0,
-                },
-            })
-        });
+            default_dashboard_stats()
+        }
+    };
     axum::Json(stats)
+}
+
+fn default_dashboard_stats() -> serde_json::Value {
+    serde_json::json!({
+        "requests": {
+            "total": 0,
+            "success": 0,
+            "errors": 0,
+            "error_rate": 0.0,
+            "success_rate": 0.0,
+        },
+        "tokens": {
+            "input": 0,
+            "output": 0,
+            "cached": 0,
+            "cache_write": 0,
+            "cache_hit_rate": 0.0,
+            "total": 0,
+            "avg_per_request": 0.0,
+        },
+        "latency": {
+            "avg_ms": 0.0,
+            "max_ms": 0,
+            "first_byte_avg_ms": 0.0,
+            "first_byte_max_ms": 0,
+        },
+        "cost": {
+            "total_cents": 0,
+        },
+    })
 }

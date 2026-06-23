@@ -1,84 +1,76 @@
 //! SQLite-backed persistence layer for the RCPA gateway.
-//!
-//! This module provides a `Store` type backed by a single SQLite connection
-//! wrapped in `Arc<Mutex<_>>`. All database operations are executed via
-//! `tokio::task::spawn_blocking` so the async runtime is never blocked.
-
-mod migrations;
-pub mod models;
 
 mod analytics;
+pub mod models;
 mod request_log_repo;
-
-use std::sync::{Arc, Mutex};
 
 pub use models::*;
 pub use request_log_repo::NewRequestLog;
+
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
+use std::str::FromStr;
+
+use crate::config::expand_tilde;
 
 /// Errors produced by the persistence layer.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("Database error: {0}")]
-    Sqlite(#[from] rusqlite::Error),
+    Sql(#[from] sqlx::Error),
 
     #[error("Not found: {0}")]
     NotFound(String),
 
-    #[error("Conflict: {0}")]
-    Conflict(String),
-
     #[error("Invalid data: {0}")]
     InvalidData(String),
-
-    #[error("Internal store error: {0}")]
-    Internal(String),
 }
 
 /// Result alias for store operations.
 pub type StoreResult<T> = Result<T, StoreError>;
 
 /// SQLite-backed persistence store.
-///
-/// Internally wraps a `rusqlite::Connection` in `Arc<Mutex<_>>` so the
-/// store can be cloned and shared across tasks safely.
 #[derive(Clone)]
 pub struct Store {
-    conn: Arc<Mutex<rusqlite::Connection>>,
+    pool: SqlitePool,
 }
 
 impl Store {
-    /// Open (or create) a database at the given file path and run all
-    /// pending migrations.
-    pub fn open(path: &str) -> anyhow::Result<Self> {
-        let db_path = std::path::Path::new(path);
-        if let Some(parent) = db_path
+    /// Open (or create) a database at the given file path and run migrations.
+    pub async fn open(path: &str) -> anyhow::Result<Self> {
+        let expanded_path = expand_tilde(std::path::Path::new(path));
+        let path_str = expanded_path.to_string_lossy().into_owned();
+
+        if let Some(parent) = expanded_path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
         {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = rusqlite::Connection::open(path)?;
-        Self::init(conn)
+
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{path_str}"))?
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .foreign_keys(true);
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(options)
+            .await?;
+
+        sqlx::migrate!("./migrations").run(&pool).await?;
+
+        Ok(Self { pool })
     }
 
     /// Create an in-memory database — useful for unit and integration tests.
-    pub fn open_in_memory() -> anyhow::Result<Self> {
-        let conn = rusqlite::Connection::open_in_memory()?;
-        Self::init(conn)
-    }
-
-    fn init(mut conn: rusqlite::Connection) -> anyhow::Result<Self> {
-        // Enable WAL mode for better concurrent read performance
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
-        migrations::run_migrations(&mut conn)?;
-        Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-        })
-    }
-
-    /// Acquire the connection lock. Panics if the mutex is poisoned.
-    fn conn(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
-        self.conn.lock().expect("store mutex poisoned")
+    pub async fn open_in_memory() -> anyhow::Result<Self> {
+        let options = SqliteConnectOptions::from_str("sqlite::memory:")?.foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await?;
+        sqlx::migrate!("./migrations").run(&pool).await?;
+        Ok(Self { pool })
     }
 }
 
@@ -86,30 +78,29 @@ impl Store {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_open_in_memory() {
-        let store = Store::open_in_memory().unwrap();
-        // Verify we can use the connection
-        let conn = store.conn();
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM request_logs", [], |r| r.get(0))
+    #[tokio::test]
+    async fn test_open_in_memory() {
+        let store = Store::open_in_memory().await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_logs")
+            .fetch_one(&store.pool)
+            .await
             .unwrap();
         assert_eq!(count, 0);
     }
 
-    #[test]
-    fn test_store_is_clone() {
-        let store = Store::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn test_store_is_clone() {
+        let store = Store::open_in_memory().await.unwrap();
         let _clone = store.clone();
     }
 
-    #[test]
-    fn test_open_creates_parent_directory() {
+    #[tokio::test]
+    async fn test_open_creates_parent_directory() {
         let temp_dir =
             std::env::temp_dir().join(format!("rcpa-store-test-{}", uuid::Uuid::new_v4()));
         let db_path = temp_dir.join("nested").join("rcpa.db");
 
-        let store = Store::open(db_path.to_str().unwrap()).unwrap();
+        let store = Store::open(db_path.to_str().unwrap()).await.unwrap();
         drop(store);
         assert!(db_path.exists());
 

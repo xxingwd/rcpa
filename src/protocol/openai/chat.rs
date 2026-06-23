@@ -7,6 +7,7 @@ use axum::{
 use bytes::Bytes;
 use futures::Stream;
 use std::{
+    collections::HashSet,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -16,8 +17,12 @@ use std::{
 use crate::error::{AppError, AppResult};
 use crate::middleware::auth;
 use crate::protocol::audit;
-use crate::protocol::common::{Operation, Protocol, ProxyContext, ProxyRequest, TokenUsage};
+use crate::protocol::common::{
+    Operation, Protocol, ProxyContext, ProxyRequest, SessionAffinityMode, TokenUsage,
+};
+use crate::retry::policy::RetryPolicy;
 use crate::server::AppState;
+use crate::stats::cost::CostCalculator;
 use crate::store::NewRequestLog;
 
 /// POST /v1/chat/completions
@@ -26,112 +31,15 @@ pub async fn chat_completions(
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Result<impl IntoResponse, AppError> {
-    let start = std::time::Instant::now();
-    let request_id = uuid::Uuid::new_v4();
-    let operation = Operation::ChatCompletions;
-    let protocol = Protocol::Completions;
-    let request_body = body.as_bytes();
-    let config_snapshot = state.config_service.snapshot();
-    let default_model = config_snapshot.config.routing.default_model.clone();
-    let requested_model = audit::model_from_body_or_default(&body, default_model.as_deref());
-
-    let auth_result = auth::authenticate_llm_api_key(&state, &headers)?;
-    let api_key_id = auth::persisted_api_key_id(&auth_result.key);
-
-    let body_value: serde_json::Value = match serde_json::from_str(&body) {
-        Ok(value) => value,
-        Err(e) => {
-            let err = AppError::BadRequest(e.to_string());
-            audit::record_llm_error(
-                &state,
-                request_id,
-                api_key_id,
-                protocol,
-                operation,
-                requested_model.as_deref().unwrap_or(""),
-                &err,
-                start,
-                Some(request_body),
-            );
-            return Err(err);
-        }
-    };
-
-    let model = body_value
-        .get("model")
-        .and_then(|v| v.as_str())
-        .map(ToString::to_string)
-        .or(default_model)
-        .ok_or_else(|| AppError::BadRequest("model is required".to_string()))?;
-
-    // Validate and resolve the user-facing model name.
-    let (resolved_model, forced_provider) =
-        match state.validate_model_name_for_key(&model, &auth_result.key) {
-            Ok(result) => result,
-            Err(err) => {
-                audit::record_llm_error(
-                    &state,
-                    request_id,
-                    api_key_id,
-                    protocol,
-                    operation,
-                    &model,
-                    &err,
-                    start,
-                    Some(request_body),
-                );
-                return Err(err);
-            }
-        };
-
-    // Check model access against the resolved model name
-    if let Err(err) =
-        auth::check_model_access_for_request(&auth_result.key, &model, &resolved_model)
-    {
-        audit::record_llm_error(
-            &state,
-            request_id,
-            api_key_id,
-            protocol,
-            operation,
-            &resolved_model,
-            &err,
-            start,
-            Some(request_body),
-        );
-        return Err(err);
-    }
-
-    let stream = body_value
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    let session_key = Some(format!("{}:{}", auth_result.key.key, model));
-
-    let ctx = ProxyContext {
-        request_id,
-        auth_key: auth_result.key.clone(),
-        config_snapshot,
-        protocol,
-        operation,
-        model: model.clone(),
-        resolved_model: resolved_model.clone(),
-        stream,
-        session_key,
-        forced_provider,
-    };
-
-    let req = ProxyRequest {
-        id: ctx.request_id,
-        protocol,
-        operation,
-        model: resolved_model,
-        body: body_value,
-        stream,
-    };
-
-    proxy_to_provider(state, req, ctx).await
+    crate::protocol::common::handle_llm_request(
+        state,
+        &headers,
+        body,
+        Protocol::Completions,
+        Operation::ChatCompletions,
+        SessionAffinityMode::Enabled,
+    )
+    .await
 }
 
 /// Build an SSE streaming response from a ProviderStreamResponse.
@@ -201,14 +109,10 @@ fn rewrite_sse_model(chunk: &[u8], alias: &str) -> Vec<u8> {
     output.into_bytes()
 }
 
-#[allow(clippy::too_many_arguments)]
 fn calculate_cost_cents(
-    state: &AppState,
     snapshot: &crate::config_service::ConfigSnapshot,
-    _user_model: &str,
     resolved_model: &str,
     provider_name: &str,
-    _provider: &str,
     tokens: Option<&TokenUsage>,
 ) -> u64 {
     let Some(tokens) = tokens else {
@@ -227,7 +131,7 @@ fn calculate_cost_cents(
             cents.round() as u64
         }
     } else {
-        state.cost.calculate(
+        CostCalculator::from_config(&snapshot.config.cost).calculate(
             resolved_model,
             tokens.prompt_tokens,
             tokens.completion_tokens,
@@ -249,16 +153,907 @@ fn token_log_fields(tokens: Option<&TokenUsage>) -> (i64, i64, i64, i64, i64) {
         .unwrap_or((0, 0, 0, 0, 0))
 }
 
-#[allow(clippy::too_many_arguments)]
+fn next_retry_backoff_ms(
+    retry_policy: &RetryPolicy,
+    attempt: u32,
+    max_attempts: u32,
+) -> Option<u64> {
+    (attempt + 1 < max_attempts).then(|| retry_policy.backoff_for(attempt).as_millis() as u64)
+}
+
+fn record_provider_failure(state: &AppState, provider_name: &str) {
+    if state.router.record_provider_failure(provider_name) {
+        state.sticky_sessions.invalidate_provider(provider_name);
+    }
+}
+
+fn record_sticky_session_success(state: &AppState, ctx: &ProxyContext, provider_name: &str) {
+    if !ctx.config_snapshot.config.routing.sticky.enabled {
+        return;
+    }
+    let Some(session_affinity) = &ctx.session_affinity else {
+        return;
+    };
+    let ttl = std::time::Duration::from_secs(ctx.config_snapshot.config.routing.sticky.ttl_secs);
+    state.sticky_sessions.set_with_ttl(
+        session_affinity.key.clone().into_string(),
+        provider_name.to_string(),
+        ttl,
+    );
+}
+
+struct ErrorLogInput<'a> {
+    request_id: &'a str,
+    api_key_id: &'a str,
+    session_hash: Option<&'a str>,
+    provider_name: &'a str,
+    protocol: &'a str,
+    model: &'a str,
+    operation: &'a str,
+    status_code: i64,
+    success: bool,
+    metadata_json: &'a str,
+    latency_ms: i64,
+    request_body: Option<&'a [u8]>,
+}
+
+/// Build a NewRequestLog for an error response (zero tokens, zero cost).
+fn error_log_entry(input: ErrorLogInput<'_>) -> NewRequestLog<'_> {
+    NewRequestLog {
+        request_id: input.request_id,
+        api_key_id: input.api_key_id,
+        session_hash: input.session_hash,
+        provider_name: input.provider_name,
+        protocol: input.protocol,
+        model: input.model,
+        operation: input.operation,
+        status_code: input.status_code,
+        success: input.success,
+        input_tokens: 0,
+        output_tokens: 0,
+        total_tokens: 0,
+        cached_tokens: 0,
+        cache_write_tokens: 0,
+        cost_cents: 0,
+        latency_ms: input.latency_ms,
+        first_byte_latency_ms: input.latency_ms,
+        metadata_json: input.metadata_json,
+        request_body: input.request_body,
+        response_body: None,
+    }
+}
+
+struct LogMetadataInput<'a> {
+    ctx: &'a ProxyContext,
+    provider_name: &'a str,
+    protocol: &'a str,
+    provider_model: &'a str,
+    status_code: i64,
+    error_code: Option<&'a str>,
+    error_message: Option<&'a str>,
+    attempt_count: u32,
+    retry_count: u32,
+    total_backoff_ms: u64,
+    sticky_hit: Option<bool>,
+    selected_provider_reason: Option<&'a str>,
+    attempts: &'a [RetryAttemptLog],
+    upstream_path: Option<&'a str>,
+}
+
+struct LogSessionMetadata<'a> {
+    id: &'a str,
+    source: Option<&'a str>,
+    hash: Option<&'a str>,
+    affinity_key: Option<&'a str>,
+}
+
+struct LogMetadata<'a> {
+    session: Option<LogSessionMetadata<'a>>,
+    requested_model: &'a str,
+    resolved_model: &'a str,
+    provider_model: &'a str,
+    routing_strategy: &'a str,
+    sticky_enabled: bool,
+    provider_name: &'a str,
+    protocol: &'a str,
+    status_code: i64,
+    error_code: Option<&'a str>,
+    error_message: Option<&'a str>,
+    attempt_count: u32,
+    retry_count: u32,
+    total_backoff_ms: u64,
+    sticky_hit: Option<bool>,
+    selected_provider_reason: Option<&'a str>,
+    attempts: &'a [RetryAttemptLog],
+    upstream_path: Option<&'a str>,
+    currency: &'a str,
+}
+
+#[derive(Debug, Clone)]
+struct RetryAttemptLog {
+    attempt: u32,
+    provider_name: String,
+    protocol: String,
+    provider_model: String,
+    status_code: i64,
+    error_code: Option<String>,
+    error_message: Option<String>,
+    retryable: bool,
+    backoff_ms_before_next: Option<u64>,
+    selected_via: &'static str,
+    sticky_hit: bool,
+    provider_healthy_before_attempt: bool,
+}
+
+impl RetryAttemptLog {
+    fn as_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "attempt": self.attempt,
+            "provider_name": self.provider_name,
+            "protocol": self.protocol,
+            "provider_model": self.provider_model,
+            "status_code": self.status_code,
+            "error_code": self.error_code,
+            "error_message": self.error_message,
+            "retryable": self.retryable,
+            "backoff_ms_before_next": self.backoff_ms_before_next,
+            "selected_via": self.selected_via,
+            "sticky_hit": self.sticky_hit,
+            "provider_healthy_before_attempt": self.provider_healthy_before_attempt
+        })
+    }
+}
+
+fn log_metadata_json(input: LogMetadataInput<'_>) -> String {
+    let session = input
+        .ctx
+        .session_affinity
+        .as_ref()
+        .map(|affinity| LogSessionMetadata {
+            id: affinity.id.as_str(),
+            source: Some(affinity.source.as_str()),
+            hash: Some(affinity.hash.as_str()),
+            affinity_key: Some(affinity.key.as_str()),
+        });
+
+    build_log_metadata_json(LogMetadata {
+        session,
+        requested_model: &input.ctx.model,
+        resolved_model: &input.ctx.resolved_model,
+        provider_model: input.provider_model,
+        routing_strategy: &input.ctx.config_snapshot.config.routing.strategy,
+        sticky_enabled: input.ctx.config_snapshot.config.routing.sticky.enabled,
+        provider_name: input.provider_name,
+        protocol: input.protocol,
+        status_code: input.status_code,
+        error_code: input.error_code,
+        error_message: input.error_message,
+        attempt_count: input.attempt_count,
+        retry_count: input.retry_count,
+        total_backoff_ms: input.total_backoff_ms,
+        sticky_hit: input.sticky_hit,
+        selected_provider_reason: input.selected_provider_reason,
+        attempts: input.attempts,
+        upstream_path: input.upstream_path,
+        currency: &input.ctx.config_snapshot.config.cost.currency,
+    })
+}
+
+fn build_log_metadata_json(input: LogMetadata<'_>) -> String {
+    let session = input.session.map(|session| {
+        serde_json::json!({
+            "id": session.id,
+            "source": session.source,
+            "hash": session.hash,
+            "affinity_key": session.affinity_key
+        })
+    });
+    let error = input.error_code.or(input.error_message).map(|_| {
+        serde_json::json!({
+            "code": input.error_code,
+            "message": input.error_message,
+            "retryable": false
+        })
+    });
+    let attempts: Vec<serde_json::Value> = input
+        .attempts
+        .iter()
+        .map(RetryAttemptLog::as_json)
+        .collect();
+
+    serde_json::json!({
+        "session": session,
+        "models": {
+            "requested": input.requested_model,
+            "resolved": input.resolved_model,
+            "provider": input.provider_model
+        },
+        "routing": {
+            "strategy": input.routing_strategy,
+            "sticky_enabled": input.sticky_enabled,
+            "sticky_hit": input.sticky_hit,
+            "selected_provider_reason": input.selected_provider_reason,
+            "candidates": null
+        },
+        "retry": {
+            "attempt_count": input.attempt_count,
+            "retry_count": input.retry_count,
+            "total_backoff_ms": input.total_backoff_ms,
+            "attempts": attempts
+        },
+        "upstream": {
+            "path": input.upstream_path,
+            "request_id": null,
+            "status_code": input.status_code
+        },
+        "pricing": {
+            "currency": input.currency
+        },
+        "error": error,
+        "body": {
+            "request_body": "upstream_request_body",
+            "response_body": "upstream_response_body"
+        },
+        "provider": {
+            "name": input.provider_name,
+            "protocol": input.protocol
+        }
+    })
+    .to_string()
+}
+
+struct PreparedAttempt {
+    provider_name: String,
+    provider: Arc<dyn crate::provider::ProviderAdapter>,
+    protocol: String,
+    actual_model: String,
+    request_body_bytes: Option<Vec<u8>>,
+    selected_via: &'static str,
+    sticky_hit: bool,
+    provider_healthy_before_attempt: bool,
+}
+
+enum AttemptExecution {
+    Response(Response),
+    Retry(AppError),
+    Fail(AppError),
+}
+
+struct RetryAttemptInput<'a> {
+    attempt: u32,
+    provider_name: &'a str,
+    protocol: &'a str,
+    provider_model: &'a str,
+    status_code: i64,
+    error_code: Option<String>,
+    error_message: Option<String>,
+    retryable: bool,
+    backoff_ms_before_next: Option<u64>,
+    selected_via: &'static str,
+    sticky_hit: bool,
+    provider_healthy_before_attempt: bool,
+}
+
+fn build_retry_attempt_log(input: RetryAttemptInput<'_>) -> RetryAttemptLog {
+    RetryAttemptLog {
+        attempt: input.attempt,
+        provider_name: input.provider_name.to_string(),
+        protocol: input.protocol.to_string(),
+        provider_model: input.provider_model.to_string(),
+        status_code: input.status_code,
+        error_code: input.error_code,
+        error_message: input.error_message,
+        retryable: input.retryable,
+        backoff_ms_before_next: input.backoff_ms_before_next,
+        selected_via: input.selected_via,
+        sticky_hit: input.sticky_hit,
+        provider_healthy_before_attempt: input.provider_healthy_before_attempt,
+    }
+}
+
+struct RequestOutcome<'a> {
+    state: &'a AppState,
+    provider_name: &'a str,
+    actual_model: &'a str,
+    latency: std::time::Duration,
+    tokens: Option<&'a TokenUsage>,
+    cost_cents: u64,
+    api_key_id: &'a str,
+    success: bool,
+}
+
+struct PersistErrorRequestLogInput<'a> {
+    state: &'a AppState,
+    ctx: &'a ProxyContext,
+    api_key_id: &'a str,
+    provider_name: &'a str,
+    protocol: &'a str,
+    provider_model: &'a str,
+    error: &'a AppError,
+    attempt_count: u32,
+    retry_count: u32,
+    total_backoff_ms: u64,
+    sticky_hit: Option<bool>,
+    selected_provider_reason: Option<&'a str>,
+    attempts: &'a [RetryAttemptLog],
+    request_body: Option<&'a [u8]>,
+    latency_ms: i64,
+}
+
+struct AttemptContext<'a> {
+    state: &'a Arc<AppState>,
+    req: &'a ProxyRequest,
+    ctx: &'a ProxyContext,
+    retry_policy: &'a RetryPolicy,
+    api_key_id: &'a str,
+    start: Instant,
+    max_attempts: u32,
+    total_backoff_ms: u64,
+}
+
+struct ProxyFailureInput<'a> {
+    state: &'a AppState,
+    ctx: &'a ProxyContext,
+    api_key_id: &'a str,
+    start: Instant,
+    max_attempts: u32,
+    total_backoff_ms: u64,
+    last_error: Option<AppError>,
+    last_actual_model: Option<&'a str>,
+    retry_attempts: &'a [RetryAttemptLog],
+    request_body: Option<&'a [u8]>,
+}
+
+struct StreamAuditInit<'a> {
+    state: Arc<AppState>,
+    ctx: &'a ProxyContext,
+    provider_name: &'a str,
+    protocol: &'a str,
+    actual_model: &'a str,
+    status_code: u16,
+    start: Instant,
+    first_byte_latency_ms: i64,
+    request_body: Option<Vec<u8>>,
+    attempt_count: u32,
+    retry_count: u32,
+    total_backoff_ms: u64,
+    routing_selected_reason: &'static str,
+    routing_sticky_hit: bool,
+    attempts: Vec<RetryAttemptLog>,
+}
+
+struct StreamAuditCompletion {
+    success: bool,
+    latency: std::time::Duration,
+    latency_ms: i64,
+    cost_cents: u64,
+    error_code: Option<String>,
+    error_message: Option<String>,
+}
+
+fn should_retry_provider_error(error: &AppError) -> bool {
+    matches!(
+        error,
+        AppError::ProviderError { .. }
+            | AppError::ProviderTimeout(_)
+            | AppError::ServiceUnavailable(_)
+    )
+}
+
+fn record_completed_request_outcome(input: RequestOutcome<'_>) {
+    if input.success {
+        input
+            .state
+            .router
+            .record_provider_success(input.provider_name);
+        input.state.stats.record_success(
+            input.actual_model,
+            input.provider_name,
+            input.latency,
+            input.tokens,
+        );
+        input.state.stats.record_cost(input.cost_cents);
+        input
+            .state
+            .stats
+            .record_key_usage(input.api_key_id, input.actual_model, input.cost_cents);
+    } else {
+        record_provider_failure(input.state, input.provider_name);
+        input
+            .state
+            .stats
+            .record_error(input.actual_model, input.provider_name);
+    }
+}
+
+fn prepare_attempt(
+    state: &AppState,
+    req: &ProxyRequest,
+    ctx: &ProxyContext,
+    attempted_providers: &mut HashSet<String>,
+) -> Result<PreparedAttempt, AppError> {
+    let snapshot = ctx.config_snapshot.clone();
+
+    let expected_protocol = req.operation.provider_protocol();
+    let all_providers: Vec<String> = snapshot
+        .providers_for_model(&req.model)
+        .into_iter()
+        .filter(|provider| snapshot.provider_supports_protocol(provider, expected_protocol))
+        .collect();
+
+    if !all_providers.is_empty()
+        && all_providers
+            .iter()
+            .all(|p| attempted_providers.contains(p))
+    {
+        attempted_providers.clear();
+    }
+
+    let session_key = ctx
+        .session_affinity
+        .as_ref()
+        .map(|affinity| affinity.key.as_str())
+        .unwrap_or("");
+    let route_decision = state.router.route_decision_with_exclusions(
+        &req.model,
+        &req.operation,
+        state,
+        &snapshot,
+        session_key,
+        Some(attempted_providers),
+    )?;
+
+    let provider_name = route_decision.provider_name.clone();
+    attempted_providers.insert(provider_name.clone());
+    let provider_healthy_before_attempt = state.router.is_provider_healthy(&provider_name);
+    let provider = snapshot
+        .registry
+        .get(&provider_name)
+        .ok_or_else(|| AppError::NoProviderAvailable(ctx.model.clone()))?;
+    let protocol = ctx.operation.provider_protocol().to_string();
+    let actual_model = provider.resolve_model(&req.model);
+    let outbound_request_body = provider.serialize_request_body(req);
+    let request_body_bytes = serde_json::to_vec(&outbound_request_body).ok();
+
+    Ok(PreparedAttempt {
+        provider_name,
+        provider,
+        protocol,
+        actual_model,
+        request_body_bytes,
+        selected_via: route_decision.selection_reason.as_str(),
+        sticky_hit: route_decision.sticky_hit,
+        provider_healthy_before_attempt,
+    })
+}
+
+async fn persist_error_request_log(input: PersistErrorRequestLogInput<'_>) {
+    let error_code = input.error.error_code();
+    let error_message = input.error.to_string();
+    let request_id = input.ctx.request_id.to_string();
+    let operation = input.ctx.operation.to_string();
+    let metadata = log_metadata_json(LogMetadataInput {
+        ctx: input.ctx,
+        provider_name: input.provider_name,
+        protocol: input.protocol,
+        provider_model: input.provider_model,
+        status_code: input.error.status_code().as_u16() as i64,
+        error_code: Some(error_code.as_ref()),
+        error_message: Some(&error_message),
+        attempt_count: input.attempt_count,
+        retry_count: input.retry_count,
+        total_backoff_ms: input.total_backoff_ms,
+        sticky_hit: input.sticky_hit,
+        selected_provider_reason: input.selected_provider_reason,
+        attempts: input.attempts,
+        upstream_path: None,
+    });
+
+    // Best-effort audit logging: request handling should not fail if persistence is unavailable.
+    if let Err(err) = audit::record_llm_request(
+        input.state,
+        error_log_entry(ErrorLogInput {
+            request_id: &request_id,
+            api_key_id: input.api_key_id,
+            session_hash: input
+                .ctx
+                .session_affinity
+                .as_ref()
+                .map(|affinity| affinity.hash.as_str()),
+            provider_name: input.provider_name,
+            protocol: input.protocol,
+            model: &input.ctx.resolved_model,
+            operation: &operation,
+            status_code: input.error.status_code().as_u16() as i64,
+            success: false,
+            metadata_json: &metadata,
+            latency_ms: input.latency_ms,
+            request_body: input.request_body,
+        }),
+    )
+    .await
+    {
+        tracing::warn!(
+            request_id = %input.ctx.request_id,
+            error = %err,
+            "Failed to persist error request audit"
+        );
+    }
+}
+
+async fn execute_stream_attempt(
+    input: AttemptContext<'_>,
+    prepared: PreparedAttempt,
+    attempt: u32,
+    retry_attempts: &mut Vec<RetryAttemptLog>,
+) -> AttemptExecution {
+    let attempt_number = attempt + 1;
+
+    match prepared.provider.proxy_stream(input.req.clone()).await {
+        Ok(stream_resp) => {
+            let first_byte_latency_ms = stream_resp.first_byte_latency_ms as i64;
+            let mut attempts = std::mem::take(retry_attempts);
+            attempts.push(build_retry_attempt_log(RetryAttemptInput {
+                attempt: attempt_number,
+                provider_name: &prepared.provider_name,
+                protocol: &prepared.protocol,
+                provider_model: &prepared.actual_model,
+                status_code: stream_resp.status as i64,
+                error_code: None,
+                error_message: None,
+                retryable: false,
+                backoff_ms_before_next: None,
+                selected_via: prepared.selected_via,
+                sticky_hit: prepared.sticky_hit,
+                provider_healthy_before_attempt: prepared.provider_healthy_before_attempt,
+            }));
+            let audit = StreamAudit::new(StreamAuditInit {
+                state: input.state.clone(),
+                ctx: input.ctx,
+                provider_name: &prepared.provider_name,
+                protocol: &prepared.protocol,
+                actual_model: &prepared.actual_model,
+                status_code: stream_resp.status,
+                start: input.start,
+                first_byte_latency_ms,
+                request_body: prepared.request_body_bytes,
+                attempt_count: attempt_number,
+                retry_count: attempt,
+                total_backoff_ms: input.total_backoff_ms,
+                routing_selected_reason: prepared.selected_via,
+                routing_sticky_hit: prepared.sticky_hit,
+                attempts,
+            });
+
+            record_sticky_session_success(input.state, input.ctx, &prepared.provider_name);
+
+            tracing::info!(
+                request_id = %input.ctx.request_id,
+                model = %prepared.actual_model,
+                public_model = %input.ctx.model,
+                provider = %prepared.provider_name,
+                status = stream_resp.status,
+                first_byte_latency_ms = first_byte_latency_ms,
+                stream = true,
+                "Streaming request started"
+            );
+
+            AttemptExecution::Response(stream_response(
+                stream_resp,
+                Some(input.ctx.model.clone()),
+                audit,
+            ))
+        }
+        Err(error) => {
+            record_provider_failure(input.state, &prepared.provider_name);
+            let should_retry = should_retry_provider_error(&error);
+            let error_message = error.to_string();
+            retry_attempts.push(build_retry_attempt_log(RetryAttemptInput {
+                attempt: attempt_number,
+                provider_name: &prepared.provider_name,
+                protocol: &prepared.protocol,
+                provider_model: &prepared.actual_model,
+                status_code: error.status_code().as_u16() as i64,
+                error_code: Some(error.error_code().into_owned()),
+                error_message: Some(error_message.clone()),
+                retryable: should_retry,
+                backoff_ms_before_next: should_retry
+                    .then(|| next_retry_backoff_ms(input.retry_policy, attempt, input.max_attempts))
+                    .flatten(),
+                selected_via: prepared.selected_via,
+                sticky_hit: prepared.sticky_hit,
+                provider_healthy_before_attempt: prepared.provider_healthy_before_attempt,
+            }));
+
+            if should_retry {
+                return AttemptExecution::Retry(error);
+            }
+
+            input
+                .state
+                .stats
+                .record_error(&prepared.actual_model, &prepared.provider_name);
+            let latency_ms = input.start.elapsed().as_millis() as i64;
+            persist_error_request_log(PersistErrorRequestLogInput {
+                state: input.state,
+                ctx: input.ctx,
+                api_key_id: input.api_key_id,
+                provider_name: &prepared.provider_name,
+                protocol: &prepared.protocol,
+                provider_model: &prepared.actual_model,
+                error: &error,
+                attempt_count: attempt_number,
+                retry_count: attempt,
+                total_backoff_ms: input.total_backoff_ms,
+                sticky_hit: Some(prepared.sticky_hit),
+                selected_provider_reason: Some(prepared.selected_via),
+                attempts: retry_attempts,
+                request_body: prepared.request_body_bytes.as_deref(),
+                latency_ms,
+            })
+            .await;
+
+            AttemptExecution::Fail(error)
+        }
+    }
+}
+
+async fn execute_non_stream_attempt(
+    input: AttemptContext<'_>,
+    prepared: PreparedAttempt,
+    attempt: u32,
+    retry_attempts: &mut Vec<RetryAttemptLog>,
+) -> AttemptExecution {
+    let attempt_number = attempt + 1;
+
+    match prepared.provider.proxy(input.req.clone()).await {
+        Ok(response) => {
+            let latency = input.start.elapsed();
+            let latency_ms = latency.as_millis() as i64;
+            let first_byte_latency_ms = response.first_byte_latency_ms as i64;
+            let response_body_bytes = serde_json::to_vec(&response.body).ok();
+            let cost_cents = calculate_cost_cents(
+                &input.ctx.config_snapshot,
+                &prepared.actual_model,
+                &prepared.provider_name,
+                response.tokens.as_ref(),
+            );
+            let (provider_error_code, provider_error_message) = if response.status >= 400 {
+                audit::extract_provider_error(&response.body)
+            } else {
+                (None, None)
+            };
+            let should_retry_response = input.retry_policy.should_retry(response.status)
+                && attempt_number < input.max_attempts;
+            retry_attempts.push(build_retry_attempt_log(RetryAttemptInput {
+                attempt: attempt_number,
+                provider_name: &prepared.provider_name,
+                protocol: &prepared.protocol,
+                provider_model: &prepared.actual_model,
+                status_code: response.status as i64,
+                error_code: provider_error_code.clone(),
+                error_message: provider_error_message.clone(),
+                retryable: should_retry_response,
+                backoff_ms_before_next: should_retry_response
+                    .then(|| next_retry_backoff_ms(input.retry_policy, attempt, input.max_attempts))
+                    .flatten(),
+                selected_via: prepared.selected_via,
+                sticky_hit: prepared.sticky_hit,
+                provider_healthy_before_attempt: prepared.provider_healthy_before_attempt,
+            }));
+
+            if should_retry_response {
+                record_provider_failure(input.state, &prepared.provider_name);
+                return AttemptExecution::Retry(AppError::ProviderError {
+                    provider_name: prepared.provider_name.clone(),
+                    status_code: StatusCode::from_u16(response.status).ok(),
+                    error_code: provider_error_code,
+                    message: provider_error_message
+                        .unwrap_or_else(|| format!("Provider returned {}", response.status)),
+                });
+            }
+
+            record_completed_request_outcome(RequestOutcome {
+                state: input.state.as_ref(),
+                provider_name: &prepared.provider_name,
+                actual_model: &prepared.actual_model,
+                latency,
+                tokens: response.tokens.as_ref(),
+                cost_cents,
+                api_key_id: input.api_key_id,
+                success: response.status < 400,
+            });
+
+            let (input_tokens, output_tokens, total_tokens, cached_tokens, cache_write_tokens) =
+                token_log_fields(response.tokens.as_ref());
+            let metadata = log_metadata_json(LogMetadataInput {
+                ctx: input.ctx,
+                provider_name: &prepared.provider_name,
+                protocol: &prepared.protocol,
+                provider_model: &prepared.actual_model,
+                status_code: response.status as i64,
+                error_code: provider_error_code.as_deref(),
+                error_message: provider_error_message.as_deref(),
+                attempt_count: attempt_number,
+                retry_count: attempt,
+                total_backoff_ms: input.total_backoff_ms,
+                sticky_hit: Some(prepared.sticky_hit),
+                selected_provider_reason: Some(prepared.selected_via),
+                attempts: retry_attempts,
+                upstream_path: None,
+            });
+            // Best-effort audit logging: a completed response should still be returned if persistence fails.
+            if let Err(err) = audit::record_llm_request(
+                input.state,
+                NewRequestLog {
+                    request_id: &input.ctx.request_id.to_string(),
+                    api_key_id: input.api_key_id,
+                    session_hash: input
+                        .ctx
+                        .session_affinity
+                        .as_ref()
+                        .map(|affinity| affinity.hash.as_str()),
+                    provider_name: &prepared.provider_name,
+                    protocol: &prepared.protocol,
+                    model: &input.ctx.resolved_model,
+                    operation: &input.ctx.operation.to_string(),
+                    status_code: response.status as i64,
+                    success: response.status < 400 && provider_error_message.is_none(),
+                    input_tokens,
+                    output_tokens,
+                    total_tokens,
+                    cached_tokens,
+                    cache_write_tokens,
+                    cost_cents: cost_cents as i64,
+                    latency_ms,
+                    first_byte_latency_ms,
+                    metadata_json: &metadata,
+                    request_body: prepared.request_body_bytes.as_deref(),
+                    response_body: response_body_bytes.as_deref(),
+                },
+            )
+            .await
+            {
+                tracing::warn!(
+                    request_id = %input.ctx.request_id,
+                    error = %err,
+                    "Failed to persist completed request audit"
+                );
+            }
+
+            record_sticky_session_success(input.state, input.ctx, &prepared.provider_name);
+
+            tracing::info!(
+                request_id = %input.ctx.request_id,
+                model = %prepared.actual_model,
+                public_model = %input.ctx.resolved_model,
+                provider = %prepared.provider_name,
+                status = response.status,
+                latency_ms = latency_ms,
+                tokens = ?response.tokens,
+                cost_cents = cost_cents,
+                "Request completed"
+            );
+
+            let status =
+                StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let mut body = response.body;
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert(
+                    "model".to_string(),
+                    serde_json::Value::String(input.ctx.model.clone()),
+                );
+            }
+
+            AttemptExecution::Response((status, Json(body)).into_response())
+        }
+        Err(error) => {
+            record_provider_failure(input.state, &prepared.provider_name);
+            let should_retry = should_retry_provider_error(&error);
+            let error_message = error.to_string();
+            retry_attempts.push(build_retry_attempt_log(RetryAttemptInput {
+                attempt: attempt_number,
+                provider_name: &prepared.provider_name,
+                protocol: &prepared.protocol,
+                provider_model: &prepared.actual_model,
+                status_code: error.status_code().as_u16() as i64,
+                error_code: Some(error.error_code().into_owned()),
+                error_message: Some(error_message.clone()),
+                retryable: should_retry,
+                backoff_ms_before_next: should_retry
+                    .then(|| next_retry_backoff_ms(input.retry_policy, attempt, input.max_attempts))
+                    .flatten(),
+                selected_via: prepared.selected_via,
+                sticky_hit: prepared.sticky_hit,
+                provider_healthy_before_attempt: prepared.provider_healthy_before_attempt,
+            }));
+
+            if should_retry {
+                return AttemptExecution::Retry(error);
+            }
+
+            input
+                .state
+                .stats
+                .record_error(&prepared.actual_model, &prepared.provider_name);
+            let latency_ms = input.start.elapsed().as_millis() as i64;
+            persist_error_request_log(PersistErrorRequestLogInput {
+                state: input.state,
+                ctx: input.ctx,
+                api_key_id: input.api_key_id,
+                provider_name: &prepared.provider_name,
+                protocol: &prepared.protocol,
+                provider_model: &prepared.actual_model,
+                error: &error,
+                attempt_count: attempt_number,
+                retry_count: attempt,
+                total_backoff_ms: input.total_backoff_ms,
+                sticky_hit: Some(prepared.sticky_hit),
+                selected_provider_reason: Some(prepared.selected_via),
+                attempts: retry_attempts,
+                request_body: prepared.request_body_bytes.as_deref(),
+                latency_ms,
+            })
+            .await;
+
+            AttemptExecution::Fail(error)
+        }
+    }
+}
+
+async fn finalize_proxy_failure(input: ProxyFailureInput<'_>) -> AppError {
+    let provider_model = input.last_actual_model.unwrap_or(&input.ctx.resolved_model);
+    let had_last_error = input.last_error.is_some();
+    let err = input
+        .last_error
+        .unwrap_or_else(|| AppError::NoProviderAvailable(input.ctx.model.clone()));
+
+    if had_last_error {
+        input
+            .state
+            .stats
+            .record_error(provider_model, "retry_exhausted");
+    }
+
+    let latency_ms = input.start.elapsed().as_millis() as i64;
+    let protocol = input.ctx.protocol.to_string();
+    persist_error_request_log(PersistErrorRequestLogInput {
+        state: input.state,
+        ctx: input.ctx,
+        api_key_id: input.api_key_id,
+        provider_name: "unrouted",
+        protocol: &protocol,
+        provider_model,
+        error: &err,
+        attempt_count: input.max_attempts,
+        retry_count: input.max_attempts.saturating_sub(1),
+        total_backoff_ms: input.total_backoff_ms,
+        sticky_hit: None,
+        selected_provider_reason: None,
+        attempts: input.retry_attempts,
+        request_body: input.request_body,
+        latency_ms,
+    })
+    .await;
+
+    err
+}
+
 struct StreamAudit {
     state: Arc<AppState>,
     config_snapshot: std::sync::Arc<crate::config_service::ConfigSnapshot>,
     request_id: String,
     api_key_id: String,
-    auth_key: String,
     provider_name: String,
-    provider: String,
-    user_model: String,
+    protocol: String,
+    requested_model: String,
+    resolved_model: String,
+    session_id: Option<String>,
+    session_source: Option<String>,
+    session_hash: Option<String>,
+    session_affinity_key: Option<String>,
+    routing_strategy: String,
+    sticky_enabled: bool,
     actual_model: String,
     operation: String,
     status_code: u16,
@@ -266,6 +1061,12 @@ struct StreamAudit {
     first_byte_latency_ms: i64,
     first_chunk_seen: bool,
     request_body: Option<Vec<u8>>,
+    attempt_count: u32,
+    retry_count: u32,
+    total_backoff_ms: u64,
+    routing_selected_reason: &'static str,
+    routing_sticky_hit: bool,
+    attempts: Vec<RetryAttemptLog>,
     tokens: Option<TokenUsage>,
     error_code: Option<String>,
     error_message: Option<String>,
@@ -274,34 +1075,51 @@ struct StreamAudit {
 }
 
 impl StreamAudit {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        state: Arc<AppState>,
-        ctx: &ProxyContext,
-        provider_name: &str,
-        provider: &str,
-        actual_model: &str,
-        status_code: u16,
-        start: Instant,
-        first_byte_latency_ms: i64,
-        request_body: Option<Vec<u8>>,
-    ) -> Self {
+    fn new(input: StreamAuditInit<'_>) -> Self {
         Self {
-            state,
-            config_snapshot: ctx.config_snapshot.clone(),
-            request_id: ctx.request_id.to_string(),
-            api_key_id: auth::persisted_api_key_id(&ctx.auth_key).to_string(),
-            auth_key: ctx.auth_key.key.clone(),
-            provider_name: provider_name.to_string(),
-            provider: provider.to_string(),
-            user_model: ctx.model.clone(),
-            actual_model: actual_model.to_string(),
-            operation: ctx.operation.to_string(),
-            status_code,
-            start,
-            first_byte_latency_ms,
+            state: input.state,
+            config_snapshot: input.ctx.config_snapshot.clone(),
+            request_id: input.ctx.request_id.to_string(),
+            api_key_id: auth::persisted_api_key_id(&input.ctx.auth_key).to_string(),
+            provider_name: input.provider_name.to_string(),
+            protocol: input.protocol.to_string(),
+            requested_model: input.ctx.model.clone(),
+            resolved_model: input.ctx.resolved_model.clone(),
+            session_id: input
+                .ctx
+                .session_affinity
+                .as_ref()
+                .map(|affinity| affinity.id.clone()),
+            session_source: input
+                .ctx
+                .session_affinity
+                .as_ref()
+                .map(|affinity| affinity.source.clone()),
+            session_hash: input
+                .ctx
+                .session_affinity
+                .as_ref()
+                .map(|affinity| affinity.hash.clone()),
+            session_affinity_key: input
+                .ctx
+                .session_affinity
+                .as_ref()
+                .map(|affinity| affinity.key.as_str().to_string()),
+            routing_strategy: input.ctx.config_snapshot.config.routing.strategy.clone(),
+            sticky_enabled: input.ctx.config_snapshot.config.routing.sticky.enabled,
+            actual_model: input.actual_model.to_string(),
+            operation: input.ctx.operation.to_string(),
+            status_code: input.status_code,
+            start: input.start,
+            first_byte_latency_ms: input.first_byte_latency_ms,
             first_chunk_seen: false,
-            request_body,
+            request_body: input.request_body,
+            attempt_count: input.attempt_count,
+            retry_count: input.retry_count,
+            total_backoff_ms: input.total_backoff_ms,
+            routing_selected_reason: input.routing_selected_reason,
+            routing_sticky_hit: input.routing_sticky_hit,
+            attempts: input.attempts,
             tokens: None,
             error_code: None,
             error_message: None,
@@ -345,7 +1163,7 @@ impl StreamAudit {
     }
 
     fn observe_json_event(&mut self, value: &serde_json::Value) {
-        if self.provider == "messages" {
+        if self.protocol == "messages" {
             if let Some(usage) = value
                 .get("message")
                 .and_then(|message| message.get("usage"))
@@ -377,12 +1195,7 @@ impl StreamAudit {
         }
     }
 
-    fn finish(&mut self, stream_error: Option<(&str, String)>) {
-        if self.finished {
-            return;
-        }
-        self.finished = true;
-
+    fn completion_info(&self, stream_error: Option<(&str, String)>) -> StreamAuditCompletion {
         let (forced_code, forced_message) = stream_error
             .map(|(code, message)| (Some(code.to_string()), Some(message)))
             .unwrap_or((None, None));
@@ -399,69 +1212,153 @@ impl StreamAudit {
         });
         let success = self.status_code < 400 && error_message.is_none();
         let latency = self.start.elapsed();
-        let latency_ms = latency.as_millis() as i64;
         let cost_cents = if success {
             calculate_cost_cents(
-                &self.state,
                 &self.config_snapshot,
-                &self.user_model,
                 &self.actual_model,
                 &self.provider_name,
-                &self.provider,
                 self.tokens.as_ref(),
             )
         } else {
             0
         };
 
-        if success {
-            self.state
-                .router
-                .record_provider_success(&self.provider_name);
-            self.state.stats.record_success(
-                &self.actual_model,
-                &self.provider_name,
-                latency,
-                self.tokens.as_ref(),
-            );
-            self.state.stats.record_cost(cost_cents);
-            self.state
-                .stats
-                .record_key_usage(&self.auth_key, &self.actual_model, cost_cents);
-        } else {
-            self.state
-                .router
-                .record_provider_failure(&self.provider_name);
-            self.state
-                .stats
-                .record_error(&self.actual_model, &self.provider_name);
+        StreamAuditCompletion {
+            success,
+            latency,
+            latency_ms: latency.as_millis() as i64,
+            cost_cents,
+            error_code,
+            error_message,
         }
+    }
+
+    fn record_completion_stats(&self, completion: &StreamAuditCompletion) {
+        record_completed_request_outcome(RequestOutcome {
+            state: &self.state,
+            provider_name: &self.provider_name,
+            actual_model: &self.actual_model,
+            latency: completion.latency,
+            tokens: self.tokens.as_ref(),
+            cost_cents: completion.cost_cents,
+            api_key_id: &self.api_key_id,
+            success: completion.success,
+        });
+    }
+
+    fn spawn_persist_completion_log(
+        &self,
+        completion: StreamAuditCompletion,
+        input_tokens: i64,
+        output_tokens: i64,
+        total_tokens: i64,
+        cached_tokens: i64,
+        cache_write_tokens: i64,
+    ) {
+        let state = self.state.clone();
+        let request_id = self.request_id.clone();
+        let api_key_id = self.api_key_id.clone();
+        let provider_name = self.provider_name.clone();
+        let protocol = self.protocol.clone();
+        let actual_model = self.actual_model.clone();
+        let operation = self.operation.clone();
+        let status_code = self.status_code;
+        let first_byte_latency_ms = self.first_byte_latency_ms;
+        let request_body = self.request_body.clone();
+        let session_hash = self.session_hash.clone();
+        let error_code = completion.error_code.clone();
+        let error_message = completion.error_message.clone();
+        let session_id = self.session_id.clone();
+        let session_source = self.session_source.clone();
+        let session_affinity_key = self.session_affinity_key.clone();
+        let requested_model = self.requested_model.clone();
+        let resolved_model = self.resolved_model.clone();
+        let routing_strategy = self.routing_strategy.clone();
+        let sticky_enabled = self.sticky_enabled;
+        let currency = self.config_snapshot.config.cost.currency.clone();
+        let metadata = build_log_metadata_json(LogMetadata {
+            session: session_id.as_deref().map(|id| LogSessionMetadata {
+                id,
+                source: session_source.as_deref(),
+                hash: session_hash.as_deref(),
+                affinity_key: session_affinity_key.as_deref(),
+            }),
+            requested_model: &requested_model,
+            resolved_model: &resolved_model,
+            provider_model: &actual_model,
+            routing_strategy: &routing_strategy,
+            sticky_enabled,
+            provider_name: &provider_name,
+            protocol: &protocol,
+            status_code: status_code as i64,
+            error_code: error_code.as_deref(),
+            error_message: error_message.as_deref(),
+            attempt_count: self.attempt_count,
+            retry_count: self.retry_count,
+            total_backoff_ms: self.total_backoff_ms,
+            sticky_hit: Some(self.routing_sticky_hit),
+            selected_provider_reason: Some(self.routing_selected_reason),
+            attempts: &self.attempts,
+            upstream_path: None,
+            currency: &currency,
+        });
+
+        tokio::spawn(async move {
+            // Best-effort audit logging: streaming completion should not block socket teardown.
+            if let Err(err) = audit::record_llm_request(
+                &state,
+                NewRequestLog {
+                    request_id: &request_id,
+                    api_key_id: &api_key_id,
+                    session_hash: session_hash.as_deref(),
+                    provider_name: &provider_name,
+                    protocol: &protocol,
+                    model: &resolved_model,
+                    operation: &operation,
+                    status_code: status_code as i64,
+                    success: completion.success,
+                    input_tokens,
+                    output_tokens,
+                    total_tokens,
+                    cached_tokens,
+                    cache_write_tokens,
+                    cost_cents: completion.cost_cents as i64,
+                    latency_ms: completion.latency_ms,
+                    first_byte_latency_ms,
+                    metadata_json: &metadata,
+                    request_body: request_body.as_deref(),
+                    response_body: None,
+                },
+            )
+            .await
+            {
+                tracing::warn!(
+                    request_id = %request_id,
+                    error = %err,
+                    "Failed to persist streaming completion audit"
+                );
+            }
+        });
+    }
+
+    fn finish(&mut self, stream_error: Option<(&str, String)>) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+
+        let completion = self.completion_info(stream_error);
+        self.record_completion_stats(&completion);
 
         let (input_tokens, output_tokens, total_tokens, cached_tokens, cache_write_tokens) =
             token_log_fields(self.tokens.as_ref());
-        let _ = audit::record_llm_request(
-            &self.state,
-            NewRequestLog {
-                request_id: &self.request_id,
-                api_key_id: &self.api_key_id,
-                provider_name: &self.provider_name,
-                provider: &self.provider,
-                model: &self.actual_model,
-                operation: &self.operation,
-                status_code: self.status_code as i64,
-                input_tokens,
-                output_tokens,
-                total_tokens,
-                cached_tokens,
-                cache_write_tokens,
-                cost_cents: cost_cents as i64,
-                latency_ms,
-                first_byte_latency_ms: self.first_byte_latency_ms,
-                error_code: error_code.as_deref(),
-                error: error_message.as_deref(),
-                request_body: self.request_body.as_deref(),
-                response_body: None,
-            },
+        self.spawn_persist_completion_log(
+            completion,
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            cached_tokens,
+            cache_write_tokens,
         );
     }
 }
@@ -528,357 +1425,95 @@ pub async fn proxy_to_provider(
     let start = std::time::Instant::now();
     let original_request_body_bytes = serde_json::to_vec(&req.body).ok();
     let api_key_id = auth::persisted_api_key_id(&ctx.auth_key);
-
-    // Route to provider (with retry support)
-    let retry_policy = &state.retry_policy;
+    let retry_policy = RetryPolicy::from_config(&ctx.config_snapshot.config.retry);
     let max_attempts = retry_policy.max_attempts();
     let mut last_error: Option<AppError> = None;
     let mut last_actual_model: Option<String> = None;
+    let mut total_backoff_ms = 0u64;
+    let mut attempted_providers = HashSet::new();
+    let mut retry_attempts = Vec::new();
 
     for attempt in 0..max_attempts {
         if attempt > 0 {
             let backoff = retry_policy.backoff_for(attempt - 1);
+            let backoff_ms = backoff.as_millis() as u64;
+            total_backoff_ms = total_backoff_ms.saturating_add(backoff_ms);
             tracing::warn!(
                 request_id = %ctx.request_id,
                 attempt = attempt,
-                backoff_ms = backoff.as_millis(),
+                backoff_ms,
                 "Retrying request"
             );
             tokio::time::sleep(backoff).await;
-        }
-
-        let snapshot = ctx.config_snapshot.clone();
-
-        // If a forced_provider is specified (from alias), use it directly;
-        // otherwise route normally via the router.
-        let provider_name = if let Some(ref forced) = ctx.forced_provider {
-            state.router.ensure_provider_health_entry(forced);
+            // Force check recovery before retrying
             state.router.check_recovery();
-            if snapshot.enabled_provider_can_serve_model(forced, &req.model)
-                && snapshot.provider_protocol(forced) == Some(req.operation.provider_protocol())
-                && state.router.is_provider_healthy(forced)
-            {
-                forced.clone()
-            } else {
-                last_error = Some(AppError::NoProviderAvailable(ctx.model.clone()));
-                continue;
-            }
-        } else {
-            let session_key = ctx.session_key.as_deref().unwrap_or("");
-            match state
-                .router
-                .route(&req.model, &req.operation, &state, &snapshot, session_key)
-            {
-                Ok(name) => name,
-                Err(e) => {
-                    last_error = Some(e);
-                    continue;
-                }
-            }
-        };
+        }
 
-        let provider = match snapshot.registry.get(&provider_name) {
-            Some(b) => b,
-            None => {
-                last_error = Some(AppError::NoProviderAvailable(ctx.model.clone()));
+        let prepared = match prepare_attempt(&state, &req, &ctx, &mut attempted_providers) {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                last_error = Some(err);
                 continue;
             }
         };
-        let actual_model = provider.resolve_model(&req.model);
-        last_actual_model = Some(actual_model.clone());
-        let outbound_request_body = provider.serialize_request_body(&req);
-        let request_body_bytes = serde_json::to_vec(&outbound_request_body).ok();
+        last_actual_model = Some(prepared.actual_model.clone());
 
-        // If streaming, use proxy_stream and return SSE response
-        if ctx.stream {
-            match provider.proxy_stream(req.clone()).await {
-                Ok(stream_resp) => {
-                    let first_byte_latency_ms = stream_resp.first_byte_latency_ms as i64;
-                    let audit = StreamAudit::new(
-                        state.clone(),
-                        &ctx,
-                        &provider_name,
-                        provider.protocol(),
-                        &actual_model,
-                        stream_resp.status,
-                        start,
-                        first_byte_latency_ms,
-                        request_body_bytes,
-                    );
-
-                    // Update sticky session
-                    if snapshot.config.routing.sticky.enabled {
-                        let session_key = format!("{}:{}", ctx.auth_key.key, ctx.model);
-                        state
-                            .sticky_sessions
-                            .set(session_key, provider_name.clone());
-                    }
-
-                    tracing::info!(
-                        request_id = %ctx.request_id,
-                        model = %actual_model,
-                        public_model = %ctx.model,
-                        provider = %provider_name,
-                        status = stream_resp.status,
-                        first_byte_latency_ms = first_byte_latency_ms,
-                        stream = true,
-                        "Streaming request started"
-                    );
-
-                    return Ok(stream_response(stream_resp, Some(ctx.model.clone()), audit));
-                }
-                Err(e) => {
-                    state.router.record_provider_failure(&provider_name);
-                    let should_retry = matches!(
-                        &e,
-                        AppError::ProviderError { .. }
-                            | AppError::ProviderTimeout(_)
-                            | AppError::ServiceUnavailable(_)
-                    );
-                    if !should_retry {
-                        state.stats.record_error(&actual_model, &provider_name);
-                        let error_msg = e.to_string();
-                        let latency_ms = start.elapsed().as_millis() as i64;
-                        let _ = audit::record_llm_request(
-                            &state,
-                            NewRequestLog {
-                                request_id: &ctx.request_id.to_string(),
-                                api_key_id,
-                                provider_name: &provider_name,
-                                provider: provider.protocol(),
-                                model: &actual_model,
-                                operation: &ctx.operation.to_string(),
-                                status_code: e.status_code().as_u16() as i64,
-                                input_tokens: 0,
-                                output_tokens: 0,
-                                total_tokens: 0,
-                                cached_tokens: 0,
-                                cache_write_tokens: 0,
-                                cost_cents: 0,
-                                latency_ms,
-                                first_byte_latency_ms: latency_ms,
-                                error_code: Some(e.error_code()),
-                                error: Some(&error_msg),
-                                request_body: request_body_bytes.as_deref(),
-                                response_body: None,
-                            },
-                        );
-                        return Err(e);
-                    }
-                    last_error = Some(e);
-                }
-            }
+        let execution = if ctx.stream {
+            execute_stream_attempt(
+                AttemptContext {
+                    state: &state,
+                    req: &req,
+                    ctx: &ctx,
+                    retry_policy: &retry_policy,
+                    api_key_id,
+                    start,
+                    max_attempts,
+                    total_backoff_ms,
+                },
+                prepared,
+                attempt,
+                &mut retry_attempts,
+            )
+            .await
         } else {
-            // Non-streaming: execute proxy
-            match provider.proxy(req.clone()).await {
-                Ok(response) => {
-                    let latency = start.elapsed();
-                    let latency_ms = latency.as_millis() as u64;
-                    let first_byte_latency_ms = response.first_byte_latency_ms as i64;
-                    let response_body_bytes = serde_json::to_vec(&response.body).ok();
+            execute_non_stream_attempt(
+                AttemptContext {
+                    state: &state,
+                    req: &req,
+                    ctx: &ctx,
+                    retry_policy: &retry_policy,
+                    api_key_id,
+                    start,
+                    max_attempts,
+                    total_backoff_ms,
+                },
+                prepared,
+                attempt,
+                &mut retry_attempts,
+            )
+            .await
+        };
 
-                    let cost_cents = calculate_cost_cents(
-                        &state,
-                        &ctx.config_snapshot,
-                        &ctx.model,
-                        &actual_model,
-                        &provider_name,
-                        provider.protocol(),
-                        response.tokens.as_ref(),
-                    );
-
-                    if response.status < 400 {
-                        state.router.record_provider_success(&provider_name);
-                        state.stats.record_success(
-                            &actual_model,
-                            &provider_name,
-                            latency,
-                            response.tokens.as_ref(),
-                        );
-                        state.stats.record_cost(cost_cents);
-                        state
-                            .stats
-                            .record_key_usage(&ctx.auth_key.key, &actual_model, cost_cents);
-                    } else {
-                        state.router.record_provider_failure(&provider_name);
-                        state.stats.record_error(&actual_model, &provider_name);
-                    }
-
-                    let (provider_error_code, provider_error_message) = if response.status >= 400 {
-                        audit::extract_provider_error(&response.body)
-                    } else {
-                        (None, None)
-                    };
-                    let (
-                        input_tokens,
-                        output_tokens,
-                        total_tokens,
-                        cached_tokens,
-                        cache_write_tokens,
-                    ) = token_log_fields(response.tokens.as_ref());
-                    let _ = audit::record_llm_request(
-                        &state,
-                        NewRequestLog {
-                            request_id: &ctx.request_id.to_string(),
-                            api_key_id,
-                            provider_name: &provider_name,
-                            provider: provider.protocol(),
-                            model: &actual_model,
-                            operation: &ctx.operation.to_string(),
-                            status_code: response.status as i64,
-                            input_tokens,
-                            output_tokens,
-                            total_tokens,
-                            cached_tokens,
-                            cache_write_tokens,
-                            cost_cents: cost_cents as i64,
-                            latency_ms: latency_ms as i64,
-                            first_byte_latency_ms,
-                            error_code: provider_error_code.as_deref(),
-                            error: provider_error_message.as_deref(),
-                            request_body: request_body_bytes.as_deref(),
-                            response_body: response_body_bytes.as_deref(),
-                        },
-                    );
-
-                    // Update sticky session
-                    if snapshot.config.routing.sticky.enabled {
-                        let session_key = format!("{}:{}", ctx.auth_key.key, ctx.model);
-                        state
-                            .sticky_sessions
-                            .set(session_key, provider_name.clone());
-                    }
-
-                    let status = StatusCode::from_u16(response.status)
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-
-                    tracing::info!(
-                        request_id = %ctx.request_id,
-                        model = %actual_model,
-                        public_model = %ctx.resolved_model,
-                        provider = %provider_name,
-                        status = response.status,
-                        latency_ms = latency_ms,
-                        tokens = ?response.tokens,
-                        cost_cents = cost_cents,
-                        "Request completed"
-                    );
-
-                    let mut body = response.body;
-                    if let Some(obj) = body.as_object_mut() {
-                        obj.insert(
-                            "model".to_string(),
-                            serde_json::Value::String(ctx.model.clone()),
-                        );
-                    }
-
-                    return Ok((status, Json(body)).into_response());
-                }
-                Err(e) => {
-                    state.router.record_provider_failure(&provider_name);
-                    let should_retry = matches!(
-                        &e,
-                        AppError::ProviderError { .. }
-                            | AppError::ProviderTimeout(_)
-                            | AppError::ServiceUnavailable(_)
-                    );
-                    if !should_retry {
-                        state.stats.record_error(&actual_model, &provider_name);
-                        let error_msg = e.to_string();
-                        let latency_ms = start.elapsed().as_millis() as i64;
-                        let _ = audit::record_llm_request(
-                            &state,
-                            NewRequestLog {
-                                request_id: &ctx.request_id.to_string(),
-                                api_key_id,
-                                provider_name: &provider_name,
-                                provider: provider.protocol(),
-                                model: &actual_model,
-                                operation: &ctx.operation.to_string(),
-                                status_code: e.status_code().as_u16() as i64,
-                                input_tokens: 0,
-                                output_tokens: 0,
-                                total_tokens: 0,
-                                cached_tokens: 0,
-                                cache_write_tokens: 0,
-                                cost_cents: 0,
-                                latency_ms,
-                                first_byte_latency_ms: latency_ms,
-                                error_code: Some(e.error_code()),
-                                error: Some(&error_msg),
-                                request_body: request_body_bytes.as_deref(),
-                                response_body: None,
-                            },
-                        );
-                        return Err(e);
-                    }
-                    last_error = Some(e);
-                }
-            }
+        match execution {
+            AttemptExecution::Response(response) => return Ok(response),
+            AttemptExecution::Retry(err) => last_error = Some(err),
+            AttemptExecution::Fail(err) => return Err(err),
         }
     }
 
-    // All retries exhausted
-    if let Some(err) = last_error {
-        let log_model = last_actual_model.as_deref().unwrap_or(&ctx.resolved_model);
-        state.stats.record_error(log_model, "retry_exhausted");
-        let error_msg = err.to_string();
-        let latency_ms = start.elapsed().as_millis() as i64;
-        let _ = audit::record_llm_request(
-            &state,
-            NewRequestLog {
-                request_id: &ctx.request_id.to_string(),
-                api_key_id,
-                provider_name: "unrouted",
-                provider: &ctx.protocol.to_string(),
-                model: log_model,
-                operation: &ctx.operation.to_string(),
-                status_code: err.status_code().as_u16() as i64,
-                input_tokens: 0,
-                output_tokens: 0,
-                total_tokens: 0,
-                cached_tokens: 0,
-                cache_write_tokens: 0,
-                cost_cents: 0,
-                latency_ms,
-                first_byte_latency_ms: latency_ms,
-                error_code: Some(err.error_code()),
-                error: Some(&error_msg),
-                request_body: original_request_body_bytes.as_deref(),
-                response_body: None,
-            },
-        );
-        Err(err)
-    } else {
-        let err = AppError::NoProviderAvailable(ctx.model.clone());
-        let error_msg = err.to_string();
-        let latency_ms = start.elapsed().as_millis() as i64;
-        let _ = audit::record_llm_request(
-            &state,
-            NewRequestLog {
-                request_id: &ctx.request_id.to_string(),
-                api_key_id,
-                provider_name: "unrouted",
-                provider: &ctx.protocol.to_string(),
-                model: &ctx.resolved_model,
-                operation: &ctx.operation.to_string(),
-                status_code: err.status_code().as_u16() as i64,
-                input_tokens: 0,
-                output_tokens: 0,
-                total_tokens: 0,
-                cached_tokens: 0,
-                cache_write_tokens: 0,
-                cost_cents: 0,
-                latency_ms,
-                first_byte_latency_ms: latency_ms,
-                error_code: Some(err.error_code()),
-                error: Some(&error_msg),
-                request_body: original_request_body_bytes.as_deref(),
-                response_body: None,
-            },
-        );
-        Err(err)
-    }
+    Err(finalize_proxy_failure(ProxyFailureInput {
+        state: &state,
+        ctx: &ctx,
+        api_key_id,
+        start,
+        max_attempts,
+        total_backoff_ms,
+        last_error,
+        last_actual_model: last_actual_model.as_deref(),
+        retry_attempts: &retry_attempts,
+        request_body: original_request_body_bytes.as_deref(),
+    })
+    .await)
 }
 
 #[cfg(test)]

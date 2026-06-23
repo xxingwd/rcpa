@@ -1,22 +1,10 @@
 use crate::config::AuthKey;
 use crate::error::AppError;
 use crate::server::AppState;
-use sha2::{Digest, Sha256};
 
 /// Result of authentication — the matched key and its info
 pub struct AuthResult {
     pub key: AuthKey,
-}
-
-/// Helper to hash an API key using SHA-256
-pub fn hash_api_key(key: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(key.as_bytes());
-    let result = hasher.finalize();
-    result
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect::<String>()
 }
 
 fn extract_api_key(headers: &axum::http::HeaderMap) -> Result<String, AppError> {
@@ -76,33 +64,14 @@ pub fn authenticate(
     Ok(AuthResult { key: auth_key })
 }
 
-pub fn authenticate_llm_api_key(
-    state: &AppState,
-    headers: &axum::http::HeaderMap,
-) -> Result<AuthResult, AppError> {
-    authenticate(state, headers)
-}
-
 pub fn persisted_api_key_id(key: &AuthKey) -> &str {
     &key.id
-}
-
-/// Check if the authenticated key has access to the requested model
-pub fn check_model_access(key: &AuthKey, model: &str) -> Result<(), AppError> {
-    if !crate::config::AppConfig::key_can_use_model(key, model) {
-        return Err(AppError::Unauthorized(format!(
-            "API key does not have access to model '{}'",
-            model
-        )));
-    }
-    Ok(())
 }
 
 /// Check model access against the user-facing model name on the request.
 pub fn check_model_access_for_request(
     key: &AuthKey,
     requested_model: &str,
-    _resolved_model: &str,
 ) -> Result<(), AppError> {
     if crate::config::AppConfig::key_can_use_model(key, requested_model) {
         return Ok(());
@@ -138,12 +107,12 @@ mod tests {
     #[test]
     fn check_model_access_for_request_only_accepts_requested_model() {
         let alias_key = auth_key_with_models(vec!["fast"]);
-        assert!(check_model_access_for_request(&alias_key, "fast", "gpt-4o").is_ok());
+        assert!(check_model_access_for_request(&alias_key, "fast").is_ok());
 
         let resolved_key = auth_key_with_models(vec!["gpt-4o"]);
-        assert!(check_model_access_for_request(&resolved_key, "fast", "gpt-4o").is_err());
+        assert!(check_model_access_for_request(&resolved_key, "fast").is_err());
 
         let denied_key = auth_key_with_models(vec!["claude-*"]);
-        assert!(check_model_access_for_request(&denied_key, "fast", "gpt-4o").is_err());
+        assert!(check_model_access_for_request(&denied_key, "fast").is_err());
     }
 }

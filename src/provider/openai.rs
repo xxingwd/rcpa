@@ -12,12 +12,8 @@ use super::{ProviderAdapter, ProviderResponse, ProviderStreamResponse};
 /// OpenAI-compatible provider
 pub struct OpenAIProvider {
     name: String,
-    protocol: String,
     base_url: String,
-    models: Vec<String>,
     model_mappings: std::collections::HashMap<String, String>,
-    /// Per-model pricing overrides
-    pricing: std::collections::HashMap<String, (f64, f64)>,
     client: Client,
     in_flight: AtomicUsize,
     headers: Vec<(String, String)>,
@@ -39,15 +35,8 @@ impl OpenAIProvider {
 
         Ok(Self {
             name: config.name.clone(),
-            protocol: config.protocol.clone(),
             base_url: config.base_url.trim_end_matches('/').to_string(),
-            models: config.enabled_model_names(),
             model_mappings: config.enabled_model_mappings(),
-            pricing: config
-                .enabled_pricing()
-                .into_iter()
-                .map(|(k, v)| (k.clone(), (v.input_per_1k, v.output_per_1k)))
-                .collect(),
             client,
             in_flight: AtomicUsize::new(0),
             headers,
@@ -124,22 +113,6 @@ impl OpenAIProvider {
 
 #[async_trait::async_trait]
 impl ProviderAdapter for OpenAIProvider {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn protocol(&self) -> &str {
-        &self.protocol
-    }
-
-    fn models(&self) -> &[String] {
-        &self.models
-    }
-
-    fn base_url(&self) -> &str {
-        &self.base_url
-    }
-
     fn resolve_model(&self, model: &str) -> String {
         self.model_mappings
             .get(model)
@@ -149,10 +122,6 @@ impl ProviderAdapter for OpenAIProvider {
 
     fn serialize_request_body(&self, req: &ProxyRequest) -> serde_json::Value {
         self.rewrite_model_in_body(req)
-    }
-
-    fn model_pricing(&self, model: &str) -> Option<(f64, f64)> {
-        self.pricing.get(model).copied()
     }
 
     async fn proxy(&self, req: ProxyRequest) -> AppResult<ProviderResponse> {
@@ -176,6 +145,8 @@ impl ProviderAdapter for OpenAIProvider {
                 let status = resp.status().as_u16();
                 let text = resp.text().await.map_err(|e| AppError::ProviderError {
                     provider_name: self.name.clone(),
+                    status_code: None,
+                    error_code: None,
                     message: e.to_string(),
                 })?;
 
@@ -200,6 +171,8 @@ impl ProviderAdapter for OpenAIProvider {
                 } else {
                     Err(AppError::ProviderError {
                         provider_name: self.name.clone(),
+                        status_code: None,
+                        error_code: None,
                         message: e.to_string(),
                     })
                 }
@@ -241,6 +214,8 @@ impl ProviderAdapter for OpenAIProvider {
                 } else {
                     Err(AppError::ProviderError {
                         provider_name: self.name.clone(),
+                        status_code: None,
+                        error_code: None,
                         message: e.to_string(),
                     })
                 }
@@ -250,6 +225,14 @@ impl ProviderAdapter for OpenAIProvider {
 
     fn connection_count(&self) -> usize {
         self.in_flight.load(Ordering::Relaxed)
+    }
+
+    fn increment_connection_for_test(&self) {
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn decrement_connection_for_test(&self) {
+        self.in_flight.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -308,7 +291,8 @@ mod tests {
     fn streaming_chat_request_includes_usage_option() {
         let provider = OpenAIProvider::new(&ProviderConfig {
             name: "openai".to_string(),
-            protocol: "completions".to_string(),
+            adapter: crate::config::ProviderAdapterKind::Openai,
+            protocols: vec![crate::config::ProviderProtocol::Completions],
             base_url: "https://api.openai.com".to_string(),
             api_key: "sk-test".to_string(),
             models: vec![ModelRule::enabled("gpt-4o")],

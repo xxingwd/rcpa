@@ -4,10 +4,10 @@
 这个仓库正在实现一个基于 Rust 的 LLM 网关。第一阶段需要稳定支持 `completions`、`responses`、`messages` 三种协议。整体系统还需要支持多供应商、多后端、多模型、模型别名、供应商侧模型名映射、按模型定价、API Key 隔离、负载均衡、粘性会话、持久化存储，以及基于 SQLite 等轻量级嵌入式数据库的数据分析能力。
 
 ## 项目结构与模块划分
-保持传输层和领域逻辑边界清晰。`src/protocol/` 负责协议处理，`src/backend/` 负责供应商适配，`src/routing/` 负责路由和粘性会话，`src/middleware/` 负责鉴权和限流，`src/server/` 负责共享状态和路由装配，`src/stats/` 负责用量与成本统计。运行时配置放在 `config.yaml`。集成测试放在 `tests/`。后续数据库能力建议单独放在 `src/store/` 或 `src/db/`。
+保持传输层和领域逻辑边界清晰。`src/protocol/` 负责协议处理，`src/backend/` 负责供应商适配，`src/routing/` 负责路由和粘性会话，`src/middleware/` 负责鉴权和限流，`src/server/` 负责共享状态和路由装配，`src/stats/` 负责用量与成本统计。运行时配置放在 `~/.rcpa/config.yaml`。集成测试放在 `tests/`。后续数据库能力建议单独放在 `src/store/` 或 `src/db/`。
 
 ## 构建、测试与开发命令
-- `cargo run -- --config data/config.yaml --log-level info`：本地启动网关；配置缺失时会自动创建。
+- `cargo run`：本地启动网关；配置缺失时会自动创建于 `~/.rcpa/config.yaml`。
 - `cargo check`：快速做编译检查。
 - `cargo test`：运行单元测试和集成测试。
 - `cargo fmt`：应用 Rust 标准格式化。

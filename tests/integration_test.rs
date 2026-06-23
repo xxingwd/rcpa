@@ -1,11 +1,14 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use rcpa::config::{
-    AdminConfig, AppConfig, AuthConfig, AuthKey, CostConfig, ModelRule, ProviderConfig,
-    RetryConfig, RoutingConfig, ServerConfig, StickyConfig, TlsConfig,
+    AdminConfig, AppConfig, AuthConfig, AuthKey, CostConfig, ModelRule, ProviderAdapterKind,
+    ProviderConfig, ProviderProtocol, RetryConfig, RoutingConfig, ServerConfig, StickyConfig,
+    TlsConfig,
 };
 use rcpa::config_service::ConfigService;
+use rcpa::store::NewRequestLog;
 
 async fn spawn_openai_mock_provider(
     status: axum::http::StatusCode,
@@ -14,36 +17,209 @@ async fn spawn_openai_mock_provider(
     use axum::{routing::post, Json, Router};
     use tokio::net::TcpListener;
 
+    let app = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post({
+                let response = response.clone();
+                move |Json(body): Json<serde_json::Value>| {
+                    let response = response.clone();
+                    async move {
+                        let model = body
+                            .get("model")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        (
+                            status,
+                            Json(serde_json::json!({
+                                "id": "chatcmpl-test",
+                                "object": "chat.completion",
+                                "model": model,
+                                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                                "usage": response.get("usage").cloned().unwrap_or_else(|| serde_json::json!({
+                                    "prompt_tokens": 5,
+                                    "completion_tokens": 7,
+                                    "total_tokens": 12,
+                                    "prompt_tokens_details": {
+                                        "cached_tokens": 2,
+                                        "cache_write_tokens": 1
+                                    }
+                                })),
+                                "echo": body,
+                                "error": response.get("error").cloned()
+                            })),
+                        )
+                    }
+                }
+            }),
+        )
+        .route(
+            "/v1/responses",
+            post({
+                let response = response.clone();
+                move |Json(body): Json<serde_json::Value>| {
+                    let response = response.clone();
+                    async move {
+                        let model = body
+                            .get("model")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        (
+                            status,
+                            Json(serde_json::json!({
+                                "id": "resp-test",
+                                "object": "response",
+                                "model": model,
+                                "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ok"}]}],
+                                "usage": response.get("usage").cloned().unwrap_or_else(|| serde_json::json!({
+                                    "input_tokens": 5,
+                                    "output_tokens": 7,
+                                    "total_tokens": 12
+                                })),
+                                "echo": body,
+                                "error": response.get("error").cloned()
+                            })),
+                        )
+                    }
+                }
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{}", addr)
+}
+
+async fn spawn_retrying_openai_mock_provider() -> String {
+    use axum::{routing::post, Json, Router};
+    use tokio::net::TcpListener;
+
+    let attempts = Arc::new(AtomicUsize::new(0));
     let app = Router::new().route(
         "/v1/chat/completions",
         post(move |Json(body): Json<serde_json::Value>| {
-            let response = response.clone();
+            let attempts = attempts.clone();
             async move {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
                 let model = body
                     .get("model")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown")
                     .to_string();
-                (
-                    status,
-                    Json(serde_json::json!({
-                        "id": "chatcmpl-test",
-                        "object": "chat.completion",
-                        "model": model,
-                        "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
-                        "usage": response.get("usage").cloned().unwrap_or_else(|| serde_json::json!({
-                            "prompt_tokens": 5,
-                            "completion_tokens": 7,
-                            "total_tokens": 12,
-                            "prompt_tokens_details": {
-                                "cached_tokens": 2,
-                                "cache_write_tokens": 1
+                if attempt == 0 {
+                    (
+                        axum::http::StatusCode::TOO_MANY_REQUESTS,
+                        Json(serde_json::json!({
+                            "error": {
+                                "code": "rate_limit_exceeded",
+                                "message": "retry me"
                             }
                         })),
-                        "echo": body,
-                        "error": response.get("error").cloned()
-                    })),
-                )
+                    )
+                } else {
+                    (
+                        axum::http::StatusCode::OK,
+                        Json(serde_json::json!({
+                            "id": "chatcmpl-retry-test",
+                            "object": "chat.completion",
+                            "model": model,
+                            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                            "usage": {
+                                "prompt_tokens": 3,
+                                "completion_tokens": 4,
+                                "total_tokens": 7
+                            }
+                        })),
+                    )
+                }
+            }
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{}", addr)
+}
+
+async fn spawn_always_rate_limited_openai_mock_provider() -> String {
+    use axum::{routing::post, Json, Router};
+    use tokio::net::TcpListener;
+
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move || async move {
+            (
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "rate_limit_exceeded",
+                        "message": "still limited"
+                    }
+                })),
+            )
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{}", addr)
+}
+
+async fn spawn_tracking_openai_mock_provider(
+    status: axum::http::StatusCode,
+    attempts: Arc<AtomicUsize>,
+) -> String {
+    use axum::{routing::post, Json, Router};
+    use tokio::net::TcpListener;
+
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |Json(body): Json<serde_json::Value>| {
+            let attempts = attempts.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                let model = body
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                if status == axum::http::StatusCode::OK {
+                    (
+                        status,
+                        Json(serde_json::json!({
+                            "id": "chatcmpl-track",
+                            "object": "chat.completion",
+                            "model": model,
+                            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                            "usage": {
+                                "prompt_tokens": 2,
+                                "completion_tokens": 3,
+                                "total_tokens": 5
+                            }
+                        })),
+                    )
+                } else {
+                    (
+                        status,
+                        Json(serde_json::json!({
+                            "error": {
+                                "code": "rate_limit_exceeded",
+                                "message": "tracked failure"
+                            }
+                        })),
+                    )
+                }
             }
         }),
     );
@@ -61,9 +237,26 @@ fn enabled_model(name: &str) -> ModelRule {
 }
 
 fn provider(name: &str, protocol: &str, base_url: &str, models: Vec<ModelRule>) -> ProviderConfig {
+    provider_with_protocols(
+        name,
+        adapter_for_protocol(protocol),
+        vec![provider_protocol(protocol)],
+        base_url,
+        models,
+    )
+}
+
+fn provider_with_protocols(
+    name: &str,
+    adapter: ProviderAdapterKind,
+    protocols: Vec<ProviderProtocol>,
+    base_url: &str,
+    models: Vec<ModelRule>,
+) -> ProviderConfig {
     ProviderConfig {
         name: name.to_string(),
-        protocol: protocol.to_string(),
+        adapter,
+        protocols,
         base_url: base_url.to_string(),
         api_key: "sk-mock-key".to_string(),
         models,
@@ -75,6 +268,22 @@ fn provider(name: &str, protocol: &str, base_url: &str, models: Vec<ModelRule>) 
         status: "enabled".to_string(),
         priority: 5,
         group: "default".to_string(),
+    }
+}
+
+fn provider_protocol(value: &str) -> ProviderProtocol {
+    match value {
+        "completions" => ProviderProtocol::Completions,
+        "responses" => ProviderProtocol::Responses,
+        "messages" => ProviderProtocol::Messages,
+        other => panic!("unknown provider protocol {other}"),
+    }
+}
+
+fn adapter_for_protocol(value: &str) -> ProviderAdapterKind {
+    match provider_protocol(value) {
+        ProviderProtocol::Completions | ProviderProtocol::Responses => ProviderAdapterKind::Openai,
+        ProviderProtocol::Messages => ProviderAdapterKind::Anthropic,
     }
 }
 
@@ -179,8 +388,89 @@ async fn test_config_service_updates_provider_snapshot() {
 
     let snapshot = state.config_service.snapshot();
     assert_eq!(snapshot.provider_count(), 2);
-    let messages = snapshot.registry.get("anthropic-test-provider").unwrap();
-    assert_eq!(messages.protocol(), "messages");
+    assert!(snapshot.registry.get("anthropic-test-provider").is_some());
+    assert!(
+        snapshot.provider_supports_protocol("anthropic-test-provider", ProviderProtocol::Messages)
+    );
+}
+
+#[tokio::test]
+async fn test_multi_protocol_provider_routes_responses_requests() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let mock_base_url = spawn_openai_mock_provider(StatusCode::OK, serde_json::json!({})).await;
+    let mut config = test_config();
+    config.providers = vec![provider_with_protocols(
+        "openai-multi",
+        ProviderAdapterKind::Openai,
+        vec![ProviderProtocol::Completions, ProviderProtocol::Responses],
+        &mock_base_url,
+        vec![enabled_model("gpt-4o")],
+    )];
+    config.auth.enabled = true;
+    config.auth.keys.push(auth_key(
+        "user-key",
+        "user-secret-key",
+        vec![enabled_model("gpt-4o")],
+    ));
+
+    let state = state_from_config(config).await;
+    let app = rcpa::server::router::build(state.clone());
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header("x-api-key", "user-secret-key")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"model":"gpt-4o","input":"hello"}"#))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(res.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let response: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(response["model"], "gpt-4o");
+
+    let logs = state
+        .store
+        .query_request_logs(&rcpa::store::models::RequestLogFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].provider_name, "openai-multi");
+    assert_eq!(logs[0].protocol, "responses");
+    assert_eq!(logs[0].operation, "responses");
+}
+
+#[test]
+fn test_config_service_rejects_database_path_hot_reload() {
+    let temp_dir = std::env::temp_dir().join(format!("rcpa-config-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let config_path = temp_dir.join("config.yaml");
+
+    let mut config = test_config();
+    config.database.path = temp_dir.join("initial.db").to_string_lossy().into_owned();
+    std::fs::write(&config_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+
+    let service = ConfigService::new(&config_path).unwrap();
+    let mut next_config = config.clone();
+    next_config.database.path = temp_dir.join("next.db").to_string_lossy().into_owned();
+
+    let err = match service.replace_raw_yaml(&serde_yaml::to_string(&next_config).unwrap()) {
+        Ok(_) => panic!("database.path hot reload should be rejected"),
+        Err(err) => err.to_string(),
+    };
+
+    assert!(err.contains("database.path cannot be changed"));
+    assert_eq!(
+        service.snapshot().config.database.path,
+        config.database.path
+    );
+
+    std::fs::remove_dir_all(temp_dir).unwrap();
 }
 
 #[tokio::test]
@@ -239,7 +529,62 @@ async fn test_admin_api_endpoints() {
     assert_eq!(keys[0]["key"], generated_key);
     assert_eq!(keys[0]["name"], "edited-key");
     assert_eq!(keys[0]["allowed_models"][0]["name"], "gpt-4o");
+    assert_eq!(keys[0]["model_aliases"]["fast"], "gpt-4o");
     assert_eq!(keys[0]["labels"], "edited-key");
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri(format!("/v1/admin/keys/{}", key_id))
+        .header("x-admin-token", "admin-token")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"labels":"patched-label"}"#))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/v1/admin/keys")
+        .header("x-admin-token", "admin-token")
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(res.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let keys: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(keys[0]["name"], "edited-key");
+    assert_eq!(keys[0]["allowed_models"][0]["name"], "gpt-4o");
+    assert_eq!(keys[0]["model_aliases"]["fast"], "gpt-4o");
+    assert_eq!(keys[0]["labels"], "patched-label");
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri(format!("/v1/admin/keys/{}", key_id))
+        .header("x-admin-token", "admin-token")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"allowed_models":null,"model_aliases":null}"#,
+        ))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/v1/admin/keys")
+        .header("x-admin-token", "admin-token")
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(res.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let keys: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert!(keys[0]["allowed_models"].as_array().unwrap().is_empty());
+    assert!(keys[0]["model_aliases"].as_object().unwrap().is_empty());
 
     let req = Request::builder()
         .method("PUT")
@@ -346,43 +691,55 @@ async fn test_admin_api_endpoints() {
 
     state
         .store
-        .insert_request_log(
-            "req-admin-filter-1",
-            "key-alpha",
-            "openai-1",
-            "completions",
-            "gpt-4o",
-            "chat.completions",
-            200,
-            12,
-            6,
-            18,
-            3,
-            120,
-            None,
-            Some(br#"{"model":"gpt-4o"}"#),
-            None,
-        )
+        .insert_request_log_entry(NewRequestLog {
+            request_id: "req-admin-filter-1",
+            api_key_id: "key-alpha",
+            session_hash: None,
+            provider_name: "openai-1",
+            protocol: "completions",
+            model: "gpt-4o",
+            operation: "chat_completions",
+            status_code: 200,
+            success: true,
+            input_tokens: 12,
+            output_tokens: 6,
+            total_tokens: 18,
+            cached_tokens: 0,
+            cache_write_tokens: 0,
+            cost_cents: 3,
+            latency_ms: 120,
+            first_byte_latency_ms: 120,
+            metadata_json: "{}",
+            request_body: Some(br#"{"model":"gpt-4o"}"#),
+            response_body: None,
+        })
+        .await
         .unwrap();
     state
         .store
-        .insert_request_log(
-            "req-admin-filter-2",
-            "key-beta",
-            "openai-1",
-            "completions",
-            "gpt-4o-mini",
-            "chat.completions",
-            200,
-            10,
-            5,
-            15,
-            2,
-            90,
-            None,
-            Some(br#"{"model":"gpt-4o-mini"}"#),
-            None,
-        )
+        .insert_request_log_entry(NewRequestLog {
+            request_id: "req-admin-filter-2",
+            api_key_id: "key-beta",
+            session_hash: None,
+            provider_name: "openai-1",
+            protocol: "completions",
+            model: "gpt-4o-mini",
+            operation: "chat_completions",
+            status_code: 200,
+            success: true,
+            input_tokens: 10,
+            output_tokens: 5,
+            total_tokens: 15,
+            cached_tokens: 0,
+            cache_write_tokens: 0,
+            cost_cents: 2,
+            latency_ms: 90,
+            first_byte_latency_ms: 90,
+            metadata_json: "{}",
+            request_body: Some(br#"{"model":"gpt-4o-mini"}"#),
+            response_body: None,
+        })
+        .await
         .unwrap();
 
     let req = Request::builder()
@@ -447,13 +804,24 @@ async fn test_llm_request_errors_are_persisted_in_stats() {
     let logs = state
         .store
         .query_request_logs(&rcpa::store::models::RequestLogFilter::default())
+        .await
         .unwrap();
     assert_eq!(logs.len(), 1);
     assert_eq!(logs[0].operation, "chat_completions");
-    assert_eq!(logs[0].provider, "completions");
+    assert_eq!(logs[0].protocol, "completions");
     assert_eq!(logs[0].api_key_id, "user-key");
     assert_eq!(logs[0].provider_name, "unrouted");
     assert_eq!(logs[0].model, "missing-model");
+    assert_eq!(logs[0].success, 0);
+    assert_eq!(logs[0].error_code.as_deref(), Some("model_not_found"));
+    let detail = state
+        .store
+        .get_request_log_detail(&logs[0].id)
+        .await
+        .unwrap()
+        .unwrap();
+    let metadata: serde_json::Value = serde_json::from_str(&detail.metadata_json).unwrap();
+    assert_eq!(metadata["error"]["code"], "model_not_found");
 }
 
 #[tokio::test]
@@ -558,43 +926,55 @@ async fn test_admin_key_model_catalog_validation_and_log_key_display_name() {
 
     state
         .store
-        .insert_request_log(
-            "req-display-name",
-            &named_key_id,
-            "openai-test-provider",
-            "completions",
-            "gpt-4o",
-            "chat_completions",
-            200,
-            1,
-            2,
-            3,
-            0,
-            20,
-            None,
-            None,
-            None,
-        )
+        .insert_request_log_entry(NewRequestLog {
+            request_id: "req-display-name",
+            api_key_id: &named_key_id,
+            session_hash: None,
+            provider_name: "openai-test-provider",
+            protocol: "completions",
+            model: "gpt-4o",
+            operation: "chat_completions",
+            status_code: 200,
+            success: true,
+            input_tokens: 1,
+            output_tokens: 2,
+            total_tokens: 3,
+            cached_tokens: 0,
+            cache_write_tokens: 0,
+            cost_cents: 0,
+            latency_ms: 20,
+            first_byte_latency_ms: 20,
+            metadata_json: "{}",
+            request_body: None,
+            response_body: None,
+        })
+        .await
         .unwrap();
     state
         .store
-        .insert_request_log(
-            "req-display-key",
-            &unnamed_key_id,
-            "openai-test-provider",
-            "completions",
-            "gpt-4o",
-            "chat_completions",
-            200,
-            1,
-            2,
-            3,
-            0,
-            20,
-            None,
-            None,
-            None,
-        )
+        .insert_request_log_entry(NewRequestLog {
+            request_id: "req-display-key",
+            api_key_id: &unnamed_key_id,
+            session_hash: None,
+            provider_name: "openai-test-provider",
+            protocol: "completions",
+            model: "gpt-4o",
+            operation: "chat_completions",
+            status_code: 200,
+            success: true,
+            input_tokens: 1,
+            output_tokens: 2,
+            total_tokens: 3,
+            cached_tokens: 0,
+            cache_write_tokens: 0,
+            cost_cents: 0,
+            latency_ms: 20,
+            first_byte_latency_ms: 20,
+            metadata_json: "{}",
+            request_body: None,
+            response_body: None,
+        })
+        .await
         .unwrap();
 
     let req = Request::builder()
@@ -623,7 +1003,8 @@ async fn test_admin_key_model_catalog_validation_and_log_key_display_name() {
         .await
         .unwrap();
     let logs: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-    assert_eq!(logs["items"][0]["key_display_name"], unnamed_key_value);
+    assert_eq!(logs["items"][0]["key_display_name"], unnamed_key_id);
+    assert_ne!(logs["items"][0]["key_display_name"], unnamed_key_value);
 }
 
 #[tokio::test]
@@ -656,7 +1037,7 @@ async fn test_models_endpoint_lists_platform_global_and_key_alias_names() {
     let state = state_from_config(config).await;
     assert!(state.validate_model_name("gpt-4o").is_err());
     assert_eq!(
-        state.validate_model_name("global-fast").unwrap().0,
+        state.validate_model_name("global-fast").unwrap(),
         "global-fast"
     );
     let app = rcpa::server::router::build(state);
@@ -731,6 +1112,7 @@ async fn test_key_alias_global_alias_and_log_detail_json_are_persisted() {
         .method("POST")
         .uri("/v1/chat/completions")
         .header("x-api-key", "user-secret-key")
+        .header("session-id", "codex-session-a")
         .header("content-type", "application/json")
         .body(Body::from(
             r#"{"model":"quick","messages":[{"role":"user","content":"hello"}]}"#,
@@ -748,11 +1130,14 @@ async fn test_key_alias_global_alias_and_log_detail_json_are_persisted() {
     let logs = state
         .store
         .query_request_logs(&rcpa::store::models::RequestLogFilter::default())
+        .await
         .unwrap();
     assert_eq!(logs.len(), 1);
     assert_eq!(logs[0].api_key_id, "user-key");
-    assert_eq!(logs[0].model, "gpt-4o");
+    assert_eq!(logs[0].model, "global-fast");
     assert_eq!(logs[0].status_code, 200);
+    assert_eq!(logs[0].success, 1);
+    assert!(logs[0].session_hash.is_some());
     assert_eq!(logs[0].total_tokens, 12);
     assert_eq!(logs[0].cached_tokens, 2);
     assert_eq!(logs[0].cache_write_tokens, 1);
@@ -762,8 +1147,16 @@ async fn test_key_alias_global_alias_and_log_detail_json_are_persisted() {
     let detail = state
         .store
         .get_request_log_detail(&logs[0].id)
+        .await
         .unwrap()
         .unwrap();
+    let metadata: serde_json::Value = serde_json::from_str(&detail.metadata_json).unwrap();
+    assert_eq!(metadata["session"]["id"], "codex-session-a");
+    assert_eq!(metadata["session"]["source"], "session_id_header");
+    assert_eq!(metadata["models"]["requested"], "quick");
+    assert_eq!(metadata["models"]["resolved"], "global-fast");
+    assert_eq!(metadata["models"]["provider"], "gpt-4o");
+    assert_eq!(metadata["routing"]["sticky_enabled"], false);
     let request_body: serde_json::Value =
         serde_json::from_slice(&detail.request_body.unwrap()).unwrap();
     assert_eq!(request_body["model"], "gpt-4o");
@@ -774,9 +1167,234 @@ async fn test_key_alias_global_alias_and_log_detail_json_are_persisted() {
     let model_rollup = state
         .store
         .aggregate_by_model("2000-01-01T00:00:00Z", "2099-12-31T23:59:59Z")
+        .await
         .unwrap();
     assert_eq!(model_rollup.len(), 1);
-    assert_eq!(model_rollup[0].group_key, "gpt-4o");
+    assert_eq!(model_rollup[0].group_key, "global-fast");
+}
+
+#[tokio::test]
+async fn test_retryable_provider_status_retries_and_logs_final_attempt_metadata() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let mock_base_url = spawn_retrying_openai_mock_provider().await;
+
+    let mut config = test_config();
+    config.providers = vec![provider(
+        "openai-test-provider",
+        "completions",
+        &mock_base_url,
+        vec![enabled_model("gpt-4o")],
+    )];
+    config.retry.initial_backoff_ms = 1;
+    config.retry.max_backoff_ms = 1;
+    config.auth.enabled = true;
+    config.auth.keys.push(auth_key(
+        "retry-key",
+        "retry-secret-key",
+        vec![enabled_model("gpt-4o")],
+    ));
+
+    let state = state_from_config(config).await;
+    let app = rcpa::server::router::build(state.clone());
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("x-api-key", "retry-secret-key")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}"#,
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let logs = state
+        .store
+        .query_request_logs(&rcpa::store::models::RequestLogFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].status_code, 200);
+    assert_eq!(logs[0].success, 1);
+
+    let detail = state
+        .store
+        .get_request_log_detail(&logs[0].id)
+        .await
+        .unwrap()
+        .unwrap();
+    let metadata: serde_json::Value = serde_json::from_str(&detail.metadata_json).unwrap();
+    assert_eq!(metadata["retry"]["attempt_count"], 2);
+    assert_eq!(metadata["retry"]["retry_count"], 1);
+    assert!(metadata["retry"]["total_backoff_ms"].as_u64().unwrap() >= 1);
+    let attempts = metadata["retry"]["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0]["attempt"], 1);
+    assert_eq!(attempts[0]["provider_name"], "openai-test-provider");
+    assert_eq!(attempts[0]["selected_via"], "healthy");
+    assert_eq!(attempts[0]["status_code"], 429);
+    assert_eq!(attempts[0]["error_code"], "rate_limit_exceeded");
+    assert_eq!(attempts[0]["retryable"], true);
+    assert!(attempts[0]["backoff_ms_before_next"].as_u64().unwrap() >= 1);
+    assert_eq!(attempts[1]["attempt"], 2);
+    assert_eq!(attempts[1]["provider_name"], "openai-test-provider");
+    assert_eq!(attempts[1]["status_code"], 200);
+    assert_eq!(attempts[1]["retryable"], false);
+    assert!(attempts[1]["backoff_ms_before_next"].is_null());
+    assert_eq!(metadata["routing"]["selected_provider_reason"], "healthy");
+    assert_eq!(metadata["routing"]["sticky_hit"], false);
+}
+
+#[tokio::test]
+async fn test_retry_exhaustion_preserves_upstream_status_code() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let mock_base_url = spawn_always_rate_limited_openai_mock_provider().await;
+
+    let mut config = test_config();
+    config.providers = vec![provider(
+        "openai-test-provider",
+        "completions",
+        &mock_base_url,
+        vec![enabled_model("gpt-4o")],
+    )];
+    config.retry.initial_backoff_ms = 1;
+    config.retry.max_backoff_ms = 1;
+    config.auth.enabled = true;
+    config.auth.keys.push(auth_key(
+        "retry-key",
+        "retry-secret-key",
+        vec![enabled_model("gpt-4o")],
+    ));
+
+    let state = state_from_config(config).await;
+    let app = rcpa::server::router::build(state.clone());
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("x-api-key", "retry-secret-key")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}"#,
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    let logs = state
+        .store
+        .query_request_logs(&rcpa::store::models::RequestLogFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].status_code, 429);
+    assert_eq!(logs[0].error_code.as_deref(), Some("rate_limit_exceeded"));
+    let detail = state
+        .store
+        .get_request_log_detail(&logs[0].id)
+        .await
+        .unwrap()
+        .unwrap();
+    let metadata: serde_json::Value = serde_json::from_str(&detail.metadata_json).unwrap();
+    let attempts = metadata["retry"]["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 3);
+    assert!(attempts
+        .iter()
+        .take(2)
+        .all(|attempt| attempt["retryable"] == serde_json::Value::Bool(true)));
+    assert_eq!(attempts[2]["retryable"], false);
+    assert_eq!(attempts[2]["status_code"], 429);
+}
+
+#[tokio::test]
+async fn test_retry_switches_to_different_provider_within_same_request() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let provider_a_attempts = Arc::new(AtomicUsize::new(0));
+    let provider_b_attempts = Arc::new(AtomicUsize::new(0));
+    let provider_a_url = spawn_tracking_openai_mock_provider(
+        StatusCode::TOO_MANY_REQUESTS,
+        provider_a_attempts.clone(),
+    )
+    .await;
+    let provider_b_url =
+        spawn_tracking_openai_mock_provider(StatusCode::OK, provider_b_attempts.clone()).await;
+
+    let mut config = test_config();
+    config.providers = vec![
+        provider(
+            "provider-a",
+            "completions",
+            &provider_a_url,
+            vec![enabled_model("gpt-4o")],
+        ),
+        provider(
+            "provider-b",
+            "completions",
+            &provider_b_url,
+            vec![enabled_model("gpt-4o")],
+        ),
+    ];
+    config.providers[0].priority = 1;
+    config.providers[1].priority = 2;
+    config.retry.initial_backoff_ms = 1;
+    config.retry.max_backoff_ms = 1;
+    config.auth.enabled = true;
+    config.auth.keys.push(auth_key(
+        "retry-key",
+        "retry-secret-key",
+        vec![enabled_model("gpt-4o")],
+    ));
+
+    let state = state_from_config(config).await;
+    let app = rcpa::server::router::build(state.clone());
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("x-api-key", "retry-secret-key")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}"#,
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    assert_eq!(provider_a_attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(provider_b_attempts.load(Ordering::SeqCst), 1);
+
+    let logs = state
+        .store
+        .query_request_logs(&rcpa::store::models::RequestLogFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(logs.len(), 1);
+    let detail = state
+        .store
+        .get_request_log_detail(&logs[0].id)
+        .await
+        .unwrap()
+        .unwrap();
+    let metadata: serde_json::Value = serde_json::from_str(&detail.metadata_json).unwrap();
+    let attempts = metadata["retry"]["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0]["provider_name"], "provider-a");
+    assert_eq!(attempts[0]["status_code"], 429);
+    assert_eq!(attempts[0]["retryable"], true);
+    assert_eq!(attempts[1]["provider_name"], "provider-b");
+    assert_eq!(attempts[1]["status_code"], 200);
+    assert_eq!(attempts[1]["retryable"], false);
+    assert_eq!(attempts[1]["selected_via"], "healthy");
 }
 
 #[tokio::test]

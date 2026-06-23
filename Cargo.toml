@@ -1,6 +1,6 @@
 [package]
 name = "rcpa"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 description = "Rust Cloud Proxy API - LLM gateway"
 readme = "README.md"
@@ -56,7 +56,7 @@ http = "1"
 hyper = { version = "1", features = ["full"] }
 
 # Database
-rusqlite = { version = "0.31", features = ["bundled"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate", "chrono", "uuid", "time"] }
 
 # Utilities
 bytes = "1"
@@ -64,7 +64,7 @@ pin-project-lite = "0.2"
 once_cell = "1"
 regex = "1"
 rand = "0.8"
-sha2 = "0.11.0"
+dirs = "5"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

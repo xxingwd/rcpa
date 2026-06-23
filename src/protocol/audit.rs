@@ -20,7 +20,7 @@ pub fn model_from_body_or_default(body: &str, default_model: Option<&str>) -> Op
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn record_llm_error(
+pub async fn record_llm_error(
     state: &AppState,
     request_id: Uuid,
     api_key_id: &str,
@@ -34,17 +34,27 @@ pub fn record_llm_error(
     let error_msg = error.to_string();
     let provider = protocol.to_string();
     let elapsed_ms = start.elapsed().as_millis() as i64;
+    let metadata = serde_json::json!({
+        "error": {
+            "code": error.error_code(),
+            "message": error_msg,
+            "retryable": false
+        }
+    })
+    .to_string();
 
     if let Err(err) = record_llm_request(
         state,
         NewRequestLog {
             request_id: &request_id.to_string(),
             api_key_id,
+            session_hash: None,
             provider_name: "unrouted",
-            provider: &provider,
+            protocol: &provider,
             model,
             operation: &operation.to_string(),
             status_code: error.status_code().as_u16() as i64,
+            success: false,
             input_tokens: 0,
             output_tokens: 0,
             total_tokens: 0,
@@ -53,21 +63,22 @@ pub fn record_llm_error(
             cost_cents: 0,
             latency_ms: elapsed_ms,
             first_byte_latency_ms: elapsed_ms,
-            error_code: Some(error.error_code()),
-            error: Some(&error_msg),
+            metadata_json: &metadata,
             request_body,
             response_body: None,
         },
-    ) {
+    )
+    .await
+    {
         tracing::error!(request_id = %request_id, error = %err, "Failed to persist LLM error log");
     }
 }
 
-pub fn record_llm_request(
+pub async fn record_llm_request(
     state: &AppState,
     entry: NewRequestLog<'_>,
 ) -> crate::store::StoreResult<crate::store::DbRequestLog> {
-    state.store.insert_request_log_entry(entry)
+    state.store.insert_request_log_entry(entry).await
 }
 
 pub fn extract_provider_error(body: &serde_json::Value) -> (Option<String>, Option<String>) {

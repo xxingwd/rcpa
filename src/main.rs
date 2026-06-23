@@ -15,7 +15,7 @@ use rcpa::server;
 #[command(name = "rcpa", version, about, long_about = None)]
 struct Cli {
     /// Path to configuration file
-    #[arg(short, long, default_value = "data/config.yaml")]
+    #[arg(short, long, default_value = "~/.rcpa/config.yaml")]
     config: String,
 
     /// Log level (trace, debug, info, warn, error)
