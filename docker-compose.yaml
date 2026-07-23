@@ -1,0 +1,21 @@
+services:
+  rcpa:
+    image: ghcr.io/xxingwd/rcpa:latest
+    restart: always
+    environment:
+      TZ: Asia/Shanghai
+    ports:
+      - "15000:15000"
+    volumes:
+      - ./rcpa:/root/.rcpa
+    command:
+      - --token
+      - ${RCPA_ADMIN_TOKEN:?set RCPA_ADMIN_TOKEN in .env}
+      - --data-dir
+      - /root/.rcpa
+      - --port
+      - "15000"
+      - --log-level
+      - info
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"

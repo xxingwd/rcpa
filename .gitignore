@@ -1,0 +1,37 @@
+# Runtime configuration and secrets
+config.yaml
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# SQLite runtime data
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+data/
+
+# Rust build output
+/target/
+
+# Frontend dependencies and build output
+/frontend/node_modules/
+/frontend/dist/
+/frontend/dist-ssr/
+
+# Logs and local process files
+*.log
+logs/
+*.pid
+
+# OS and editor files
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+*.swo
+

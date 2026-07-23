@@ -1,0 +1,52 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release-linux:
+    name: Build Linux release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: npm ci
+        working-directory: frontend
+
+      - run: npm run build
+        working-directory: frontend
+
+      - run: cargo build --release
+
+      - name: Package release
+        id: package
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          package_dir="$RUNNER_TEMP/rcpa-${version}-linux-x86_64"
+          mkdir -p "$package_dir/frontend"
+          cp target/release/rcpa "$package_dir/rcpa"
+          cp -r frontend/dist "$package_dir/frontend/dist"
+          cp README.md CONTRIBUTING.md LICENSE config.example.yaml docker-compose.yaml .env.example "$package_dir/"
+          chmod +x "$package_dir/rcpa"
+          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/rcpa-${version}-linux-x86_64.tar.gz" "rcpa-${version}-linux-x86_64"
+          echo "archive=$RUNNER_TEMP/rcpa-${version}-linux-x86_64.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.package.outputs.archive }}

@@ -1,0 +1,89 @@
+# Example business config. Platform runtime options are CLI-only:
+# --token, --port, --data-dir, and --log-level.
+#
+# Upstream transport policy is global. Providers define credentials, models,
+# routing priority, custom headers, and one or more protocol endpoints.
+
+upstream:
+  timeout_secs: 300
+
+providers:
+- name: openai
+  api_key: replace-with-openai-api-key
+  models:
+  - name: gpt-4o
+    status: enabled
+    pricing:
+      input_per_1k: 2.50
+      output_per_1k: 10.00
+    aliases: []
+  - name: gpt-4.1-mini
+    status: enabled
+    pricing:
+      input_per_1k: 0.40
+      output_per_1k: 1.60
+    aliases: []
+  endpoints:
+  - protocol: completions
+    base_url: https://api.openai.com/v1/chat/completions
+  - protocol: responses
+    base_url: https://api.openai.com/v1/responses
+  headers: {}
+  status: enabled
+  priority: 0
+
+- name: anthropic
+  api_key: replace-with-anthropic-api-key
+  models:
+  - name: claude-sonnet-4-20250514
+    status: enabled
+    pricing:
+      input_per_1k: 3.00
+      output_per_1k: 15.00
+    aliases:
+    - claude-sonnet
+  endpoints:
+  - protocol: messages
+    base_url: https://api.anthropic.com/v1/messages
+  headers: {}
+  status: enabled
+  priority: 0
+
+routing:
+  sticky:
+    enabled: true
+    ttl_secs: 300
+    fallback_retry_interval_secs: 60
+
+retry:
+  max_attempts: 3
+  initial_backoff_ms: 100
+  max_backoff_ms: 10000
+  retryable_statuses:
+  - 429
+  - 502
+  - 503
+  - 504
+
+cost:
+  currency: USD
+  default_input_per_1k: 0.0
+  default_output_per_1k: 0.0
+  models:
+    gpt-4o:
+      input_per_1k: 2.50
+      output_per_1k: 10.00
+    claude-sonnet:
+      input_per_1k: 3.00
+      output_per_1k: 15.00
+
+keys:
+- id: local-dev
+  name: local-dev
+  key: replace-with-client-api-key
+  models: []
+  model_aliases:
+    fast: gpt-4o
+    smart: claude-sonnet
+  status: enabled
+  labels: null

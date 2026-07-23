@@ -1,0 +1,17 @@
+.git
+.github
+target
+frontend/node_modules
+frontend/dist
+rcpa.db
+rcpa.db-shm
+rcpa.db-wal
+*.db
+*.sqlite
+*.sqlite3
+config.yaml
+.env
+.env.*
+*.log
+logs
+data
