@@ -27,6 +27,14 @@ pub struct RequestLogBodyGcResult {
     pub failed_logs_cleared: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SqliteMaintenanceResult {
+    vacuum_ran: bool,
+    pages_before: u64,
+    pages_after: u64,
+    freelist_pages_before: u64,
+}
+
 impl RequestLogBodyGcResult {
     pub fn total_logs_cleared(self) -> u64 {
         self.success_logs_cleared + self.failed_logs_cleared
@@ -90,14 +98,63 @@ impl Store {
 
         Ok(total_cleared)
     }
+
+    async fn maintain_sqlite_storage(
+        &self,
+        bodies_cleared: bool,
+    ) -> StoreResult<SqliteMaintenanceResult> {
+        let mut connection = self.pool.acquire().await?;
+        checkpoint_wal(&mut connection).await?;
+
+        let pages_before = pragma_u64(&mut connection, "PRAGMA page_count").await?;
+        let freelist_pages_before = pragma_u64(&mut connection, "PRAGMA freelist_count").await?;
+        let vacuum_ran = bodies_cleared || freelist_pages_before > 0;
+
+        if vacuum_ran {
+            sqlx::query("VACUUM").execute(&mut *connection).await?;
+            checkpoint_wal(&mut connection).await?;
+        }
+
+        let pages_after = pragma_u64(&mut connection, "PRAGMA page_count").await?;
+        Ok(SqliteMaintenanceResult {
+            vacuum_ran,
+            pages_before,
+            pages_after,
+            freelist_pages_before,
+        })
+    }
 }
 
-/// Start the request-body retention task. It compensates immediately at startup,
-/// then runs every day at 03:00 in UTC+08:00 (Asia/Shanghai).
+async fn checkpoint_wal(
+    connection: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
+) -> StoreResult<()> {
+    let (busy, log_frames, checkpointed_frames): (i64, i64, i64) =
+        sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+            .fetch_one(&mut **connection)
+            .await?;
+    if busy != 0 {
+        return Err(StoreError::Maintenance(format!(
+            "WAL checkpoint remained busy with {log_frames} frames and {checkpointed_frames} checkpointed"
+        )));
+    }
+    Ok(())
+}
+
+async fn pragma_u64(
+    connection: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    statement: &str,
+) -> StoreResult<u64> {
+    let value: i64 = sqlx::query_scalar(statement)
+        .fetch_one(&mut **connection)
+        .await?;
+    u64::try_from(value).map_err(|_| {
+        StoreError::Maintenance(format!("{statement} returned a negative value: {value}"))
+    })
+}
+
+/// Start the request-body retention task at 03:00 in UTC+08:00 (Asia/Shanghai).
 pub fn spawn_request_log_body_gc(store: Store) -> JoinHandle<()> {
     tokio::spawn(async move {
-        run_gc(&store).await;
-
         loop {
             let now = Utc::now();
             let next_run = next_daily_gc_after(now);
@@ -116,12 +173,32 @@ pub fn spawn_request_log_body_gc(store: Store) -> JoinHandle<()> {
 async fn run_gc(store: &Store) {
     let started_at = Utc::now();
     match store.gc_request_log_bodies(started_at, GC_BATCH_SIZE).await {
-        Ok(result) => tracing::info!(
-            success_logs_cleared = result.success_logs_cleared,
-            failed_logs_cleared = result.failed_logs_cleared,
-            total_logs_cleared = result.total_logs_cleared(),
-            "Request log body GC completed"
-        ),
+        Ok(result) => {
+            tracing::info!(
+                success_logs_cleared = result.success_logs_cleared,
+                failed_logs_cleared = result.failed_logs_cleared,
+                total_logs_cleared = result.total_logs_cleared(),
+                "Request log body GC completed"
+            );
+            match store
+                .maintain_sqlite_storage(result.total_logs_cleared() > 0)
+                .await
+            {
+                Ok(maintenance) => tracing::info!(
+                    vacuum_ran = maintenance.vacuum_ran,
+                    pages_before = maintenance.pages_before,
+                    pages_after = maintenance.pages_after,
+                    pages_reclaimed = maintenance
+                        .pages_before
+                        .saturating_sub(maintenance.pages_after),
+                    freelist_pages_before = maintenance.freelist_pages_before,
+                    "SQLite storage maintenance completed"
+                ),
+                Err(error) => {
+                    tracing::error!(error = %error, "SQLite storage maintenance failed")
+                }
+            }
+        }
         Err(error) => tracing::error!(error = %error, "Request log body GC failed"),
     }
 }
@@ -241,6 +318,53 @@ mod tests {
 
         let second_result = store.gc_request_log_bodies(now, 1).await.unwrap();
         assert_eq!(second_result, RequestLogBodyGcResult::default());
+    }
+
+    #[tokio::test]
+    async fn storage_maintenance_returns_cleared_body_pages_to_filesystem() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("rcpa-storage-gc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("rcpa.db");
+        let store = Store::open_path(&db_path).await.unwrap();
+        let log_id = insert_log(&store, "large-old-success", true).await;
+        set_created_at(&store, &log_id, "2026-07-22T11:59:59+00:00").await;
+        sqlx::query(
+            "UPDATE request_logs
+             SET request_body = zeroblob(1048576), response_body = zeroblob(1048576)
+             WHERE id = ?",
+        )
+        .bind(&log_id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+        let baseline = store.maintain_sqlite_storage(false).await.unwrap();
+        assert!(!baseline.vacuum_ran);
+        let file_size_before = std::fs::metadata(&db_path).unwrap().len();
+
+        let now = DateTime::parse_from_rfc3339("2026-07-23T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let gc_result = store.gc_request_log_bodies(now, 500).await.unwrap();
+        assert_eq!(gc_result.success_logs_cleared, 1);
+
+        let maintenance = store.maintain_sqlite_storage(true).await.unwrap();
+        let file_size_after = std::fs::metadata(&db_path).unwrap().len();
+        assert!(maintenance.vacuum_ran);
+        assert!(maintenance.pages_after < maintenance.pages_before);
+        assert!(file_size_after < file_size_before);
+
+        let mut connection = store.pool.acquire().await.unwrap();
+        assert_eq!(
+            pragma_u64(&mut connection, "PRAGMA freelist_count")
+                .await
+                .unwrap(),
+            0
+        );
+        drop(connection);
+        drop(store);
+        std::fs::remove_dir_all(temp_dir).unwrap();
     }
 
     #[tokio::test]

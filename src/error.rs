@@ -128,6 +128,7 @@ impl From<crate::store::StoreError> for AppError {
         match e {
             crate::store::StoreError::NotFound(msg) => AppError::NotFound(msg),
             crate::store::StoreError::InvalidData(msg) => AppError::BadRequest(msg),
+            crate::store::StoreError::Maintenance(msg) => AppError::Internal(msg),
             crate::store::StoreError::Sql(err) => AppError::Internal(err.to_string()),
         }
     }

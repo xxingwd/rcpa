@@ -698,6 +698,110 @@ async fn test_config_service_updates_provider_snapshot() {
 }
 
 #[tokio::test]
+async fn test_admin_provider_rename_updates_key_references_and_sticky_sessions() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let mut config = test_config();
+    let mut key = auth_key(
+        "restricted-key",
+        "restricted-secret",
+        vec![enabled_model("gpt-4o")],
+    );
+    key.allowed_providers = vec!["openai-test-provider".to_string()];
+    config.keys.push(key);
+
+    let state = state_from_config(config).await;
+    state.sticky_sessions.set(
+        "rename-session".to_string(),
+        "openai-test-provider".to_string(),
+    );
+    let app = rcpa::server::router::build(state.clone());
+
+    let request = Request::builder()
+        .method("PUT")
+        .uri("/v1/admin/providers/openai-test-provider")
+        .header("x-admin-token", "admin-token")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"name":"renamed-provider","api_key":"sk-renamed","models":[{"name":"gpt-4o","status":"enabled","aliases":[]}],"endpoints":[{"protocol":"completions","base_url":"https://api.example.com/v1/chat/completions"}],"status":"enabled","priority":3}"#,
+        ))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let snapshot = state.config_service.snapshot();
+    assert!(snapshot.find_provider("openai-test-provider").is_none());
+    let renamed = snapshot.find_provider("renamed-provider").unwrap();
+    assert_eq!(renamed.status, "enabled");
+    assert_eq!(renamed.priority, 3);
+    let restricted_key = snapshot.auth_key_for_secret("restricted-secret").unwrap();
+    assert_eq!(restricted_key.allowed_providers, vec!["renamed-provider"]);
+    assert!(snapshot.has_endpoint("gpt-4o", Some(&restricted_key)));
+    assert!(state.sticky_sessions.is_empty());
+}
+
+#[tokio::test]
+async fn test_admin_provider_update_changes_status() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let state = state_from_config(test_config()).await;
+    let app = rcpa::server::router::build(state.clone());
+    let request = Request::builder()
+        .method("PUT")
+        .uri("/v1/admin/providers/openai-test-provider")
+        .header("x-admin-token", "admin-token")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"name":"openai-test-provider","api_key":"sk-updated","models":[{"name":"gpt-4o","status":"enabled","aliases":[]}],"endpoints":[{"protocol":"completions","base_url":"https://api.example.com/v1/chat/completions"}],"status":"disabled","priority":5}"#,
+        ))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let snapshot = state.config_service.snapshot();
+    let provider = snapshot.find_provider("openai-test-provider").unwrap();
+    assert_eq!(provider.status, "disabled");
+    assert_eq!(provider.api_key, "sk-updated");
+}
+
+#[tokio::test]
+async fn test_admin_provider_rename_rejects_existing_name() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let mut config = test_config();
+    config.providers.push(provider(
+        "existing-provider",
+        "responses",
+        "https://api.example.com/v1/responses",
+        vec![enabled_model("existing-model")],
+    ));
+    let state = state_from_config(config).await;
+    let app = rcpa::server::router::build(state.clone());
+
+    let request = Request::builder()
+        .method("PUT")
+        .uri("/v1/admin/providers/openai-test-provider")
+        .header("x-admin-token", "admin-token")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"name":"existing-provider","api_key":"sk-renamed","models":[{"name":"gpt-4o","status":"enabled","aliases":[]}],"endpoints":[{"protocol":"completions","base_url":"https://api.example.com/v1/chat/completions"}]}"#,
+        ))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let snapshot = state.config_service.snapshot();
+    assert!(snapshot.find_provider("openai-test-provider").is_some());
+    assert!(snapshot.find_provider("existing-provider").is_some());
+}
+
+#[tokio::test]
 async fn test_multi_protocol_provider_routes_responses_requests() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};

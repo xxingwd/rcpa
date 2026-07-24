@@ -78,7 +78,7 @@ There is no database migration and no change to the public LLM protocol routes.
 
 SQLite is the default storage backend. Schema changes are versioned through migrations. If the schema is out of date or migration order is invalid, startup fails until the database is migrated explicitly.
 
-Request and response bodies use a fixed retention policy: successful request bodies are cleared after 24 hours and failed request bodies after 7 days. Cleanup compensates once at startup and then runs daily at 03:00 Asia/Shanghai in batches of 500; request log rows, metadata, token usage, cost, latency, and analytics metrics are retained. Cleared SQLite pages are reused automatically, but shrinking the database file itself still requires a separately scheduled `VACUUM` maintenance window.
+Request and response bodies use a fixed retention policy: successful request bodies are cleared after 24 hours and failed request bodies after 7 days. Cleanup runs daily at 03:00 Asia/Shanghai in batches of 500; request log rows, metadata, token usage, cost, latency, and analytics metrics are retained. After cleanup, storage maintenance truncates the WAL and runs `VACUUM` when bodies were cleared or freelist pages are available, then truncates the WAL again so reclaimed space is returned to the filesystem.
 
 ## Docker
 

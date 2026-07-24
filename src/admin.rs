@@ -545,6 +545,38 @@ pub struct CreateProviderPayload {
     pub priority: Option<i64>,
 }
 
+fn replace_provider_config(
+    config: &mut AppConfig,
+    original_name: &str,
+    provider: ProviderConfig,
+) -> anyhow::Result<()> {
+    let provider_index = config
+        .providers
+        .iter()
+        .position(|item| item.name == original_name)
+        .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", original_name))?;
+    if provider.name != original_name
+        && config
+            .providers
+            .iter()
+            .any(|item| item.name == provider.name)
+    {
+        anyhow::bail!("Provider '{}' already exists", provider.name);
+    }
+
+    if provider.name != original_name {
+        for key in &mut config.keys {
+            for allowed_provider in &mut key.allowed_providers {
+                if allowed_provider == original_name {
+                    allowed_provider.clone_from(&provider.name);
+                }
+            }
+        }
+    }
+    config.providers[provider_index] = provider;
+    Ok(())
+}
+
 pub async fn list_providers(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -614,6 +646,81 @@ pub async fn create_provider(
         .ok_or_else(|| AppError::Internal("Saved provider missing from snapshot".into()))?;
 
     Ok((axum::http::StatusCode::CREATED, Json(view)))
+}
+
+pub async fn update_provider(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(original_name): Path<String>,
+    Json(payload): Json<CreateProviderPayload>,
+) -> Result<impl IntoResponse, AppError> {
+    check_admin(&state, &headers)?;
+    ensure_model_name_is_canonical(&original_name, "provider name")?;
+    ensure_model_name_is_canonical(&payload.name, "provider name")?;
+
+    let current = state.config_service.snapshot();
+    if !current
+        .raw_config
+        .providers
+        .iter()
+        .any(|provider| provider.name == original_name)
+    {
+        return Err(AppError::NotFound(format!(
+            "Provider '{}' not found",
+            original_name
+        )));
+    }
+    if payload.name != original_name
+        && current
+            .raw_config
+            .providers
+            .iter()
+            .any(|provider| provider.name == payload.name)
+    {
+        return Err(AppError::BadRequest(format!(
+            "Provider '{}' already exists",
+            payload.name
+        )));
+    }
+
+    let existing = current
+        .raw_config
+        .providers
+        .iter()
+        .find(|provider| provider.name == original_name)
+        .expect("provider existence checked above");
+    let provider_name = payload.name.clone();
+    let provider = ProviderConfig {
+        name: provider_name.clone(),
+        api_key: payload.api_key,
+        models: payload.models,
+        endpoints: payload.endpoints,
+        headers: payload.headers.unwrap_or_default(),
+        status: payload.status.unwrap_or_else(|| existing.status.clone()),
+        priority: payload.priority.unwrap_or(existing.priority),
+    };
+
+    let mut candidate = current.raw_config.clone();
+    replace_provider_config(&mut candidate, &original_name, provider.clone())
+        .and_then(|_| candidate.validate())
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+
+    let snapshot = state
+        .config_service
+        .update(|config| replace_provider_config(config, &original_name, provider))
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+
+    if provider_name != original_name {
+        state.sticky_sessions.invalidate_provider(&original_name);
+    }
+
+    let view = snapshot
+        .providers()
+        .into_iter()
+        .find(|provider| provider.name == provider_name)
+        .ok_or_else(|| AppError::Internal("Updated provider missing from snapshot".into()))?;
+
+    Ok(Json(view))
 }
 
 pub async fn update_provider_status(

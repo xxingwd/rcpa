@@ -27,6 +27,9 @@ pub enum StoreError {
 
     #[error("Invalid data: {0}")]
     InvalidData(String),
+
+    #[error("Database maintenance error: {0}")]
+    Maintenance(String),
 }
 
 /// Result alias for store operations.

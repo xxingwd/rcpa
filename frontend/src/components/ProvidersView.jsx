@@ -231,13 +231,16 @@ export default function ProvidersView({ showToast }) {
       models,
       endpoints: normalizedEndpoints,
       headers: Object.fromEntries(normalizedHeaders.map((header) => [header.name, header.value])),
-      status: editingProvider?.status || providerStatus,
+      status: providerStatus,
       priority: parseInt(priority, 10) || 0,
     };
 
     try {
-      const res = await apiFetch('/v1/admin/providers', {
-        method: 'POST',
+      const endpoint = editingProvider
+        ? `/v1/admin/providers/${encodeURIComponent(editingProvider.name)}`
+        : '/v1/admin/providers';
+      const res = await apiFetch(endpoint, {
+        method: editingProvider ? 'PUT' : 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
@@ -318,7 +321,7 @@ export default function ProvidersView({ showToast }) {
         </div>
       </CardHeader>
       <CardContent>
-        <Table>
+        <Table className="min-w-[1040px]">
           <TableHeader>
             <TableRow>
               <TableHead>供应商名称</TableHead>
@@ -337,7 +340,9 @@ export default function ProvidersView({ showToast }) {
                 const endpointsList = Array.isArray(provider.endpoints) ? provider.endpoints : [];
                 return (
                   <TableRow key={provider.name}>
-                    <TableCell className="font-semibold">{provider.name}</TableCell>
+                    <TableCell className="max-w-[150px] font-mono text-xs font-medium" title={provider.name}>
+                      <span className="block truncate">{provider.name}</span>
+                    </TableCell>
                     <TableCell className="max-w-[260px]">
                       <div className="space-y-1">
                         {endpointsList.map((endpoint, index) => (
@@ -379,7 +384,7 @@ export default function ProvidersView({ showToast }) {
                               onClick={() => toggleProviderModelStatus(provider.name, model.name, model.status)}
                               title={model.name}
                               className={`
-                                inline-flex items-center gap-1.5 h-6 px-2 rounded-full font-mono text-xs border transition-colors
+                                inline-flex h-6 items-center gap-1 px-1.5 rounded-full border font-mono text-xs transition-colors
                                 ${modelEnabled
                                   ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-600 hover:bg-emerald-500/20'
                                   : 'bg-muted border-border text-muted-foreground hover:bg-muted/80'}
@@ -394,7 +399,13 @@ export default function ProvidersView({ showToast }) {
                     </TableCell>
                     <TableCell>
                       <div className="flex gap-1.5">
-                        <Button variant="outline" size="icon" className="h-7 w-7" onClick={() => openEditModal(provider)}>
+                        <Button
+                          variant="outline"
+                          size="icon"
+                          className="h-7 w-7"
+                          onClick={() => openEditModal(provider)}
+                          aria-label={`编辑供应商 ${provider.name}`}
+                        >
                           <Edit2 size={12} />
                         </Button>
                         <Button
@@ -421,7 +432,7 @@ export default function ProvidersView({ showToast }) {
       </CardContent>
 
       <Dialog open={isModalOpen} onOpenChange={setIsModalOpen}>
-        <DialogContent className="max-h-[90vh] max-w-[900px] overflow-y-auto">
+        <DialogContent className="max-h-[90vh] max-w-[1020px] overflow-y-auto">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <Layers size={18} className="text-primary" />
@@ -436,7 +447,7 @@ export default function ProvidersView({ showToast }) {
             <div className="grid grid-cols-2 gap-4">
               <div className="space-y-2">
                 <Label className="text-xs uppercase tracking-wider text-muted-foreground">供应商名称 *</Label>
-                <Input type="text" value={name} onChange={(e) => setName(e.target.value)} placeholder="openai" required disabled={!!editingProvider} />
+                <Input type="text" value={name} onChange={(e) => setName(e.target.value)} placeholder="openai" required />
               </div>
               <div className="space-y-2">
                 <Label className="text-xs uppercase tracking-wider text-muted-foreground">API Key *</Label>
@@ -486,7 +497,14 @@ export default function ProvidersView({ showToast }) {
                         />
                       </div>
                       <div className="col-span-1 flex items-end">
-                        <Button type="button" variant="destructive" size="icon" className="h-9 w-9" onClick={() => removeEndpointRow(index)}>
+                        <Button
+                          type="button"
+                          variant="destructive"
+                          size="icon"
+                          className="h-9 w-9"
+                          onClick={() => removeEndpointRow(index)}
+                          aria-label={`删除 Endpoint ${index + 1}`}
+                        >
                           <Trash2 size={13} />
                         </Button>
                       </div>
@@ -554,7 +572,14 @@ export default function ProvidersView({ showToast }) {
                       />
                     </div>
                     <div className="col-span-1 flex items-end">
-                      <Button type="button" variant="destructive" size="icon" className="h-9 w-9" onClick={() => removeHeaderRow(index)}>
+                      <Button
+                        type="button"
+                        variant="destructive"
+                        size="icon"
+                        className="h-9 w-9"
+                        onClick={() => removeHeaderRow(index)}
+                        aria-label={`删除 Header ${index + 1}`}
+                      >
                         <Trash2 size={13} />
                       </Button>
                     </div>
@@ -580,9 +605,9 @@ export default function ProvidersView({ showToast }) {
                 {formModels.map((item, index) => (
                   <div key={index} className="flex items-end gap-2 rounded-lg border border-border bg-muted/50 p-3">
                     <div className="grid flex-1 grid-cols-12 gap-2">
-                      <div className="col-span-4 space-y-1">
+                      <div className="col-span-3 space-y-1">
                         <Label className="text-[10px] text-muted-foreground">模型名称 *</Label>
-                        <Input type="text" value={item.name} onChange={(e) => handleModelChange(index, 'name', e.target.value)} placeholder="gpt-4o-mini" required />
+                        <Input type="text" value={item.name} onChange={(e) => handleModelChange(index, 'name', e.target.value)} placeholder="gpt-4o-mini" className="font-mono text-xs" required />
                       </div>
                       <div className="col-span-3 space-y-1">
                         <Label className="flex items-center gap-0.5 text-[10px] text-muted-foreground"><Shuffle size={9} /> 别名</Label>
@@ -596,10 +621,10 @@ export default function ProvidersView({ showToast }) {
                         <Label className="flex items-center gap-0.5 text-[10px] text-muted-foreground"><Coins size={9} /> 输出/1K</Label>
                         <Input type="number" step="0.000001" value={item.outputPrice} onChange={(e) => handleModelChange(index, 'outputPrice', e.target.value)} placeholder="0.015" />
                       </div>
-                      <div className="col-span-1 space-y-1">
+                      <div className="col-span-2 min-w-0 space-y-1">
                         <Label className="text-[10px] text-muted-foreground">状态</Label>
                         <Select value={item.status} onValueChange={(value) => handleModelChange(index, 'status', value)}>
-                          <SelectTrigger>
+                          <SelectTrigger className="w-full text-xs">
                             <SelectValue />
                           </SelectTrigger>
                           <SelectContent>
@@ -609,7 +634,14 @@ export default function ProvidersView({ showToast }) {
                         </Select>
                       </div>
                     </div>
-                    <Button type="button" variant="destructive" size="icon" className="h-8 w-8 shrink-0" onClick={() => removeModelRow(index)}>
+                    <Button
+                      type="button"
+                      variant="destructive"
+                      size="icon"
+                      className="h-8 w-8 shrink-0"
+                      onClick={() => removeModelRow(index)}
+                      aria-label={`删除模型 ${item.name || index + 1}`}
+                    >
                       <Trash2 size={13} />
                     </Button>
                   </div>

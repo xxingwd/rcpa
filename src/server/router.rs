@@ -34,7 +34,7 @@ pub fn build(state: Arc<AppState>) -> Router {
         )
         .route(
             "/admin/providers/{name}",
-            delete(crate::admin::delete_provider),
+            put(crate::admin::update_provider).delete(crate::admin::delete_provider),
         )
         .route(
             "/admin/providers/{name}/status",
