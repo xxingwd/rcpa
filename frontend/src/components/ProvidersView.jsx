@@ -22,7 +22,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from './ui/select';
-import { Coins, Edit2, Layers, Plus, Shuffle, Trash2 } from 'lucide-react';
+import { Coins, Copy, Edit2, Layers, Plus, Shuffle, Trash2 } from 'lucide-react';
 
 const PROTOCOL_OPTIONS = ['completions', 'responses', 'messages'];
 
@@ -77,15 +77,24 @@ export default function ProvidersView({ showToast }) {
     fetchProviders();
   }, [fetchProviders]);
 
-  const openCreateModal = () => {
+  const openCreateModal = (provider = null) => {
     setEditingProvider(null);
     setName('');
-    setApiKey('');
-    setEndpoints([]);
-    setPriority(0);
-    setProviderStatus('enabled');
-    setFormModels([]);
-    setCustomHeaders([]);
+    setApiKey(provider?.api_key || '');
+    setEndpoints(Array.isArray(provider?.endpoints) ? provider.endpoints : []);
+    setPriority(provider?.priority ?? 0);
+    setProviderStatus(provider?.status || 'enabled');
+    setCustomHeaders(Object.entries(provider?.headers || {}).map(([headerName, value]) => ({
+      name: headerName,
+      value,
+    })));
+    setFormModels(modelNames(provider || {}).map((model) => ({
+      name: model.name,
+      status: model.status || 'enabled',
+      inputPrice: model.pricing?.input_per_1k?.toString() || '',
+      outputPrice: model.pricing?.output_per_1k?.toString() || '',
+      aliases: Array.isArray(model.aliases) ? model.aliases.join(', ') : '',
+    })));
     setIsModalOpen(true);
   };
 
@@ -407,6 +416,16 @@ export default function ProvidersView({ showToast }) {
                           aria-label={`编辑供应商 ${provider.name}`}
                         >
                           <Edit2 size={12} />
+                        </Button>
+                        <Button
+                          variant="outline"
+                          size="icon"
+                          className="h-7 w-7"
+                          onClick={() => openCreateModal(provider)}
+                          aria-label={`复制供应商 ${provider.name}`}
+                          title="复制供应商"
+                        >
+                          <Copy size={12} />
                         </Button>
                         <Button
                           variant="outline"
