@@ -21,6 +21,9 @@ pub async fn dashboard(cx: &Cx) -> Result {
     let cache_hit_rate = stats.tokens.cache_hit_rate;
     let avg_first_byte = stats.latency.first_byte_avg_ms;
     let avg_tokens_per_req = stats.tokens.avg_per_request;
+    let _error_count = stats.requests.errors;
+    let _max_latency = stats.latency.max_ms;
+    let _max_first_byte = stats.latency.first_byte_max_ms;
     
     view! {
         <!DOCTYPE html>
@@ -34,7 +37,19 @@ pub async fn dashboard(cx: &Cx) -> Result {
             </head>
             <body class="bg-zinc-50 text-zinc-900">
                 <div class="flex min-h-screen">
-                    <sidebar />
+                    <aside class="flex h-screen w-64 flex-col border-r border-zinc-200 bg-white">
+                        <div class="border-b border-zinc-200 px-6 py-4">
+                            <h2 class="text-lg font-bold text-zinc-900">"RCPA"</h2>
+                            <p class="text-xs text-zinc-500">"LLM 网关管理"</p>
+                        </div>
+                        <nav class="flex-1 space-y-1 px-3 py-4">
+                            <a href="/" class="block rounded-lg bg-zinc-100 px-3 py-2 text-sm font-medium">"仪表盘"</a>
+                            <a href="/keys" class="block rounded-lg px-3 py-2 text-sm font-medium text-zinc-700 hover:bg-zinc-100">"密钥管理"</a>
+                            <a href="/providers" class="block rounded-lg px-3 py-2 text-sm font-medium text-zinc-700 hover:bg-zinc-100">"供应商"</a>
+                            <a href="/logs" class="block rounded-lg px-3 py-2 text-sm font-medium text-zinc-700 hover:bg-zinc-100">"调用日志"</a>
+                            <a href="/config" class="block rounded-lg px-3 py-2 text-sm font-medium text-zinc-700 hover:bg-zinc-100">"配置"</a>
+                        </nav>
+                    </aside>
                     <main class="flex-1 p-8">
                         <div class="mx-auto max-w-7xl">
                             <header class="mb-8 flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
