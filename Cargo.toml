@@ -16,7 +16,7 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace", "limit", "timeout", "request-id", "compression-gzip", "decompression-gzip", "auth"] }
 
 # Topcoat framework for admin UI
-topcoat = { git = "https://github.com/tokio-rs/topcoat.git", features = ["view", "router", "cookie", "ui", "discover"] }
+topcoat = { git = "https://github.com/tokio-rs/topcoat.git", features = ["view", "router", "cookie", "ui", "discover", "htmx"] }
 topcoat-router = { git = "https://github.com/tokio-rs/topcoat.git", features = ["tower", "discover"] }
 
 # HTTP client

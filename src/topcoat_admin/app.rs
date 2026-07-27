@@ -19,7 +19,7 @@ pub fn build_topcoat_app(state: Arc<AppState>) -> Router {
     // Build the meta router (handles /health, /stats)
     let meta = crate::server::router::build_meta_router(state.clone());
     
-    let router = Router::builder()
+    Router::builder()
         .app_context(state.clone())
         // Bridge specific API paths to the axum router
         .route(TowerRoute::new(
@@ -39,9 +39,7 @@ pub fn build_topcoat_app(state: Arc<AppState>) -> Router {
         ))
         // Auto-discover all #[page] annotated functions
         .discover()
-        .build();
-    
-    router
+        .build()
 }
 
 /// Shared app context accessor.
