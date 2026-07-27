@@ -16,13 +16,23 @@ use crate::protocol::anthropic;
 use crate::protocol::openai;
 use crate::server::AppState;
 
+/// Builds the full application router (for backward compatibility).
 pub fn build(state: Arc<AppState>) -> Router {
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    let api = build_api_router(state.clone());
+    let meta = build_meta_router(state.clone());
 
-    let api_v1 = Router::new()
+    Router::new()
+        .nest("/v1", api)
+        .merge(meta)
+        .layer(TraceLayer::new_for_http())
+        .layer(RequestBodyLimitLayer::new(20 * 1024 * 1024 * 1024))
+        .layer(cors())
+}
+
+/// Builds the API router that handles all /v1/* routes.
+/// This is exposed separately so Topcoat can bridge to it via TowerRoute.
+pub fn build_api_router(state: Arc<AppState>) -> Router {
+    Router::new()
         .route("/models", get(openai::models::list_models))
         .route("/chat/completions", post(openai::chat::chat_completions))
         .route("/responses", post(openai::responses::responses))
@@ -117,21 +127,24 @@ pub fn build(state: Arc<AppState>) -> Router {
             metrics_middleware,
         ))
         .layer(middleware::from_fn(request_id_middleware))
-        .with_state(state.clone());
+        .with_state(state.clone())
+}
 
-    let meta = Router::new()
+/// Builds the meta router for health, stats, and admin UI serving.
+pub fn build_meta_router(state: Arc<AppState>) -> Router {
+    Router::new()
         .route("/health", get(health_check))
         .route("/stats", get(stats_handler))
         .route("/admin", get(crate::admin::dashboard))
         .route("/assets/{*path}", get(crate::admin::static_handler))
-        .with_state(state.clone());
+        .with_state(state.clone())
+}
 
-    Router::new()
-        .nest("/v1", api_v1)
-        .merge(meta)
-        .layer(TraceLayer::new_for_http())
-        .layer(RequestBodyLimitLayer::new(500 * 1024 * 1024))
-        .layer(cors)
+fn cors() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any)
 }
 
 async fn health_check(state: axum::extract::State<Arc<AppState>>) -> axum::Json<serde_json::Value> {

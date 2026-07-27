@@ -15,6 +15,10 @@ tokio = { version = "1", features = ["full"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace", "limit", "timeout", "request-id", "compression-gzip", "decompression-gzip", "auth"] }
 
+# Topcoat framework for admin UI
+topcoat = { git = "https://github.com/tokio-rs/topcoat.git", features = ["view", "router", "cookie", "ui", "discover"] }
+topcoat-router = { git = "https://github.com/tokio-rs/topcoat.git", features = ["tower", "discover"] }
+
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "gzip", "brotli", "http2"] }
 

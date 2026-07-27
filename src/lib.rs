@@ -10,3 +10,4 @@ pub mod routing;
 pub mod server;
 pub mod stats;
 pub mod store;
+pub mod topcoat_admin;

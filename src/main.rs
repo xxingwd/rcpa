@@ -10,6 +10,7 @@ use rcpa::config::{
 };
 use rcpa::config_service::ConfigService;
 use rcpa::server::{self, RuntimeConfig};
+use rcpa::topcoat_admin::build_topcoat_app;
 
 /// RCPA - Rust Cloud Proxy API
 /// High-performance LLM API gateway supporting multiple AI providers
@@ -109,18 +110,17 @@ async fn main() -> anyhow::Result<()> {
     );
     let _request_log_body_gc = rcpa::store::spawn_request_log_body_gc(state.store.clone());
 
-    // Build router
-    let app = server::router::build(state.clone());
+    // Build Topcoat app (serves admin UI + bridges API to axum router)
+    let app = build_topcoat_app(state.clone());
 
     // Bind and serve
     let addr = SocketAddr::new("0.0.0.0".parse()?, cli.port);
-
     tracing::info!("RCPA listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+    // Use Topcoat's serve_until with our shutdown signal
+    topcoat::serve_until(listener, app, shutdown_signal())
         .await?;
 
     tracing::info!("RCPA shutting down");
