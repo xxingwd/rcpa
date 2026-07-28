@@ -53,6 +53,7 @@ pub struct ConfigSnapshot {
     pub model_endpoints: Vec<ModelEndpoint>,
     pub key_endpoints: HashMap<String, Vec<ModelEndpoint>>,
     api_keys_by_secret: HashMap<String, AuthKey>,
+    key_display_names: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -267,6 +268,18 @@ impl ConfigSnapshot {
             .filter(|key| key.status == "enabled")
             .map(|key| (key.key.clone(), key.clone()))
             .collect();
+        let key_display_names = raw_config
+            .keys
+            .iter()
+            .map(|key| {
+                let display_name = key
+                    .name
+                    .as_deref()
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or(&key.id);
+                (key.id.clone(), display_name.to_string())
+            })
+            .collect();
 
         Ok(Self {
             raw_config,
@@ -275,6 +288,7 @@ impl ConfigSnapshot {
             model_endpoints,
             key_endpoints,
             api_keys_by_secret,
+            key_display_names,
         })
     }
 
@@ -344,6 +358,13 @@ impl ConfigSnapshot {
 
     pub fn auth_key_for_secret(&self, secret: &str) -> Option<AuthKey> {
         self.api_keys_by_secret.get(secret).cloned()
+    }
+
+    pub fn auth_key_display_name<'a>(&'a self, api_key_id: &'a str) -> &'a str {
+        self.key_display_names
+            .get(api_key_id)
+            .map(String::as_str)
+            .unwrap_or(api_key_id)
     }
 
     pub fn providers(&self) -> Vec<ProviderView> {

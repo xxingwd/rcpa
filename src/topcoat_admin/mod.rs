@@ -49,9 +49,33 @@ pub(crate) fn escape_inline_js_string(value: &str) -> String {
     escape_html(&serde_json::to_string(value).expect("serializing a string cannot fail"))
 }
 
+const SHANGHAI_UTC_OFFSET_SECONDS: i32 = 8 * 60 * 60;
+
+fn shanghai_time(value: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    let offset = chrono::FixedOffset::east_opt(SHANGHAI_UTC_OFFSET_SECONDS)?;
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|time| time.with_timezone(&offset))
+}
+
+pub(crate) fn format_shanghai_time_short(value: &str) -> String {
+    shanghai_time(value)
+        .map(|time| time.format("%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| value.to_string())
+}
+
+pub(crate) fn format_shanghai_time_full(value: &str) -> String {
+    shanghai_time(value)
+        .map(|time| time.format("%Y-%m-%d %H:%M:%S UTC+8").to_string())
+        .unwrap_or_else(|| value.to_string())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{escape_html, escape_inline_js_string, render_shared_styles};
+    use super::{
+        escape_html, escape_inline_js_string, format_shanghai_time_full,
+        format_shanghai_time_short, render_shared_styles,
+    };
 
     #[test]
     fn escapes_dynamic_html_and_inline_javascript_strings() {
@@ -78,5 +102,18 @@ mod tests {
         assert!(styles.contains(".dialog-footer {"));
         assert!(!styles.contains(".admin-card"));
         assert!(!styles.contains("max-width: 80rem"));
+    }
+
+    #[test]
+    fn formats_admin_timestamps_in_shanghai_time() {
+        assert_eq!(
+            format_shanghai_time_short("2026-07-28T16:30:45Z"),
+            "07-29 00:30:45"
+        );
+        assert_eq!(
+            format_shanghai_time_full("2026-07-28T16:30:45+00:00"),
+            "2026-07-29 00:30:45 UTC+8"
+        );
+        assert_eq!(format_shanghai_time_short("invalid"), "invalid");
     }
 }

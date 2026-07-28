@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use super::{models::AggregateRow, models::TotalStats, Store, StoreResult};
 
 const SUCCESS_CONDITION: &str = "status = 'success'";
+const SHANGHAI_UTC_OFFSET_SECONDS: i32 = 8 * 60 * 60;
 
 /// Dashboard-oriented LLM API metrics derived from persisted request logs.
 #[derive(Debug, Clone, Serialize)]
@@ -84,15 +85,19 @@ impl Store {
         self.aggregate_by_column("api_key_id", from, to).await
     }
 
-    /// Time-series aggregation by hour (truncated ISO-8601 hour).
+    /// Time-series aggregation by hour in the Shanghai calendar.
     pub async fn aggregate_by_hour(&self, from: &str, to: &str) -> StoreResult<Vec<AggregateRow>> {
-        self.aggregate_by_time("substr(created_at, 1, 13)", from, to)
-            .await
+        self.aggregate_by_time(
+            "strftime('%Y-%m-%d %H:00', created_at, '+8 hours')",
+            from,
+            to,
+        )
+        .await
     }
 
-    /// Time-series aggregation by day (truncated ISO-8601 date).
+    /// Time-series aggregation by day in the Shanghai calendar.
     pub async fn aggregate_by_day(&self, from: &str, to: &str) -> StoreResult<Vec<AggregateRow>> {
-        self.aggregate_by_time("substr(created_at, 1, 10)", from, to)
+        self.aggregate_by_time("strftime('%Y-%m-%d', created_at, '+8 hours')", from, to)
             .await
     }
 
@@ -300,11 +305,19 @@ impl Store {
 
 impl AnalyticsTimeBucket {
     fn key(self, created_at: &str) -> String {
-        let length = match self {
-            Self::Hour => 13,
-            Self::Day => 10,
-        };
-        created_at.get(..length).unwrap_or(created_at).to_string()
+        let local_time = chrono::DateTime::parse_from_rfc3339(created_at)
+            .ok()
+            .and_then(|time| {
+                chrono::FixedOffset::east_opt(SHANGHAI_UTC_OFFSET_SECONDS)
+                    .map(|offset| time.with_timezone(&offset))
+            });
+
+        match (self, local_time) {
+            (Self::Hour, Some(time)) => time.format("%Y-%m-%d %H:00").to_string(),
+            (Self::Day, Some(time)) => time.format("%Y-%m-%d").to_string(),
+            (Self::Hour, None) => created_at.get(..13).unwrap_or(created_at).to_string(),
+            (Self::Day, None) => created_at.get(..10).unwrap_or(created_at).to_string(),
+        }
     }
 }
 
@@ -677,6 +690,17 @@ mod tests {
         assert_eq!(analytics.timeline.len(), 1);
         assert_eq!(analytics.timeline[0].request_count, 5);
         assert_eq!(analytics.timeline[0].success_rate, 0.8);
+    }
+
+    #[test]
+    fn analytics_time_buckets_follow_the_shanghai_calendar() {
+        let utc_evening = "2026-07-28T16:30:45Z";
+
+        assert_eq!(
+            AnalyticsTimeBucket::Hour.key(utc_evening),
+            "2026-07-29 00:00"
+        );
+        assert_eq!(AnalyticsTimeBucket::Day.key(utc_evening), "2026-07-29");
     }
 
     #[tokio::test]

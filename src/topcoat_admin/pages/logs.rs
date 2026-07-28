@@ -7,9 +7,9 @@ use topcoat::{
 use crate::store::models::RequestLogFilter;
 use crate::topcoat_admin::app::{app_state, require_admin};
 use crate::topcoat_admin::{
-    escape_html, escape_inline_js_string, render_list, render_page, render_shared_scripts,
-    render_shared_styles, render_sidebar, render_theme_bootstrap, render_toast_container,
-    trusted_html, ListLayout, PageLayout,
+    escape_html, escape_inline_js_string, format_shanghai_time_full, format_shanghai_time_short,
+    render_list, render_page, render_shared_scripts, render_shared_styles, render_sidebar,
+    render_theme_bootstrap, render_toast_container, trusted_html, ListLayout, PageLayout,
 };
 
 const PAGE_SIZE: i64 = 20;
@@ -96,8 +96,8 @@ fn logs_actions() -> String {
 }
 
 fn logs_list_body() -> String {
-    r##"<div class="flex min-h-0 flex-1 flex-col">
-        <div class="logs-table-wrap min-h-0 flex-1">
+    r##"<div class="logs-list-content flex min-h-0 min-w-0 flex-1 flex-col">
+        <div class="logs-table-wrap min-h-0 min-w-0 flex-1">
             <table class="w-full text-sm min-w-[1440px]">
                 <thead class="border-b border-zinc-200 bg-zinc-50">
                     <tr>
@@ -194,8 +194,11 @@ pub async fn logs(cx: &Cx) -> Result {
         .badge-secondary {{ background: var(--muted); color: var(--foreground); padding: 0.125rem 0.5rem; border-radius: 6px; font-size: 0.75rem; }}
         .logs-page .page-header {{ align-items: flex-start; }}
         .logs-page .page-actions {{ flex: 1 1 auto; }}
-        .logs-page .page-body, .logs-page .data-list {{ display: flex; min-height: 0; flex: 1 1 auto; }}
-        .logs-table-wrap {{ min-height: 0; overflow: auto; }}
+        .logs-page {{ min-width: 0; overflow: hidden; }}
+        .logs-page .page-body, .logs-page .data-list {{ display: flex; width: 100%; min-width: 0; min-height: 0; flex: 1 1 auto; overflow: hidden; }}
+        .logs-list-content {{ width: 100%; max-width: 100%; overflow: hidden; }}
+        .logs-table-wrap {{ width: 100%; max-width: 100%; min-height: 0; overflow: auto; overscroll-behavior: contain; }}
+        .logs-table-wrap thead {{ position: sticky; top: 0; z-index: 1; }}
         @media (max-width: 639px) {{
             .filter-select {{ width: calc(50% - .25rem) !important; min-width: 0; }}
             .logs-pagination-row {{ align-items: flex-start; flex-direction: column; gap: .75rem; }}
@@ -236,6 +239,12 @@ pub async fn logs(cx: &Cx) -> Result {
         let totalPages = 1;
         let totalCount = 0;
         let refreshInterval = null;
+        let logsRequest = null;
+        const shanghaiTimeFormatter = new Intl.DateTimeFormat('zh-CN', {{
+            timeZone: 'Asia/Shanghai',
+            year: 'numeric', month: '2-digit', day: '2-digit',
+            hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23'
+        }});
 
         function formatTokens(n) {{
             n = parseInt(n) || 0;
@@ -272,7 +281,8 @@ pub async fn logs(cx: &Cx) -> Result {
 
         function formatTime(iso) {{
             const d = new Date(iso);
-            return d.toLocaleString('zh-CN', {{ month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }});
+            if (Number.isNaN(d.getTime())) return String(iso || '');
+            return shanghaiTimeFormatter.format(d).replaceAll('/', '-') + ' UTC+8';
         }}
 
         function cacheRate(input, cached) {{
@@ -288,6 +298,9 @@ pub async fn logs(cx: &Cx) -> Result {
 
         function loadPage(page) {{
             currentPage = page;
+            if (logsRequest) logsRequest.abort();
+            const request = new AbortController();
+            logsRequest = request;
             const key = document.getElementById('filter-key').value;
             const model = document.getElementById('filter-model').value;
             const provider = document.getElementById('filter-provider').value;
@@ -300,7 +313,7 @@ pub async fn logs(cx: &Cx) -> Result {
                 provider_name: provider === 'all' ? '' : provider,
                 protocol: protocol === 'all' ? '' : protocol,
             }});
-            fetch('/logs/table?' + params.toString())
+            fetch('/logs/table?' + params.toString(), {{ signal: request.signal }})
                 .then(r => {{
                     if (r.status === 401) return redirectToLogin();
                     return r.text();
@@ -317,6 +330,12 @@ pub async fn logs(cx: &Cx) -> Result {
                     const lastRow = Math.min(offset + limit, totalCount);
                     document.getElementById('logs-info').textContent = `第 ${{firstRow}} - ${{lastRow}} 条，共 ${{totalCount}} 条`;
                     updatePagination(page, totalPages);
+                }})
+                .catch(error => {{
+                    if (error.name !== 'AbortError') console.error('Failed to load logs:', error);
+                }})
+                .finally(() => {{
+                    if (logsRequest === request) logsRequest = null;
                 }});
         }}
 
@@ -571,6 +590,7 @@ pub async fn logs_table(cx: &Cx) -> Result {
         .await
         .unwrap_or_default();
     let total = state.store.count_request_logs(&filter).await.unwrap_or(0);
+    let snapshot = state.config_service.snapshot();
 
     let mut html = String::new();
 
@@ -607,14 +627,15 @@ pub async fn logs_table(cx: &Cx) -> Result {
             } else {
                 "badge-success"
             };
-            let time_str = escape_html(&log.created_at);
+            let time_short = escape_html(&format_shanghai_time_short(&log.created_at));
+            let time_full = escape_html(&format_shanghai_time_full(&log.created_at));
             let request_id_short = if log.request_id.len() > 8 {
                 &log.request_id[..8]
             } else {
                 &log.request_id
             };
             let request_id_short = escape_html(request_id_short);
-            let api_key_id = escape_html(&log.api_key_id);
+            let key_display_name = escape_html(snapshot.auth_key_display_name(&log.api_key_id));
             let provider_name = escape_html(&log.provider_name);
             let protocol = escape_html(&log.protocol);
             let operation = escape_html(&log.operation);
@@ -623,7 +644,7 @@ pub async fn logs_table(cx: &Cx) -> Result {
 
             html.push_str(&format!(
                 r##"<tr class="log-row border-b border-zinc-100">
-                    <td class="px-3 py-2.5 whitespace-nowrap text-xs text-zinc-500">{}</td>
+                    <td class="px-3 py-2.5 whitespace-nowrap font-mono text-xs text-zinc-500" title="{}">{}</td>
                     <td class="px-3 py-2.5 font-mono text-xs text-zinc-500 whitespace-nowrap">{}</td>
                     <td class="px-3 py-2.5"><span class="badge-secondary font-mono truncate block max-w-24" title="{}">{}</span></td>
                     <td class="px-3 py-2.5"><span class="badge-outline font-mono truncate block max-w-28">{}</span></td>
@@ -642,10 +663,11 @@ pub async fn logs_table(cx: &Cx) -> Result {
                     <td class="px-3 py-2.5"><span class="{} font-mono px-2 py-0.5 text-xs">{}</span></td>
                     <td class="px-3 py-2.5"><button class="inline-flex h-7 w-7 items-center justify-center rounded border border-zinc-200 hover:bg-zinc-50" onclick="openDetail({})"><svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg></button></td>
                 </tr>"##,
-                time_str,
+                time_full,
+                time_short,
                 request_id_short,
-                api_key_id,
-                api_key_id,
+                key_display_name,
+                key_display_name,
                 provider_name,
                 protocol,
                 operation,

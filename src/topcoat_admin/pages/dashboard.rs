@@ -297,6 +297,10 @@ async fn render_dashboard(cx: &Cx) -> Result {
         let currentOpDim = 'key';
         let currentTrafficDim = 'model';
         let analyticsData = null;
+        let analyticsLoading = false;
+        let chartDataSignature = null;
+        const DAY_MS = 24 * 60 * 60 * 1000;
+        const SHANGHAI_OFFSET_MS = 8 * 60 * 60 * 1000;
 
         function formatTokens(n) {{
             n = parseInt(n) || 0;
@@ -330,6 +334,13 @@ async fn render_dashboard(cx: &Cx) -> Result {
             return element.innerHTML;
         }}
 
+        function formatTimelineLabel(value) {{
+            const label = String(value || '');
+            if (/^\d{{4}}-\d{{2}}-\d{{2}} \d{{2}}:00$/.test(label)) return label.slice(5);
+            if (/^\d{{4}}-\d{{2}}-\d{{2}}$/.test(label)) return label.slice(5);
+            return label;
+        }}
+
         function formatSeconds(seconds) {{
             seconds = parseInt(seconds) || 0;
             if (seconds < 60) return seconds + 's';
@@ -343,14 +354,35 @@ async fn render_dashboard(cx: &Cx) -> Result {
             return milliseconds ? iso.replace('Z', '+00:00') : iso.replace(/\.\d{{3}}Z$/, '+00:00');
         }}
 
-        function startOfDay(date) {{ return new Date(date.getFullYear(), date.getMonth(), date.getDate()); }}
+        function shanghaiDateParts(date) {{
+            const shifted = new Date(date.getTime() + SHANGHAI_OFFSET_MS);
+            return {{
+                year: shifted.getUTCFullYear(),
+                month: shifted.getUTCMonth(),
+                day: shifted.getUTCDate(),
+                weekday: shifted.getUTCDay() || 7
+            }};
+        }}
+
+        function shanghaiDate(year, month, day) {{
+            return new Date(Date.UTC(year, month, day) - SHANGHAI_OFFSET_MS);
+        }}
+
+        function startOfDay(date) {{
+            const parts = shanghaiDateParts(date);
+            return shanghaiDate(parts.year, parts.month, parts.day);
+        }}
+
         function startOfWeek(date) {{
             const start = startOfDay(date);
-            const day = start.getDay() || 7;
-            start.setDate(start.getDate() - day + 1);
-            return start;
+            const weekday = shanghaiDateParts(date).weekday;
+            return new Date(start.getTime() - (weekday - 1) * DAY_MS);
         }}
-        function startOfMonth(date) {{ return new Date(date.getFullYear(), date.getMonth(), 1); }}
+
+        function startOfMonth(date) {{
+            const parts = shanghaiDateParts(date);
+            return shanghaiDate(parts.year, parts.month, 1);
+        }}
 
         function analyticsParams(rangeName) {{
             const now = new Date();
@@ -362,19 +394,18 @@ async fn render_dashboard(cx: &Cx) -> Result {
             if (rangeName === 'today') from = startOfDay(now);
             if (rangeName === 'yesterday') {{
                 to = new Date(startOfDay(now).getTime() - 1);
-                from = new Date(to);
-                from.setHours(0, 0, 0, 0);
+                from = startOfDay(to);
             }}
             if (rangeName === 'this_week') from = startOfWeek(now);
             if (rangeName === 'last_week') {{
                 to = new Date(startOfWeek(now).getTime() - 1);
-                from = new Date(startOfWeek(now));
-                from.setDate(from.getDate() - 7);
+                from = new Date(startOfWeek(now).getTime() - 7 * DAY_MS);
             }}
             if (rangeName === 'this_month') from = startOfMonth(now);
             if (rangeName === 'last_month') {{
                 to = new Date(startOfMonth(now).getTime() - 1);
-                from = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+                const parts = shanghaiDateParts(now);
+                from = shanghaiDate(parts.year, parts.month - 1, 1);
             }}
             const params = new URLSearchParams({{ bucket: rangeName === 'all' ? 'day' : 'hour' }});
             if (from) {{
@@ -405,9 +436,11 @@ async fn render_dashboard(cx: &Cx) -> Result {
         }}
 
         function loadAnalytics() {{
+            if (analyticsLoading) return Promise.resolve();
+            analyticsLoading = true;
             const range = document.getElementById('time-range')?.value || 'today';
             const analyticsUrl = '/v1/admin/analytics/dashboard?' + analyticsParams(range).toString();
-            Promise.all([
+            return Promise.all([
                 fetch(analyticsUrl, {{ credentials: 'include' }}),
                 fetch('/health', {{ credentials: 'include' }})
             ])
@@ -429,7 +462,8 @@ async fn render_dashboard(cx: &Cx) -> Result {
                     renderOperationsTable();
                     renderTrafficTable();
                 }})
-                .catch(err => console.error('Failed to load analytics:', err));
+                .catch(err => console.error('Failed to load analytics:', err))
+                .finally(() => {{ analyticsLoading = false; }});
         }}
 
         function renderCharts(timeline) {{
@@ -437,7 +471,7 @@ async fn render_dashboard(cx: &Cx) -> Result {
                 timeline = [{{ label: '无数据', request_count: 0, success_count: 0, error_count: 0, total_input_tokens: 0, total_output_tokens: 0, total_cached_tokens: 0, total_cache_write_tokens: 0, total_tokens: 0 }}];
             }}
 
-            const labels = timeline.map(b => b.label || b.group_key);
+            const labels = timeline.map(b => formatTimelineLabel(b.label || b.group_key));
             const tokenCtx = document.getElementById('tokenTrendChart').getContext('2d');
             const requestCtx = document.getElementById('requestTrendChart').getContext('2d');
             const styles = getComputedStyle(document.documentElement);
@@ -447,6 +481,8 @@ async fn render_dashboard(cx: &Cx) -> Result {
             const options = (tokenChartOptions) => ({{
                 responsive: true,
                 maintainAspectRatio: false,
+                animation: false,
+                normalized: true,
                 interaction: {{ mode: 'index', intersect: false }},
                 scales: {{
                     x: {{ stacked: true, grid: {{ display: false }}, ticks: {{ color: textColor, maxRotation: 0, autoSkip: true, font: {{ size: 10 }} }}, border: {{ display: false }} }},
@@ -458,34 +494,64 @@ async fn render_dashboard(cx: &Cx) -> Result {
                 }}
             }});
 
-            if (tokenChart) tokenChart.destroy();
-            if (requestChart) requestChart.destroy();
-
-            tokenChart = new Chart(tokenCtx, {{
-                type: 'bar',
-                data: {{
-                    labels: labels,
-                    datasets: [
-                        {{ label: '非缓存输入', data: timeline.map(b => Math.max(0, b.total_input_tokens - b.total_cached_tokens)), backgroundColor: 'rgba(59, 130, 246, 0.78)', stack: 'tokens' }},
-                        {{ label: '缓存命中', data: timeline.map(b => b.total_cached_tokens), backgroundColor: 'rgba(16, 185, 129, 0.82)', stack: 'tokens' }},
-                        {{ label: '缓存写入', data: timeline.map(b => b.total_cache_write_tokens), backgroundColor: 'rgba(245, 158, 11, 0.82)', stack: 'tokens' }},
-                        {{ label: '输出', data: timeline.map(b => b.total_output_tokens), backgroundColor: 'rgba(139, 92, 246, 0.72)', stack: 'tokens' }}
-                    ]
-                }},
-                options: options(true)
+            const tokenData = [
+                timeline.map(b => Math.max(0, b.total_input_tokens - b.total_cached_tokens)),
+                timeline.map(b => b.total_cached_tokens),
+                timeline.map(b => b.total_cache_write_tokens),
+                timeline.map(b => b.total_output_tokens)
+            ];
+            const requestData = [
+                timeline.map(b => b.success_count),
+                timeline.map(b => b.error_count)
+            ];
+            const nextSignature = JSON.stringify({{
+                labels,
+                tokenData,
+                requestData,
+                theme: document.documentElement.dataset.theme || 'light'
             }});
+            if (tokenChart && requestChart && chartDataSignature === nextSignature) return;
 
-            requestChart = new Chart(requestCtx, {{
-                type: 'bar',
-                data: {{
-                    labels: labels,
-                    datasets: [
-                        {{ label: '成功', data: timeline.map(b => b.success_count), backgroundColor: 'rgba(16, 185, 129, 0.78)', stack: 'requests' }},
-                        {{ label: '失败', data: timeline.map(b => b.error_count), backgroundColor: 'rgba(239, 68, 68, 0.78)', stack: 'requests' }}
-                    ]
-                }},
-                options: options(false)
-            }});
+            if (!tokenChart) {{
+                tokenChart = new Chart(tokenCtx, {{
+                    type: 'bar',
+                    data: {{
+                        labels: labels,
+                        datasets: [
+                            {{ label: '非缓存输入', data: tokenData[0], backgroundColor: 'rgba(59, 130, 246, 0.78)', stack: 'tokens' }},
+                            {{ label: '缓存命中', data: tokenData[1], backgroundColor: 'rgba(16, 185, 129, 0.82)', stack: 'tokens' }},
+                            {{ label: '缓存写入', data: tokenData[2], backgroundColor: 'rgba(245, 158, 11, 0.82)', stack: 'tokens' }},
+                            {{ label: '输出', data: tokenData[3], backgroundColor: 'rgba(139, 92, 246, 0.72)', stack: 'tokens' }}
+                        ]
+                    }},
+                    options: options(true)
+                }});
+            }} else {{
+                tokenChart.data.labels = labels;
+                tokenChart.data.datasets.forEach((dataset, index) => {{ dataset.data = tokenData[index]; }});
+                tokenChart.options = options(true);
+                tokenChart.update('none');
+            }}
+
+            if (!requestChart) {{
+                requestChart = new Chart(requestCtx, {{
+                    type: 'bar',
+                    data: {{
+                        labels: labels,
+                        datasets: [
+                            {{ label: '成功', data: requestData[0], backgroundColor: 'rgba(16, 185, 129, 0.78)', stack: 'requests' }},
+                            {{ label: '失败', data: requestData[1], backgroundColor: 'rgba(239, 68, 68, 0.78)', stack: 'requests' }}
+                        ]
+                    }},
+                    options: options(false)
+                }});
+            }} else {{
+                requestChart.data.labels = labels;
+                requestChart.data.datasets.forEach((dataset, index) => {{ dataset.data = requestData[index]; }});
+                requestChart.options = options(false);
+                requestChart.update('none');
+            }}
+            chartDataSignature = nextSignature;
         }}
 
         function renderOperationsTable() {{

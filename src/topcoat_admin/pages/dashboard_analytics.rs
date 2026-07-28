@@ -38,7 +38,7 @@ pub async fn dashboard_analytics(cx: &Cx) -> Result {
     let from = "1970-01-01T00:00:00Z";
     let to = "9999-12-31T23:59:59Z";
 
-    let analytics = match state
+    let mut analytics = match state
         .store
         .dashboard_analytics(from, to, crate::store::AnalyticsTimeBucket::Hour)
         .await
@@ -46,6 +46,10 @@ pub async fn dashboard_analytics(cx: &Cx) -> Result {
         Ok(data) => data,
         Err(_) => return Ok(View::unescaped_unchecked("[]")),
     };
+    let snapshot = state.config_service.snapshot();
+    for row in &mut analytics.by_key {
+        row.group_key = snapshot.auth_key_display_name(&row.group_key).to_string();
+    }
 
     let timeline: Vec<TimeBucket> = analytics
         .timeline

@@ -573,7 +573,8 @@ pub async fn get_analytics_by_key(
 ) -> Result<impl IntoResponse, AppError> {
     check_admin(&state, &headers)?;
     let (from, to) = query.resolve_range();
-    let data = state.store.aggregate_by_key(&from, &to).await?;
+    let mut data = state.store.aggregate_by_key(&from, &to).await?;
+    apply_key_display_names(&state.config_service.snapshot(), &mut data);
     Ok(Json(data))
 }
 
@@ -617,11 +618,21 @@ pub async fn get_dashboard_analytics(
 ) -> Result<impl IntoResponse, AppError> {
     check_admin(&state, &headers)?;
     let (from, to) = query.resolve_range();
-    let data = state
+    let mut data = state
         .store
         .dashboard_analytics(&from, &to, query.time_bucket())
         .await?;
+    apply_key_display_names(&state.config_service.snapshot(), &mut data.by_key);
     Ok(Json(data))
+}
+
+fn apply_key_display_names(
+    snapshot: &crate::config_service::ConfigSnapshot,
+    rows: &mut [crate::store::models::AggregateRow],
+) {
+    for row in rows {
+        row.group_key = snapshot.auth_key_display_name(&row.group_key).to_string();
+    }
 }
 
 // === Provider Management ===
@@ -1216,27 +1227,11 @@ pub struct RequestLogView {
     pub retry_count: u32,
 }
 
-fn key_display_name(snapshot: &crate::config_service::ConfigSnapshot, api_key_id: &str) -> String {
-    snapshot
-        .raw_config
-        .keys
-        .iter()
-        .find(|key| key.id == api_key_id)
-        .map(|key| {
-            key.name
-                .as_deref()
-                .filter(|name| !name.trim().is_empty())
-                .unwrap_or(&key.id)
-                .to_string()
-        })
-        .unwrap_or_else(|| api_key_id.to_string())
-}
-
 fn request_log_view(
     snapshot: &crate::config_service::ConfigSnapshot,
     log: crate::store::models::DbRequestLog,
 ) -> RequestLogView {
-    let key_display_name = key_display_name(snapshot, &log.api_key_id);
+    let key_display_name = snapshot.auth_key_display_name(&log.api_key_id).to_string();
     let retry_count = u32::try_from(log.retry_count).unwrap_or(0);
     RequestLogView {
         log,

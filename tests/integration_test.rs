@@ -1799,7 +1799,7 @@ async fn test_admin_key_model_catalog_validation_and_log_key_display_name() {
         .header("x-admin-token", "admin-token")
         .body(Body::empty())
         .unwrap();
-    let res = app.oneshot(req).await.unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let body_bytes = axum::body::to_bytes(res.into_body(), 1024 * 1024)
         .await
@@ -1807,6 +1807,32 @@ async fn test_admin_key_model_catalog_validation_and_log_key_display_name() {
     let logs: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(logs["items"][0]["key_display_name"], unnamed_key_id);
     assert_ne!(logs["items"][0]["key_display_name"], unnamed_key_value);
+
+    for path in [
+        "/v1/admin/analytics/key?from=2000-01-01T00:00:00Z&to=2099-12-31T23:59:59Z",
+        "/v1/admin/analytics/dashboard?from=2000-01-01T00:00:00Z&to=2099-12-31T23:59:59Z",
+    ] {
+        let req = Request::builder()
+            .method("GET")
+            .uri(path)
+            .header("x-admin-token", "admin-token")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "path: {path}");
+        let body_bytes = axum::body::to_bytes(res.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let analytics: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let by_key = if path.contains("dashboard") {
+            analytics["by_key"].as_array().unwrap()
+        } else {
+            analytics.as_array().unwrap()
+        };
+        assert!(by_key.iter().any(|row| row["group_key"] == "catalog-key"));
+        assert!(by_key.iter().any(|row| row["group_key"] == unnamed_key_id));
+        assert!(!by_key.iter().any(|row| row["group_key"] == named_key_id));
+    }
 }
 
 #[tokio::test]

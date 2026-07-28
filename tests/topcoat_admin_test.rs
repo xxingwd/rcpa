@@ -6,6 +6,7 @@ use rcpa::{
         ProviderProtocol, RetryConfig, RoutingConfig, StickyConfig, UpstreamConfig,
     },
     server::AppState,
+    store::NewRequestLog,
     topcoat_admin::build_topcoat_app,
 };
 
@@ -75,6 +76,32 @@ fn populated_config() -> AppConfig {
 #[tokio::test]
 async fn admin_pages_require_cookie_and_render_the_shared_rust_shell() {
     let state = Arc::new(AppState::from_config(populated_config()).await.unwrap());
+    state
+        .store
+        .insert_request_log_entry(NewRequestLog {
+            request_id: "fixture-request",
+            api_key_id: "fixture-key",
+            session_hash: None,
+            provider_name: "fixture-provider",
+            protocol: "responses",
+            model: "upstream-model",
+            operation: "responses",
+            status_code: 200,
+            success: true,
+            input_tokens: 8,
+            output_tokens: 4,
+            total_tokens: 12,
+            cached_tokens: 2,
+            cache_write_tokens: 0,
+            cost_cents: 1,
+            latency_ms: 80,
+            first_byte_latency_ms: 40,
+            metadata_json: "{}",
+            request_body: None,
+            response_body: None,
+        })
+        .await
+        .unwrap();
     let app = build_topcoat_app(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -218,6 +245,28 @@ async fn admin_pages_require_cookie_and_render_the_shared_rust_shell() {
         "/dashboard"
     );
 
+    let logs_table = client
+        .get(format!("{base}/logs/table"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert!(logs_table.status().is_success());
+    let logs_table_html = logs_table.text().await.unwrap();
+    assert!(logs_table_html.contains("Fixture Key"));
+    assert!(!logs_table_html.contains("fixture-key"));
+
+    let dashboard_analytics = client
+        .get(format!("{base}/dashboard/analytics"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert!(dashboard_analytics.status().is_success());
+    let dashboard_analytics: serde_json::Value =
+        serde_json::from_str(&dashboard_analytics.text().await.unwrap()).unwrap();
+    assert_eq!(dashboard_analytics["by_key"][0]["group_key"], "Fixture Key");
+
     for path in ["/dashboard", "/keys", "/providers", "/logs", "/config"] {
         let response = client
             .get(format!("{base}{path}"))
@@ -259,6 +308,18 @@ async fn admin_pages_require_cookie_and_render_the_shared_rust_shell() {
             assert!(html.contains("hx-trigger=\"load, rcpa-keys-refresh from:body\""));
             assert!(html.contains("refreshData('keys')"));
         }
+        if path == "/dashboard" {
+            assert!(html.contains("animation: false"));
+            assert!(html.contains("tokenChart.update('none')"));
+            assert!(html.contains("requestChart.update('none')"));
+            assert!(html.contains("if (analyticsLoading) return Promise.resolve()"));
+            assert!(html.contains("formatTimelineLabel(b.label || b.group_key)"));
+            assert!(html.contains("const SHANGHAI_OFFSET_MS = 8 * 60 * 60 * 1000"));
+            assert!(html.contains("chartDataSignature === nextSignature"));
+            assert!(!html.contains("date.getFullYear()"));
+            assert!(!html.contains("tokenChart.destroy()"));
+            assert!(!html.contains("requestChart.destroy()"));
+        }
         if path == "/providers" {
             assert!(html.contains("id=\"providers-list\""));
             assert!(html.contains("hx-trigger=\"load, rcpa-providers-refresh from:body\""));
@@ -269,6 +330,9 @@ async fn admin_pages_require_cookie_and_render_the_shared_rust_shell() {
         if path == "/logs" {
             assert!(html.contains("id=\"logs-list\""));
             assert!(html.contains("class=\"dialog-shell log-dialog\""));
+            assert!(html.contains(".logs-page { min-width: 0; overflow: hidden; }"));
+            assert!(html.contains("timeZone: 'Asia/Shanghai'"));
+            assert!(html.contains("let logsRequest = null"));
         }
     }
 
