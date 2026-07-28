@@ -20,13 +20,7 @@ cargo run -- --token local-admin-token --port 15000 --data-dir ~/.rcpa --log-lev
 
 On first start, RCPA creates `~/.rcpa/config.yaml`, `~/.rcpa/rcpa.db`, and `~/.rcpa/logs/`.
 
-The admin UI is served from `frontend/dist`, so build the frontend before running a packaged binary:
-
-```bash
-cd frontend
-npm ci
-npm run build
-```
+The Topcoat admin UI and its static assets are compiled into the Rust binary. Open `http://localhost:15000/login` after the server starts.
 
 ## Config Model
 
@@ -106,7 +100,6 @@ The included `docker-compose.yaml` pulls `ghcr.io/xxingwd/rcpa:latest`, exposes 
 Binary release archives should include:
 
 - `rcpa` binary
-- `frontend/dist`
 - `config.example.yaml`
 - `docker-compose.yaml`
 - `.env.example`
@@ -114,7 +107,7 @@ Binary release archives should include:
 - `CONTRIBUTING.md`
 - `LICENSE`
 
-Run the binary from the archive root so the server can find `frontend/dist`.
+The `rcpa` binary is self-contained and can run from any working directory.
 
 ## Development
 
@@ -123,7 +116,6 @@ cargo check
 cargo test
 cargo fmt
 cargo clippy --all-targets --all-features -- -D warnings
-cd frontend && npm ci && npm run lint && npm run build
 ```
 
 Do not commit real `config.yaml`, `.env` files, SQLite databases, logs, or generated build directories.

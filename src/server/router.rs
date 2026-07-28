@@ -122,6 +122,9 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
             "/admin/analytics/dashboard",
             get(crate::admin::get_dashboard_analytics),
         )
+        .route("/admin/login", post(crate::admin::admin_login))
+        .route("/admin/logout", post(crate::admin::admin_logout))
+        .route("/admin/session", get(crate::admin::admin_check_session))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             metrics_middleware,
@@ -130,13 +133,11 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
         .with_state(state.clone())
 }
 
-/// Builds the meta router for health, stats, and admin UI serving.
+/// Builds the meta router for health and stats.
 pub fn build_meta_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health_check))
         .route("/stats", get(stats_handler))
-        .route("/admin", get(crate::admin::dashboard))
-        .route("/assets/{*path}", get(crate::admin::static_handler))
         .with_state(state.clone())
 }
 

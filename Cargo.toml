@@ -1,6 +1,6 @@
 [package]
 name = "rcpa"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2021"
 description = "Rust Cloud Proxy API - LLM gateway"
 readme = "README.md"
@@ -16,7 +16,7 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace", "limit", "timeout", "request-id", "compression-gzip", "decompression-gzip", "auth"] }
 
 # Topcoat framework for admin UI
-topcoat = { git = "https://github.com/tokio-rs/topcoat.git", features = ["view", "router", "cookie", "ui", "discover", "htmx"] }
+topcoat = { git = "https://github.com/tokio-rs/topcoat.git", features = ["view", "router", "cookie", "ui", "tailwind", "font-fontsource", "discover", "htmx"] }
 topcoat-router = { git = "https://github.com/tokio-rs/topcoat.git", features = ["tower", "discover"] }
 
 # HTTP client
@@ -73,6 +73,9 @@ dirs = "5"
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+
+[build-dependencies]
+topcoat-tailwind = { git = "https://github.com/tokio-rs/topcoat.git", features = ["build"] }
 
 [profile.release]
 lto = "fat"

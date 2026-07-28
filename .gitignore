@@ -17,11 +17,6 @@ data/
 # Rust build output
 /target/
 
-# Frontend dependencies and build output
-/frontend/node_modules/
-/frontend/dist/
-/frontend/dist-ssr/
-
 # Logs and local process files
 *.log
 logs/
@@ -34,4 +29,3 @@ logs/
 !.vscode/extensions.json
 *.swp
 *.swo
-

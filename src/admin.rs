@@ -1,7 +1,7 @@
 use axum::{
     extract::{Path, Query, State},
-    http::HeaderMap,
-    response::IntoResponse,
+    http::{header::SET_COOKIE, HeaderMap},
+    response::{IntoResponse, Response},
     Json,
 };
 use serde::{Deserialize, Deserializer, Serialize};
@@ -12,15 +12,108 @@ use crate::config::{AppConfig, AuthKey, EndpointConfig, ModelPricing, ModelRule,
 use crate::error::AppError;
 use crate::server::AppState;
 
-fn check_admin(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
-    let token = headers
+const ADMIN_COOKIE_NAME: &str = "rcpa_admin_token";
+
+/// Extract admin token from either x-admin-token header or cookie.
+fn extract_admin_token(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
+    // First try header (for API clients)
+    if let Some(token) = headers
         .get("x-admin-token")
         .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| AppError::Unauthorized("Admin token required".into()))?;
-    if token != state.admin_token {
+    {
+        if token == state.admin_token {
+            return Ok(());
+        }
         return Err(AppError::Unauthorized("Invalid admin token".into()));
     }
-    Ok(())
+
+    // Then try cookie (for browser clients)
+    if let Some(cookie_header) = headers.get("cookie").and_then(|v| v.to_str().ok()) {
+        for cookie in cookie_header.split(';') {
+            let cookie = cookie.trim();
+            if let Some((name, value)) = cookie.split_once('=') {
+                if name.trim() == ADMIN_COOKIE_NAME {
+                    let value = value.trim();
+                    if value == state.admin_token {
+                        return Ok(());
+                    }
+                    return Err(AppError::Unauthorized("Invalid admin token".into()));
+                }
+            }
+        }
+    }
+
+    Err(AppError::Unauthorized("Admin token required".into()))
+}
+
+/// Check if request has valid admin authentication.
+pub fn check_admin(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
+    extract_admin_token(state, headers)
+}
+
+/// Build Set-Cookie header for admin login.
+fn build_login_cookie(token: &str) -> String {
+    format!(
+        "{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
+        ADMIN_COOKIE_NAME,
+        token,
+        7 * 24 * 60 * 60 // 7 days
+    )
+}
+
+/// Build Set-Cookie header for admin logout.
+fn build_logout_cookie() -> String {
+    format!(
+        "{}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0",
+        ADMIN_COOKIE_NAME
+    )
+}
+
+// === Login / Logout ===
+
+#[derive(Debug, Deserialize)]
+pub struct LoginPayload {
+    pub token: String,
+}
+
+/// Login endpoint: validates token and sets HTTP-only cookie.
+pub async fn admin_login(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<LoginPayload>,
+) -> Result<Response<String>, AppError> {
+    if payload.token != state.admin_token {
+        return Err(AppError::Unauthorized("Invalid admin token".into()));
+    }
+
+    let cookie = build_login_cookie(&state.admin_token);
+    let body = serde_json::json!({"status": "ok"}).to_string();
+    Ok(Response::builder()
+        .status(200)
+        .header(SET_COOKIE, cookie)
+        .header("content-type", "application/json")
+        .body(body)
+        .unwrap())
+}
+
+/// Logout endpoint: clears the admin cookie.
+pub async fn admin_logout() -> Response<String> {
+    let cookie = build_logout_cookie();
+    let body = serde_json::json!({"status": "ok"}).to_string();
+    Response::builder()
+        .status(200)
+        .header(SET_COOKIE, cookie)
+        .header("content-type", "application/json")
+        .body(body)
+        .unwrap()
+}
+
+/// Check if admin is authenticated (for frontend to verify session).
+pub async fn admin_check_session(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, AppError> {
+    check_admin(&state, &headers)?;
+    Ok(Json(serde_json::json!({"authenticated": true})))
 }
 
 // === API Key Management ===
@@ -1226,45 +1319,4 @@ pub async fn get_request_log_detail(
         request_body,
         response_body,
     }))
-}
-
-pub async fn dashboard() -> impl IntoResponse {
-    match tokio::fs::read_to_string("frontend/dist/index.html").await {
-        Ok(html) => axum::response::Html(html).into_response(),
-        Err(_) => (
-            axum::http::StatusCode::NOT_FOUND,
-            "Index page not found. Please build the frontend first.",
-        )
-            .into_response(),
-    }
-}
-
-pub async fn static_handler(Path(path): Path<String>) -> impl IntoResponse {
-    let file_path = std::path::PathBuf::from("frontend/dist/assets").join(&path);
-    match tokio::fs::read(&file_path).await {
-        Ok(content) => {
-            let mime = if path.ends_with(".js") {
-                "application/javascript"
-            } else if path.ends_with(".css") {
-                "text/css"
-            } else if path.ends_with(".svg") {
-                "image/svg+xml"
-            } else {
-                "application/octet-stream"
-            };
-
-            (
-                [
-                    (axum::http::header::CONTENT_TYPE, mime),
-                    (
-                        axum::http::header::CACHE_CONTROL,
-                        "public, max-age=31536000",
-                    ),
-                ],
-                content,
-            )
-                .into_response()
-        }
-        Err(_) => axum::http::StatusCode::NOT_FOUND.into_response(),
-    }
 }

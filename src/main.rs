@@ -120,8 +120,7 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
     // Use Topcoat's serve_until with our shutdown signal
-    topcoat::serve_until(listener, app, shutdown_signal())
-        .await?;
+    topcoat::serve_until(listener, app, shutdown_signal()).await?;
 
     tracing::info!("RCPA shutting down");
     Ok(())

@@ -11,7 +11,6 @@ cargo fmt --check
 cargo check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
-cd frontend && npm ci && npm run lint && npm run build
 ```
 
 ## Rules

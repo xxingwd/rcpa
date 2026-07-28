@@ -48,7 +48,7 @@ pub async fn fetch_dashboard_stats(cx: &Cx) -> DashboardStats {
     let state = crate::topcoat_admin::app::app_state(cx);
     let from = "1970-01-01T00:00:00Z";
     let to = "9999-12-31T23:59:59Z";
-    
+
     match state.store.dashboard_stats(from, to).await {
         Ok(stats) => serde_json::from_value(serde_json::to_value(stats).unwrap_or_default())
             .unwrap_or_default(),

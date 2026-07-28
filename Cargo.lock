@@ -1900,7 +1900,7 @@ dependencies = [
 
 [[package]]
 name = "rcpa"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1930,6 +1930,7 @@ dependencies = [
  "tokio-stream",
  "topcoat",
  "topcoat-router",
+ "topcoat-tailwind",
  "tower",
  "tower-http 0.6.11",
  "tracing",
@@ -2104,6 +2105,7 @@ version = "0.23.40"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
 dependencies = [
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -2895,6 +2897,7 @@ dependencies = [
  "topcoat-runtime",
  "topcoat-runtime-macro",
  "topcoat-session",
+ "topcoat-tailwind",
  "topcoat-ui-registry",
  "topcoat-view",
  "topcoat-view-macro",
@@ -3156,6 +3159,17 @@ dependencies = [
  "topcoat-core",
  "topcoat-router",
  "web-time",
+]
+
+[[package]]
+name = "topcoat-tailwind"
+version = "0.4.0"
+source = "git+https://github.com/tokio-rs/topcoat.git#ca0903338ea00ba1bd7495525ac7c687cd4971b7"
+dependencies = [
+ "sha2 0.11.0",
+ "thiserror 2.0.18",
+ "topcoat-core",
+ "ureq",
 ]
 
 [[package]]
@@ -3446,6 +3460,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
+name = "ureq"
+version = "3.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dea7109cdcd5864d4eeb1b58a1648dc9bf520360d7af16ec26d0a9354bafcfc0"
+dependencies = [
+ "base64",
+ "flate2",
+ "log",
+ "percent-encoding",
+ "rustls",
+ "rustls-pki-types",
+ "ureq-proto",
+ "utf8-zero",
+ "webpki-roots",
+]
+
+[[package]]
+name = "ureq-proto"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e994ba84b0bd1b1b0cf92878b7ef898a5c1760108fe7b6010327e274917a808c"
+dependencies = [
+ "base64",
+ "http",
+ "httparse",
+ "log",
+]
+
+[[package]]
 name = "url"
 version = "2.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3456,6 +3499,12 @@ dependencies = [
  "percent-encoding",
  "serde",
 ]
+
+[[package]]
+name = "utf8-zero"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8c0a043c9540bae7c578c88f91dda8bd82e59ae27c21baca69c8b191aaf5a6e"
 
 [[package]]
 name = "utf8_iter"
