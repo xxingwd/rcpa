@@ -27,15 +27,48 @@ pub struct NewRequestLog<'a> {
     pub response_body: Option<&'a [u8]>,
 }
 
-const REQUEST_LOG_SELECT_FIELDS: &str = r#"l.id, l.request_id, l.run_id, m.api_key_id, m.session_hash,
-                    m.provider_name, m.protocol, m.model, l.operation, m.status, m.status_code,
-                    CASE WHEN m.status = 'success' THEN 1 ELSE 0 END as success,
-                    m.input_tokens, m.output_tokens,
-                    m.input_tokens + m.output_tokens as total_tokens,
-                    m.cached_tokens, m.cache_write_tokens,
-                    m.cost_cents, m.latency_ms, m.first_byte_latency_ms, l.retry_count,
+#[derive(Debug, Clone)]
+pub struct NewRunningRequestLog<'a> {
+    pub request_id: &'a str,
+    pub api_key_id: &'a str,
+    pub session_hash: Option<&'a str>,
+    pub provider_name: &'a str,
+    pub protocol: &'a str,
+    pub model: &'a str,
+    pub operation: &'a str,
+    pub status_code: i64,
+    pub retry_count: i64,
+    pub first_byte_latency_ms: i64,
+    pub metadata_json: &'a str,
+    pub request_body: Option<&'a [u8]>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RequestLogProgress<'a> {
+    pub provider_name: &'a str,
+    pub protocol: &'a str,
+    pub model: &'a str,
+    pub status_code: i64,
+    pub retry_count: i64,
+    pub first_byte_latency_ms: i64,
+    pub metadata_json: &'a str,
+    pub request_body: Option<&'a [u8]>,
+}
+
+const REQUEST_LOG_SELECT_FIELDS: &str = r#"l.id, l.request_id, l.run_id, l.api_key_id, l.session_hash,
+                    l.provider_name, l.protocol, l.model, l.operation, l.status, l.status_code,
+                    CASE WHEN l.status = 'success' THEN 1 ELSE 0 END as success,
+                    l.input_tokens, l.output_tokens,
+                    l.input_tokens + l.output_tokens as total_tokens,
+                    l.cached_tokens, l.cache_write_tokens,
+                    l.cost_cents,
+                    CASE WHEN l.status = 'running'
+                        THEN MAX(0, CAST((julianday('now') - julianday(l.created_at)) * 86400000 AS INTEGER))
+                        ELSE l.latency_ms
+                    END as latency_ms,
+                    l.first_byte_latency_ms, l.retry_count,
                     l.meta, json_extract(l.meta, '$.error.code') as error_code,
-                    json_extract(l.meta, '$.error.message') as error, m.created_at, l.finished_at"#;
+                    json_extract(l.meta, '$.error.message') as error, l.created_at, l.finished_at"#;
 
 impl Store {
     pub async fn insert_request_log_entry(
@@ -52,14 +85,14 @@ impl Store {
             entry.cache_write_tokens,
         );
 
-        let mut transaction = self.pool.begin().await?;
         sqlx::query(
             r#"INSERT INTO request_logs (
                 id, request_id, run_id, api_key_id, session_hash, provider_name, protocol,
                 model, operation, status, status_code, retry_count, input_tokens, output_tokens,
-                cost_cents, latency_ms, first_byte_latency_ms, meta, created_at,
-                finished_at, request_body, response_body
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                cached_tokens, cache_write_tokens, cost_cents, latency_ms,
+                first_byte_latency_ms, meta, created_at, updated_at, finished_at,
+                request_body, response_body
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&id)
         .bind(entry.request_id)
@@ -75,44 +108,19 @@ impl Store {
         .bind(retry_count)
         .bind(entry.input_tokens)
         .bind(entry.output_tokens)
+        .bind(entry.cached_tokens)
+        .bind(entry.cache_write_tokens)
         .bind(entry.cost_cents)
         .bind(entry.latency_ms)
         .bind(entry.first_byte_latency_ms)
         .bind(&meta)
         .bind(&now)
         .bind(&now)
+        .bind(&now)
         .bind(entry.request_body)
         .bind(entry.response_body)
-        .execute(&mut *transaction)
+        .execute(&self.pool)
         .await?;
-
-        sqlx::query(
-            r#"INSERT INTO request_log_metrics (
-                id, api_key_id, session_hash, provider_name, protocol, model, status, status_code,
-                input_tokens, output_tokens, cached_tokens, cache_write_tokens, cost_cents,
-                latency_ms, first_byte_latency_ms, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
-        )
-        .bind(&id)
-        .bind(entry.api_key_id)
-        .bind(entry.session_hash)
-        .bind(entry.provider_name)
-        .bind(entry.protocol)
-        .bind(entry.model)
-        .bind(status)
-        .bind(entry.status_code)
-        .bind(entry.input_tokens)
-        .bind(entry.output_tokens)
-        .bind(entry.cached_tokens)
-        .bind(entry.cache_write_tokens)
-        .bind(entry.cost_cents)
-        .bind(entry.latency_ms)
-        .bind(entry.first_byte_latency_ms)
-        .bind(&now)
-        .execute(&mut *transaction)
-        .await?;
-
-        transaction.commit().await?;
 
         Ok(DbRequestLog {
             id,
@@ -146,6 +154,146 @@ impl Store {
         })
     }
 
+    pub async fn begin_request_log(&self, entry: NewRunningRequestLog<'_>) -> StoreResult<String> {
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        let meta = normalized_meta(entry.metadata_json, 0, 0);
+
+        sqlx::query(
+            r#"INSERT INTO request_logs (
+                id, request_id, run_id, api_key_id, session_hash, provider_name, protocol,
+                model, operation, status, status_code, retry_count, input_tokens, output_tokens,
+                cached_tokens, cache_write_tokens, cost_cents, latency_ms,
+                first_byte_latency_ms, meta, created_at, updated_at, finished_at,
+                request_body, response_body
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, 0, 0, 0, 0, 0, 0, ?, ?, ?, ?, NULL, ?, NULL)"#,
+        )
+        .bind(&id)
+        .bind(entry.request_id)
+        .bind(entry.request_id)
+        .bind(entry.api_key_id)
+        .bind(entry.session_hash)
+        .bind(entry.provider_name)
+        .bind(entry.protocol)
+        .bind(entry.model)
+        .bind(entry.operation)
+        .bind(entry.status_code)
+        .bind(entry.retry_count)
+        .bind(entry.first_byte_latency_ms)
+        .bind(meta)
+        .bind(&now)
+        .bind(&now)
+        .bind(entry.request_body)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(id)
+    }
+
+    pub async fn update_request_log_progress(
+        &self,
+        id: &str,
+        progress: RequestLogProgress<'_>,
+    ) -> StoreResult<bool> {
+        let now = Utc::now().to_rfc3339();
+        let meta = normalized_meta(progress.metadata_json, 0, 0);
+        let result = sqlx::query(
+            r#"UPDATE request_logs
+               SET provider_name = ?, protocol = ?, model = ?, status_code = ?,
+                   retry_count = ?, first_byte_latency_ms = ?, meta = ?, updated_at = ?,
+                   request_body = COALESCE(?, request_body)
+               WHERE id = ? AND status = 'running'"#,
+        )
+        .bind(progress.provider_name)
+        .bind(progress.protocol)
+        .bind(progress.model)
+        .bind(progress.status_code)
+        .bind(progress.retry_count)
+        .bind(progress.first_byte_latency_ms)
+        .bind(meta)
+        .bind(now)
+        .bind(progress.request_body)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn complete_request_log(
+        &self,
+        id: &str,
+        entry: NewRequestLog<'_>,
+    ) -> StoreResult<bool> {
+        let now = Utc::now().to_rfc3339();
+        let retry_count = retry_count_from_meta(entry.metadata_json);
+        let status = if entry.success { "success" } else { "failed" };
+        let meta = normalized_meta(
+            entry.metadata_json,
+            entry.cached_tokens,
+            entry.cache_write_tokens,
+        );
+        let result = sqlx::query(
+            r#"UPDATE request_logs
+               SET api_key_id = ?, session_hash = ?, provider_name = ?, protocol = ?,
+                   model = ?, operation = ?, status = ?, status_code = ?, retry_count = ?,
+                   input_tokens = ?, output_tokens = ?, cached_tokens = ?,
+                   cache_write_tokens = ?, cost_cents = ?, latency_ms = ?,
+                   first_byte_latency_ms = ?, meta = ?, updated_at = ?, finished_at = ?,
+                   request_body = COALESCE(?, request_body), response_body = ?
+               WHERE id = ? AND status = 'running'"#,
+        )
+        .bind(entry.api_key_id)
+        .bind(entry.session_hash)
+        .bind(entry.provider_name)
+        .bind(entry.protocol)
+        .bind(entry.model)
+        .bind(entry.operation)
+        .bind(status)
+        .bind(entry.status_code)
+        .bind(retry_count)
+        .bind(entry.input_tokens)
+        .bind(entry.output_tokens)
+        .bind(entry.cached_tokens)
+        .bind(entry.cache_write_tokens)
+        .bind(entry.cost_cents)
+        .bind(entry.latency_ms)
+        .bind(entry.first_byte_latency_ms)
+        .bind(meta)
+        .bind(&now)
+        .bind(&now)
+        .bind(entry.request_body)
+        .bind(entry.response_body)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn interrupt_running_request_logs(&self) -> StoreResult<u64> {
+        let now = Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            r#"UPDATE request_logs
+               SET status = 'interrupted',
+                   latency_ms = MAX(0, CAST((julianday(?) - julianday(created_at)) * 86400000 AS INTEGER)),
+                   meta = json_set(meta,
+                       '$.error.code', 'gateway_restarted',
+                       '$.error.message', 'Gateway restarted before the request completed',
+                       '$.error.retryable', 0
+                   ),
+                   updated_at = ?, finished_at = ?
+               WHERE status = 'running'"#,
+        )
+        .bind(&now)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected())
+    }
+
     /// Query request logs with optional filters. Body BLOBs are excluded
     /// from list results — use `get_request_log_detail` for full records.
     pub async fn query_request_logs(
@@ -157,14 +305,13 @@ impl Store {
 
         let mut query = QueryBuilder::<Sqlite>::new(format!(
             "SELECT {fields}
-             FROM request_log_metrics m
-             JOIN request_logs l ON l.id = m.id
+             FROM request_logs l
              WHERE 1 = 1",
             fields = REQUEST_LOG_SELECT_FIELDS
         ));
         append_request_log_filters(&mut query, filter);
         query
-            .push(" ORDER BY m.created_at DESC LIMIT ")
+            .push(" ORDER BY l.created_at DESC LIMIT ")
             .push_bind(limit)
             .push(" OFFSET ")
             .push_bind(offset);
@@ -179,7 +326,7 @@ impl Store {
     /// Count request logs matching the same filters used by `query_request_logs`.
     pub async fn count_request_logs(&self, filter: &RequestLogFilter) -> StoreResult<i64> {
         let mut query =
-            QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM request_log_metrics m WHERE 1 = 1");
+            QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM request_logs l WHERE 1 = 1");
         append_request_log_filters(&mut query, filter);
         let count = query
             .build_query_scalar::<i64>()
@@ -195,7 +342,6 @@ impl Store {
             "SELECT {fields},
                     request_body, response_body
              FROM request_logs l
-             JOIN request_log_metrics m ON m.id = l.id
              WHERE l.id = ?
              LIMIT 1",
             fields = REQUEST_LOG_SELECT_FIELDS
@@ -210,43 +356,43 @@ impl Store {
 
 fn append_request_log_filters(query: &mut QueryBuilder<'_, Sqlite>, filter: &RequestLogFilter) {
     if let Some(from) = &filter.from {
-        query.push(" AND m.created_at >= ").push_bind(from.clone());
+        query.push(" AND l.created_at >= ").push_bind(from.clone());
     }
     if let Some(to) = &filter.to {
-        query.push(" AND m.created_at <= ").push_bind(to.clone());
+        query.push(" AND l.created_at <= ").push_bind(to.clone());
     }
     if let Some(api_key_id) = &filter.api_key_id {
         query
-            .push(" AND m.api_key_id = ")
+            .push(" AND l.api_key_id = ")
             .push_bind(api_key_id.clone());
     }
     if let Some(session_hash) = &filter.session_hash {
         query
-            .push(" AND m.session_hash = ")
+            .push(" AND l.session_hash = ")
             .push_bind(session_hash.clone());
     }
     if let Some(model) = &filter.model {
-        query.push(" AND m.model = ").push_bind(model.clone());
+        query.push(" AND l.model = ").push_bind(model.clone());
     }
     if let Some(provider_name) = &filter.provider_name {
         query
-            .push(" AND m.provider_name = ")
+            .push(" AND l.provider_name = ")
             .push_bind(provider_name.clone());
     }
     if let Some(protocol) = &filter.protocol {
-        query.push(" AND m.protocol = ").push_bind(protocol.clone());
+        query.push(" AND l.protocol = ").push_bind(protocol.clone());
     }
     if let Some(status) = &filter.status {
-        query.push(" AND m.status = ").push_bind(status.clone());
+        query.push(" AND l.status = ").push_bind(status.clone());
     }
     if let Some(status_code) = filter.status_code {
-        query.push(" AND m.status_code = ").push_bind(status_code);
+        query.push(" AND l.status_code = ").push_bind(status_code);
     }
     if let Some(success) = filter.success {
         query.push(if success == 1 {
-            " AND m.status = 'success'"
+            " AND l.status = 'success'"
         } else {
-            " AND m.status <> 'success'"
+            " AND l.status <> 'success' AND l.status <> 'running'"
         });
     }
 }
@@ -308,7 +454,9 @@ fn normalized_meta(meta: &str, cached_tokens: i64, cache_write_tokens: i64) -> S
 
 #[cfg(test)]
 mod tests {
-    use super::super::{models::RequestLogFilter, NewRequestLog, Store};
+    use super::super::{
+        models::RequestLogFilter, NewRequestLog, NewRunningRequestLog, RequestLogProgress, Store,
+    };
 
     fn metadata(error_code: Option<&str>, error: Option<&str>) -> String {
         serde_json::json!({
@@ -496,5 +644,162 @@ mod tests {
         assert_eq!(detail.cache_write_tokens, 0);
         assert!(detail.request_body.is_some());
         assert!(detail.response_body.is_none());
+    }
+
+    #[tokio::test]
+    async fn running_request_is_visible_and_completion_updates_the_same_row() {
+        let store = Store::open_in_memory().await.unwrap();
+        let log_id = store
+            .begin_request_log(NewRunningRequestLog {
+                request_id: "req-running",
+                api_key_id: "key-running",
+                session_hash: None,
+                provider_name: "provider-a",
+                protocol: "responses",
+                model: "model-a",
+                operation: "responses",
+                status_code: 0,
+                retry_count: 0,
+                first_byte_latency_ms: 0,
+                metadata_json: "{}",
+                request_body: Some(br#"{"model":"model-a"}"#),
+            })
+            .await
+            .unwrap();
+
+        let running = store
+            .query_request_logs(&RequestLogFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].id, log_id);
+        assert_eq!(running[0].status, "running");
+        assert!(running[0].finished_at.is_none());
+        assert_eq!(
+            store
+                .total_stats("2000-01-01T00:00:00Z", "2099-12-31T23:59:59Z")
+                .await
+                .unwrap()
+                .request_count,
+            0
+        );
+
+        let retry_meta = serde_json::json!({
+            "error": {"code": "rate_limit", "message": "retry later"},
+            "retry": {"retry_count": 1}
+        })
+        .to_string();
+        assert!(store
+            .update_request_log_progress(
+                &log_id,
+                RequestLogProgress {
+                    provider_name: "provider-b",
+                    protocol: "responses",
+                    model: "model-b",
+                    status_code: 429,
+                    retry_count: 1,
+                    first_byte_latency_ms: 0,
+                    metadata_json: &retry_meta,
+                    request_body: None,
+                },
+            )
+            .await
+            .unwrap());
+
+        let retrying = store
+            .get_request_log_detail(&log_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retrying.status, "running");
+        assert_eq!(retrying.provider_name, "provider-b");
+        assert_eq!(retrying.retry_count, 1);
+        assert_eq!(retrying.error_code.as_deref(), Some("rate_limit"));
+
+        let final_meta = serde_json::json!({"retry": {"retry_count": 1}}).to_string();
+        let final_entry = NewRequestLog {
+            request_id: "req-running",
+            api_key_id: "key-running",
+            session_hash: None,
+            provider_name: "provider-b",
+            protocol: "responses",
+            model: "model-b",
+            operation: "responses",
+            status_code: 200,
+            success: true,
+            input_tokens: 12,
+            output_tokens: 8,
+            total_tokens: 20,
+            cached_tokens: 4,
+            cache_write_tokens: 1,
+            cost_cents: 3,
+            latency_ms: 250,
+            first_byte_latency_ms: 80,
+            metadata_json: &final_meta,
+            request_body: None,
+            response_body: Some(br#"{"ok":true}"#),
+        };
+        assert!(store
+            .complete_request_log(&log_id, final_entry.clone())
+            .await
+            .unwrap());
+        assert!(!store
+            .complete_request_log(&log_id, final_entry)
+            .await
+            .unwrap());
+
+        let completed = store
+            .get_request_log_detail(&log_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.status, "success");
+        assert_eq!(completed.cached_tokens, 4);
+        assert!(completed.finished_at.is_some());
+        assert_eq!(
+            store
+                .total_stats("2000-01-01T00:00:00Z", "2099-12-31T23:59:59Z")
+                .await
+                .unwrap()
+                .request_count,
+            1
+        );
+        let row_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_logs")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(row_count, 1);
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_marks_running_requests_interrupted() {
+        let store = Store::open_in_memory().await.unwrap();
+        let log_id = store
+            .begin_request_log(NewRunningRequestLog {
+                request_id: "req-interrupted",
+                api_key_id: "key",
+                session_hash: None,
+                provider_name: "provider",
+                protocol: "messages",
+                model: "model",
+                operation: "messages",
+                status_code: 0,
+                retry_count: 0,
+                first_byte_latency_ms: 0,
+                metadata_json: "{}",
+                request_body: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(store.interrupt_running_request_logs().await.unwrap(), 1);
+        let interrupted = store
+            .get_request_log_detail(&log_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(interrupted.status, "interrupted");
+        assert_eq!(interrupted.error_code.as_deref(), Some("gateway_restarted"));
+        assert!(interrupted.finished_at.is_some());
     }
 }

@@ -5,7 +5,7 @@ use uuid::Uuid;
 use crate::error::AppError;
 use crate::protocol::common::{Operation, Protocol};
 use crate::server::AppState;
-use crate::store::NewRequestLog;
+use crate::store::{NewRequestLog, NewRunningRequestLog, RequestLogProgress};
 
 pub fn model_from_body(body: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(body)
@@ -78,6 +78,37 @@ pub async fn record_llm_request(
     entry: NewRequestLog<'_>,
 ) -> crate::store::StoreResult<crate::store::DbRequestLog> {
     state.store.insert_request_log_entry(entry).await
+}
+
+pub async fn begin_llm_request(
+    state: &AppState,
+    entry: NewRunningRequestLog<'_>,
+) -> crate::store::StoreResult<String> {
+    state.store.begin_request_log(entry).await
+}
+
+pub async fn update_llm_request(
+    state: &AppState,
+    log_id: &str,
+    progress: RequestLogProgress<'_>,
+) -> crate::store::StoreResult<bool> {
+    state
+        .store
+        .update_request_log_progress(log_id, progress)
+        .await
+}
+
+pub async fn complete_llm_request(
+    state: &AppState,
+    log_id: Option<&str>,
+    entry: NewRequestLog<'_>,
+) -> crate::store::StoreResult<()> {
+    if let Some(log_id) = log_id {
+        state.store.complete_request_log(log_id, entry).await?;
+    } else {
+        state.store.insert_request_log_entry(entry).await?;
+    }
+    Ok(())
 }
 
 pub fn extract_provider_error(body: &serde_json::Value) -> (Option<String>, Option<String>) {

@@ -7,9 +7,10 @@ use topcoat::{
 use crate::store::models::RequestLogFilter;
 use crate::topcoat_admin::app::{app_state, require_admin};
 use crate::topcoat_admin::{
-    escape_html, escape_inline_js_string, format_shanghai_time_full, format_shanghai_time_short,
-    render_list, render_page, render_shared_scripts, render_shared_styles, render_sidebar,
-    render_theme_bootstrap, render_toast_container, trusted_html, ListLayout, PageLayout,
+    escape_html, escape_inline_js_string, format_duration_ms, format_shanghai_time_full,
+    format_shanghai_time_short, render_list, render_page, render_shared_scripts,
+    render_shared_styles, render_sidebar, render_theme_bootstrap, render_toast_container,
+    trusted_html, ListLayout, PageLayout,
 };
 
 const PAGE_SIZE: i64 = 20;
@@ -82,6 +83,7 @@ fn logs_actions() -> String {
         <option value="all">全部协议</option>
     </select>
     <select id="filter-refresh" class="filter-select w-24">
+        <option value="1000">1秒刷新</option>
         <option value="5000">5秒刷新</option>
         <option value="10000">10秒刷新</option>
         <option value="30000">30秒刷新</option>
@@ -190,6 +192,7 @@ pub async fn logs(cx: &Cx) -> Result {
         .pagination-btn:disabled {{ opacity: 0.5; cursor: not-allowed; }}
         .badge-success {{ background: color-mix(in oklch, #10b981 15%, transparent); color: #10b981; padding: 0.125rem 0.5rem; border-radius: 6px; font-size: 0.75rem; }}
         .badge-error {{ background: var(--destructive); color: white; padding: 0.125rem 0.5rem; border-radius: 6px; font-size: 0.75rem; }}
+        .badge-running {{ background: color-mix(in oklch, #d97706 15%, transparent); color: #b45309; padding: 0.125rem 0.5rem; border-radius: 6px; font-size: 0.75rem; }}
         .badge-outline {{ border: 1px solid var(--border); padding: 0.125rem 0.5rem; border-radius: 6px; font-size: 0.75rem; }}
         .badge-secondary {{ background: var(--muted); color: var(--foreground); padding: 0.125rem 0.5rem; border-radius: 6px; font-size: 0.75rem; }}
         .logs-page .page-header {{ align-items: flex-start; }}
@@ -238,7 +241,7 @@ pub async fn logs(cx: &Cx) -> Result {
         let currentPage = 1;
         let totalPages = 1;
         let totalCount = 0;
-        let refreshInterval = null;
+        let refreshTimer = null;
         let logsRequest = null;
         const shanghaiTimeFormatter = new Intl.DateTimeFormat('zh-CN', {{
             timeZone: 'Asia/Shanghai',
@@ -254,9 +257,10 @@ pub async fn logs(cx: &Cx) -> Result {
         }}
 
         function formatDuration(ms) {{
-            ms = parseInt(ms) || 0;
-            if (ms < 1000) return ms + 'ms';
-            return (ms / 1000).toFixed(2) + 's';
+            ms = Number(ms);
+            if (!Number.isFinite(ms) || ms < 0) ms = 0;
+            if (ms < 1000) return Math.min(999, Math.round(ms)) + 'ms';
+            return (ms / 1000).toFixed(2).replace(/\.?0+$/, '') + 's';
         }}
 
         function formatPercent(v) {{
@@ -298,6 +302,10 @@ pub async fn logs(cx: &Cx) -> Result {
 
         function loadPage(page) {{
             currentPage = page;
+            if (refreshTimer) {{
+                clearTimeout(refreshTimer);
+                refreshTimer = null;
+            }}
             if (logsRequest) logsRequest.abort();
             const request = new AbortController();
             logsRequest = request;
@@ -313,7 +321,7 @@ pub async fn logs(cx: &Cx) -> Result {
                 provider_name: provider === 'all' ? '' : provider,
                 protocol: protocol === 'all' ? '' : protocol,
             }});
-            fetch('/logs/table?' + params.toString(), {{ signal: request.signal }})
+            return fetch('/logs/table?' + params.toString(), {{ signal: request.signal }})
                 .then(r => {{
                     if (r.status === 401) return redirectToLogin();
                     return r.text();
@@ -335,7 +343,10 @@ pub async fn logs(cx: &Cx) -> Result {
                     if (error.name !== 'AbortError') console.error('Failed to load logs:', error);
                 }})
                 .finally(() => {{
-                    if (logsRequest === request) logsRequest = null;
+                    if (logsRequest === request) {{
+                        logsRequest = null;
+                        scheduleRefresh();
+                    }}
                 }});
         }}
 
@@ -388,7 +399,8 @@ pub async fn logs(cx: &Cx) -> Result {
 
         function renderDetail(d) {{
             const log = d.log || d;
-            const isErr = log.status_code >= 400;
+            const isRunning = log.status === 'running';
+            const isErr = !isRunning && log.status !== 'success';
             const firstByte = log.first_byte_latency_ms || 0;
             const inputTokens = log.input_tokens || 0;
             const outputTokens = log.output_tokens || 0;
@@ -407,7 +419,7 @@ pub async fn logs(cx: &Cx) -> Result {
                 <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
                     <div class="rounded-lg border bg-zinc-50 p-3">
                         <div class="text-[0.65rem] uppercase tracking-wider text-zinc-500 mb-1">状态码</div>
-                        <div class="font-mono text-sm ${{isErr ? 'text-red-600' : 'text-emerald-600'}}">${{log.status_code}}</div>
+                        <div class="font-mono text-sm ${{isRunning ? 'text-amber-700' : (isErr ? 'text-red-600' : 'text-emerald-600')}}">${{isRunning ? (log.retry_count > 0 ? '重试中' : '处理中') : log.status_code}}</div>
                     </div>
                     <div class="rounded-lg border bg-zinc-50 p-3">
                         <div class="text-[0.65rem] uppercase tracking-wider text-zinc-500 mb-1">耗时</div>
@@ -415,35 +427,35 @@ pub async fn logs(cx: &Cx) -> Result {
                     </div>
                     <div class="rounded-lg border bg-zinc-50 p-3">
                         <div class="text-[0.65rem] uppercase tracking-wider text-zinc-500 mb-1">TTFT</div>
-                        <div class="font-mono text-sm">${{formatDuration(firstByte)}}</div>
+                        <div class="font-mono text-sm">${{isRunning ? '—' : formatDuration(firstByte)}}</div>
                     </div>
                     <div class="rounded-lg border bg-zinc-50 p-3">
                         <div class="text-[0.65rem] uppercase tracking-wider text-zinc-500 mb-1">输入 / 输出</div>
-                        <div class="font-mono text-sm">${{formatTokens(inputTokens)}} / ${{formatTokens(outputTokens)}}</div>
+                        <div class="font-mono text-sm">${{isRunning ? '—' : formatTokens(inputTokens) + ' / ' + formatTokens(outputTokens)}}</div>
                     </div>
                     <div class="rounded-lg border bg-zinc-50 p-3">
                         <div class="text-[0.65rem] uppercase tracking-wider text-zinc-500 mb-1">缓存命中 / 写入</div>
-                        <div class="font-mono text-sm">${{formatTokens(cachedTokens)}} / ${{formatTokens(log.cache_write_tokens || 0)}}</div>
+                        <div class="font-mono text-sm">${{isRunning ? '—' : formatTokens(cachedTokens) + ' / ' + formatTokens(log.cache_write_tokens || 0)}}</div>
                     </div>
                     <div class="rounded-lg border bg-zinc-50 p-3">
                         <div class="text-[0.65rem] uppercase tracking-wider text-zinc-500 mb-1">总 Tokens</div>
-                        <div class="font-mono text-sm">${{formatTokens(log.total_tokens || 0)}}</div>
+                        <div class="font-mono text-sm">${{isRunning ? '—' : formatTokens(log.total_tokens || 0)}}</div>
                     </div>
                     <div class="rounded-lg border bg-zinc-50 p-3">
                         <div class="text-[0.65rem] uppercase tracking-wider text-zinc-500 mb-1">CHR</div>
-                        <div class="font-mono text-sm">${{formatPercent(hitRate)}}</div>
+                        <div class="font-mono text-sm">${{isRunning ? '—' : formatPercent(hitRate)}}</div>
                     </div>
                     <div class="rounded-lg border bg-zinc-50 p-3">
                         <div class="text-[0.65rem] uppercase tracking-wider text-zinc-500 mb-1">TPS</div>
-                        <div class="font-mono text-sm">${{formatTps(outputTokens, log.latency_ms, firstByte)}}</div>
+                        <div class="font-mono text-sm">${{isRunning ? '—' : formatTps(outputTokens, log.latency_ms, firstByte)}}</div>
                     </div>
                     <div class="rounded-lg border bg-zinc-50 p-3">
                         <div class="text-[0.65rem] uppercase tracking-wider text-zinc-500 mb-1">TPOT</div>
-                        <div class="font-mono text-sm">${{formatTpot(outputTokens, log.latency_ms, firstByte)}}</div>
+                        <div class="font-mono text-sm">${{isRunning ? '—' : formatTpot(outputTokens, log.latency_ms, firstByte)}}</div>
                     </div>
                     <div class="rounded-lg border bg-zinc-50 p-3">
                         <div class="text-[0.65rem] uppercase tracking-wider text-zinc-500 mb-1">价格</div>
-                        <div class="font-mono text-sm">${{formatCost(log.cost_cents)}}</div>
+                        <div class="font-mono text-sm">${{isRunning ? '—' : formatCost(log.cost_cents)}}</div>
                     </div>
                 </div>
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
@@ -518,19 +530,32 @@ pub async fn logs(cx: &Cx) -> Result {
             container.innerHTML = html;
         }}
 
+        function scheduleRefresh() {{
+            if (refreshTimer) clearTimeout(refreshTimer);
+            refreshTimer = null;
+            const refreshSelect = document.getElementById('filter-refresh');
+            const ms = parseInt(refreshSelect.value);
+            if (ms > 0 && !document.hidden) {{
+                refreshTimer = setTimeout(() => loadPage(currentPage), Math.max(1000, ms));
+            }}
+        }}
+
         // Initialize
         document.addEventListener('DOMContentLoaded', function() {{
             const query = new URLSearchParams(window.location.search);
             const refreshSelect = document.getElementById('filter-refresh');
-            refreshSelect.value = localStorage.getItem('rcpa_logs_refresh_ms') || '5000';
-            const resetInterval = () => {{
-                if (refreshInterval) clearInterval(refreshInterval);
-                const ms = parseInt(refreshSelect.value);
-                if (ms > 0) refreshInterval = setInterval(() => loadPage(currentPage), Math.max(1000, ms));
-            }};
+            refreshSelect.value = localStorage.getItem('rcpa_logs_refresh_ms') || '1000';
             refreshSelect.addEventListener('change', () => {{
                 localStorage.setItem('rcpa_logs_refresh_ms', refreshSelect.value);
-                resetInterval();
+                scheduleRefresh();
+            }});
+            document.addEventListener('visibilitychange', () => {{
+                if (document.hidden) {{
+                    if (refreshTimer) clearTimeout(refreshTimer);
+                    refreshTimer = null;
+                }} else {{
+                    loadPage(currentPage);
+                }}
             }});
             ['filter-key', 'filter-model', 'filter-provider', 'filter-protocol'].forEach((id) => {{
                 document.getElementById(id).addEventListener('change', () => loadPage(1));
@@ -542,7 +567,6 @@ pub async fn logs(cx: &Cx) -> Result {
                 document.getElementById('filter-protocol').value = query.get('protocol') || 'all';
                 loadPage(Math.max(1, parseInt(query.get('page')) || 1));
             }});
-            resetInterval();
         }});
     </script>
     {}
@@ -600,7 +624,8 @@ pub async fn logs_table(cx: &Cx) -> Result {
         );
     } else {
         for log in &log_entries {
-            let is_err = log.status_code >= 400;
+            let is_running = log.status == "running";
+            let is_err = !is_running && log.status != "success";
             let first_byte = log.first_byte_latency_ms;
             let input_tokens = log.input_tokens;
             let output_tokens = log.output_tokens;
@@ -622,10 +647,59 @@ pub async fn logs_table(cx: &Cx) -> Result {
                 0.0
             };
 
-            let status_class = if is_err {
-                "badge-error"
+            let (status_class, status_label) = if is_running {
+                (
+                    "badge-running",
+                    if log.retry_count > 0 {
+                        "重试中".to_string()
+                    } else {
+                        "处理中".to_string()
+                    },
+                )
+            } else if is_err {
+                ("badge-error", log.status_code.to_string())
             } else {
-                "badge-success"
+                ("badge-success", log.status_code.to_string())
+            };
+            let input_display = if is_running {
+                "—".to_string()
+            } else {
+                format_tokens(input_tokens)
+            };
+            let output_display = if is_running {
+                "—".to_string()
+            } else {
+                format_tokens(output_tokens)
+            };
+            let cached_display = if is_running {
+                "—".to_string()
+            } else {
+                format_tokens(cached_tokens)
+            };
+            let hit_rate_display = if is_running {
+                "—".to_string()
+            } else {
+                format!("{:.1}%", hit_rate * 100.0)
+            };
+            let tps_display = if is_running {
+                "—".to_string()
+            } else {
+                format!("{tps:.1}")
+            };
+            let ttft_display = if is_running {
+                "—".to_string()
+            } else {
+                format_duration_ms(first_byte as f64)
+            };
+            let tpot_display = if is_running {
+                "—".to_string()
+            } else {
+                format_duration_ms(tpot)
+            };
+            let cost_display = if is_running {
+                "—".to_string()
+            } else {
+                format!("¥{:.4}", log.cost_cents as f64 / 100.0)
             };
             let time_short = escape_html(&format_shanghai_time_short(&log.created_at));
             let time_full = escape_html(&format_shanghai_time_full(&log.created_at));
@@ -653,12 +727,12 @@ pub async fn logs_table(cx: &Cx) -> Result {
                     <td class="px-3 py-2.5 font-mono text-xs whitespace-nowrap">{}</td>
                     <td class="px-3 py-2.5 font-mono text-xs whitespace-nowrap">{}</td>
                     <td class="px-3 py-2.5 font-mono text-xs whitespace-nowrap">{}</td>
-                    <td class="px-3 py-2.5 font-mono text-xs whitespace-nowrap">{:.1}%</td>
-                    <td class="px-3 py-2.5 font-mono text-xs whitespace-nowrap">{:.1}</td>
-                    <td class="px-3 py-2.5 font-mono text-xs whitespace-nowrap">{}ms</td>
-                    <td class="px-3 py-2.5 font-mono text-xs whitespace-nowrap">{:.0}ms</td>
-                    <td class="px-3 py-2.5 font-mono text-xs whitespace-nowrap">{}ms</td>
-                    <td class="px-3 py-2.5 font-mono text-xs whitespace-nowrap">¥{:.4}</td>
+                    <td class="px-3 py-2.5 font-mono text-xs whitespace-nowrap">{}</td>
+                    <td class="px-3 py-2.5 font-mono text-xs whitespace-nowrap">{}</td>
+                    <td class="px-3 py-2.5 font-mono text-xs whitespace-nowrap">{}</td>
+                    <td class="px-3 py-2.5 font-mono text-xs whitespace-nowrap">{}</td>
+                    <td class="px-3 py-2.5 font-mono text-xs whitespace-nowrap">{}</td>
+                    <td class="px-3 py-2.5 font-mono text-xs whitespace-nowrap">{}</td>
                     <td class="px-3 py-2.5 font-mono text-xs whitespace-nowrap">{}</td>
                     <td class="px-3 py-2.5"><span class="{} font-mono px-2 py-0.5 text-xs">{}</span></td>
                     <td class="px-3 py-2.5"><button class="inline-flex h-7 w-7 items-center justify-center rounded border border-zinc-200 hover:bg-zinc-50" onclick="openDetail({})"><svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg></button></td>
@@ -673,18 +747,18 @@ pub async fn logs_table(cx: &Cx) -> Result {
                 operation,
                 model,
                 model,
-                format_tokens(input_tokens),
-                format_tokens(output_tokens),
-                format_tokens(cached_tokens),
-                hit_rate * 100.0,
-                tps,
-                first_byte,
-                tpot,
-                log.latency_ms,
-                log.cost_cents as f64 / 100.0,
+                input_display,
+                output_display,
+                cached_display,
+                hit_rate_display,
+                tps_display,
+                ttft_display,
+                tpot_display,
+                format_duration_ms(log.latency_ms as f64),
+                cost_display,
                 log.retry_count,
                 status_class,
-                log.status_code,
+                status_label,
                 log_id_js
             ));
         }

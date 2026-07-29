@@ -6,7 +6,7 @@ use rcpa::{
         ProviderProtocol, RetryConfig, RoutingConfig, StickyConfig, UpstreamConfig,
     },
     server::AppState,
-    store::NewRequestLog,
+    store::{NewRequestLog, NewRunningRequestLog},
     topcoat_admin::build_topcoat_app,
 };
 
@@ -94,11 +94,29 @@ async fn admin_pages_require_cookie_and_render_the_shared_rust_shell() {
             cached_tokens: 2,
             cache_write_tokens: 0,
             cost_cents: 1,
-            latency_ms: 80,
-            first_byte_latency_ms: 40,
+            latency_ms: 2_500,
+            first_byte_latency_ms: 1_200,
             metadata_json: "{}",
             request_body: None,
             response_body: None,
+        })
+        .await
+        .unwrap();
+    state
+        .store
+        .begin_request_log(NewRunningRequestLog {
+            request_id: "fixture-running-request",
+            api_key_id: "fixture-key",
+            session_hash: None,
+            provider_name: "fixture-provider",
+            protocol: "responses",
+            model: "upstream-model",
+            operation: "responses",
+            status_code: 0,
+            retry_count: 0,
+            first_byte_latency_ms: 0,
+            metadata_json: "{}",
+            request_body: None,
         })
         .await
         .unwrap();
@@ -257,6 +275,18 @@ async fn admin_pages_require_cookie_and_render_the_shared_rust_shell() {
         .unwrap();
     assert_eq!(oversized_response.status().as_u16(), 404);
 
+    let logs_page = client
+        .get(format!("{base}/logs"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert!(logs_page.status().is_success());
+    let logs_page_html = logs_page.text().await.unwrap();
+    assert!(logs_page_html.contains("<option value=\"1000\">1秒刷新</option>"));
+    assert!(logs_page_html.contains("localStorage.getItem('rcpa_logs_refresh_ms') || '1000'"));
+    assert!(logs_page_html.contains("document.addEventListener('visibilitychange'"));
+
     let logs_table = client
         .get(format!("{base}/logs/table"))
         .header("cookie", &cookie)
@@ -267,6 +297,13 @@ async fn admin_pages_require_cookie_and_render_the_shared_rust_shell() {
     let logs_table_html = logs_table.text().await.unwrap();
     assert!(logs_table_html.contains("Fixture Key"));
     assert!(!logs_table_html.contains("fixture-key"));
+    assert!(logs_table_html.contains(">1.2s</td>"));
+    assert!(logs_table_html.contains(">325ms</td>"));
+    assert!(logs_table_html.contains(">2.5s</td>"));
+    assert!(!logs_table_html.contains(">1200ms</td>"));
+    assert!(!logs_table_html.contains(">2500ms</td>"));
+    assert!(logs_table_html.contains(">处理中</span>"));
+    assert!(logs_table_html.contains(">—</td>"));
 
     let dashboard_analytics = client
         .get(format!("{base}/dashboard/analytics"))
@@ -322,6 +359,7 @@ async fn admin_pages_require_cookie_and_render_the_shared_rust_shell() {
         }
         if path == "/dashboard" {
             assert!(html.contains("animation: false"));
+            assert!(html.contains(".toFixed(2).replace(/\\.?0+$/, '') + 's'"));
             assert!(html.contains("tokenChart.update('none')"));
             assert!(html.contains("requestChart.update('none')"));
             assert!(html.contains("if (analyticsLoading) return Promise.resolve()"));
@@ -331,6 +369,13 @@ async fn admin_pages_require_cookie_and_render_the_shared_rust_shell() {
             assert!(!html.contains("date.getFullYear()"));
             assert!(!html.contains("tokenChart.destroy()"));
             assert!(!html.contains("requestChart.destroy()"));
+            assert_eq!(html.matches("class=\"dashboard-table-card ").count(), 2);
+            assert_eq!(html.matches("class=\"dashboard-table-scroll\"").count(), 2);
+            assert!(html.contains(
+                ".dashboard-table-scroll { min-height: 0; flex: 1 1 auto; overflow: auto;"
+            ));
+            assert!(html.contains(".dashboard-table-scroll thead th { position: sticky; top: 0;"));
+            assert_eq!(html.matches("aria-sort=\"descending\"").count(), 2);
         }
         if path == "/providers" {
             assert!(html.contains("id=\"providers-list\""));
@@ -343,6 +388,7 @@ async fn admin_pages_require_cookie_and_render_the_shared_rust_shell() {
             assert!(html.contains("id=\"logs-list\""));
             assert!(html.contains("class=\"dialog-shell log-dialog\""));
             assert!(html.contains(".logs-page { min-width: 0; overflow: hidden; }"));
+            assert!(html.contains(".toFixed(2).replace(/\\.?0+$/, '') + 's'"));
             assert!(html.contains("timeZone: 'Asia/Shanghai'"));
             assert!(html.contains("let logsRequest = null"));
         }

@@ -25,7 +25,7 @@ use crate::protocol::translation;
 use crate::retry::policy::RetryPolicy;
 use crate::server::AppState;
 use crate::stats::cost::CostCalculator;
-use crate::store::NewRequestLog;
+use crate::store::{NewRequestLog, NewRunningRequestLog, RequestLogProgress};
 
 /// POST /v1/chat/completions
 pub async fn chat_completions(
@@ -1238,6 +1238,7 @@ struct RequestOutcome<'a> {
 
 struct PersistErrorRequestLogInput<'a> {
     state: &'a AppState,
+    request_log_id: Option<&'a str>,
     ctx: &'a ProxyContext,
     api_key_id: &'a str,
     provider_name: &'a str,
@@ -1258,6 +1259,7 @@ struct PersistErrorRequestLogInput<'a> {
 
 struct AttemptContext<'a> {
     state: &'a Arc<AppState>,
+    request_log_id: Option<&'a str>,
     ctx: &'a ProxyContext,
     retry_policy: &'a RetryPolicy,
     api_key_id: &'a str,
@@ -1268,6 +1270,7 @@ struct AttemptContext<'a> {
 
 struct ProxyFailureInput<'a> {
     state: &'a AppState,
+    request_log_id: Option<&'a str>,
     ctx: &'a ProxyContext,
     api_key_id: &'a str,
     start: Instant,
@@ -1285,6 +1288,7 @@ struct ProxyFailureInput<'a> {
 
 struct StreamAuditInit<'a> {
     state: Arc<AppState>,
+    request_log_id: Option<&'a str>,
     ctx: &'a ProxyContext,
     provider_name: &'a str,
     protocol: &'a str,
@@ -1456,6 +1460,103 @@ fn prepare_attempt(
     })
 }
 
+struct RunningRequestLogInput<'a> {
+    state: &'a AppState,
+    request_log_id: Option<&'a str>,
+    ctx: &'a ProxyContext,
+    api_key_id: &'a str,
+    prepared: &'a PreparedAttempt,
+    attempts: &'a [RetryAttemptLog],
+    retry_count: u32,
+    total_backoff_ms: u64,
+    first_byte_latency_ms: i64,
+}
+
+async fn persist_running_request_log(input: RunningRequestLogInput<'_>) -> Option<String> {
+    let last_attempt = input.attempts.last();
+    let status_code = last_attempt.map(|attempt| attempt.status_code).unwrap_or(0);
+    let request_id = input.ctx.request_id.to_string();
+    let operation = input.ctx.operation.to_string();
+    let metadata = log_metadata_json(LogMetadataInput {
+        ctx: input.ctx,
+        provider_name: &input.prepared.provider_name,
+        protocol: &input.prepared.protocol,
+        provider_model: &input.prepared.actual_model,
+        upstream_base_url: Some(&input.prepared.upstream_base_url),
+        upstream_operation: Some(&input.prepared.operation),
+        status_code,
+        error_code: last_attempt.and_then(|attempt| attempt.error_code.as_deref()),
+        error_message: last_attempt.and_then(|attempt| attempt.error_message.as_deref()),
+        attempt_count: input.attempts.len() as u32,
+        retry_count: input.retry_count,
+        total_backoff_ms: input.total_backoff_ms,
+        sticky_hit: Some(input.prepared.sticky_hit),
+        selected_provider_reason: Some(input.prepared.selected_via),
+        attempts: input.attempts,
+        upstream_path: None,
+    });
+
+    if let Some(log_id) = input.request_log_id {
+        if let Err(error) = audit::update_llm_request(
+            input.state,
+            log_id,
+            RequestLogProgress {
+                provider_name: &input.prepared.provider_name,
+                protocol: &input.prepared.protocol,
+                model: &input.prepared.actual_model,
+                status_code,
+                retry_count: input.retry_count as i64,
+                first_byte_latency_ms: input.first_byte_latency_ms,
+                metadata_json: &metadata,
+                request_body: input.prepared.request_body_bytes.as_deref(),
+            },
+        )
+        .await
+        {
+            tracing::warn!(
+                request_id = %input.ctx.request_id,
+                error = %error,
+                "Failed to update running request audit"
+            );
+        }
+        return Some(log_id.to_string());
+    }
+
+    match audit::begin_llm_request(
+        input.state,
+        NewRunningRequestLog {
+            request_id: &request_id,
+            api_key_id: input.api_key_id,
+            session_hash: input
+                .ctx
+                .session_affinity
+                .as_ref()
+                .map(|affinity| affinity.hash.as_str()),
+            provider_name: &input.prepared.provider_name,
+            protocol: &input.prepared.protocol,
+            model: &input.prepared.actual_model,
+            operation: &operation,
+            status_code,
+            retry_count: input.retry_count as i64,
+            first_byte_latency_ms: input.first_byte_latency_ms,
+            metadata_json: &metadata,
+            request_body: input.prepared.request_body_bytes.as_deref(),
+        },
+    )
+    .await
+    {
+        Ok(log_id) => Some(log_id),
+        Err(error) => {
+            tracing::warn!(
+                request_id = %input.ctx.request_id,
+                error = %error,
+                "Failed to persist running request audit"
+            );
+            None
+        }
+    }
+}
+
 async fn persist_error_request_log(input: PersistErrorRequestLogInput<'_>) {
     let error_code = input.error.error_code();
     let error_message = input.error.to_string();
@@ -1481,8 +1582,9 @@ async fn persist_error_request_log(input: PersistErrorRequestLogInput<'_>) {
     });
 
     // Best-effort audit logging: request handling should not fail if persistence is unavailable.
-    if let Err(err) = audit::record_llm_request(
+    if let Err(err) = audit::complete_llm_request(
         input.state,
+        input.request_log_id,
         error_log_entry(ErrorLogInput {
             request_id: &request_id,
             api_key_id: input.api_key_id,
@@ -1543,8 +1645,21 @@ async fn execute_stream_attempt(
                 sticky_hit: prepared.sticky_hit,
                 provider_healthy_before_attempt: prepared.provider_healthy_before_attempt,
             }));
+            let request_log_id = persist_running_request_log(RunningRequestLogInput {
+                state: input.state,
+                request_log_id: input.request_log_id,
+                ctx: input.ctx,
+                api_key_id: input.api_key_id,
+                prepared: &prepared,
+                attempts: &attempts,
+                retry_count: attempt,
+                total_backoff_ms: input.total_backoff_ms,
+                first_byte_latency_ms,
+            })
+            .await;
             let audit = StreamAudit::new(StreamAuditInit {
                 state: input.state.clone(),
+                request_log_id: request_log_id.as_deref(),
                 ctx: input.ctx,
                 provider_name: &prepared.provider_name,
                 protocol: &prepared.protocol,
@@ -1622,6 +1737,7 @@ async fn execute_stream_attempt(
             let latency_ms = input.start.elapsed().as_millis() as i64;
             persist_error_request_log(PersistErrorRequestLogInput {
                 state: input.state,
+                request_log_id: input.request_log_id,
                 ctx: input.ctx,
                 api_key_id: input.api_key_id,
                 provider_name: &prepared.provider_name,
@@ -1689,6 +1805,7 @@ async fn execute_non_stream_attempt(
                         }));
                         persist_error_request_log(PersistErrorRequestLogInput {
                             state: input.state,
+                            request_log_id: input.request_log_id,
                             ctx: input.ctx,
                             api_key_id: input.api_key_id,
                             provider_name: &prepared.provider_name,
@@ -1803,8 +1920,9 @@ async fn execute_non_stream_attempt(
                 upstream_path: None,
             });
             // Best-effort audit logging: a completed response should still be returned if persistence fails.
-            if let Err(err) = audit::record_llm_request(
+            if let Err(err) = audit::complete_llm_request(
                 input.state,
+                input.request_log_id,
                 NewRequestLog {
                     request_id: &input.ctx.request_id.to_string(),
                     api_key_id: input.api_key_id,
@@ -1910,6 +2028,7 @@ async fn execute_non_stream_attempt(
             let latency_ms = input.start.elapsed().as_millis() as i64;
             persist_error_request_log(PersistErrorRequestLogInput {
                 state: input.state,
+                request_log_id: input.request_log_id,
                 ctx: input.ctx,
                 api_key_id: input.api_key_id,
                 provider_name: &prepared.provider_name,
@@ -1956,6 +2075,7 @@ async fn finalize_proxy_failure(input: ProxyFailureInput<'_>) -> AppError {
     let latency_ms = input.start.elapsed().as_millis() as i64;
     persist_error_request_log(PersistErrorRequestLogInput {
         state: input.state,
+        request_log_id: input.request_log_id,
         ctx: input.ctx,
         api_key_id: input.api_key_id,
         provider_name,
@@ -1980,6 +2100,7 @@ async fn finalize_proxy_failure(input: ProxyFailureInput<'_>) -> AppError {
 
 struct StreamAudit {
     state: Arc<AppState>,
+    request_log_id: Option<String>,
     config_snapshot: std::sync::Arc<crate::config_service::ConfigSnapshot>,
     request_id: String,
     request_headers: BTreeMap<String, String>,
@@ -2021,6 +2142,7 @@ impl StreamAudit {
     fn new(input: StreamAuditInit<'_>) -> Self {
         Self {
             state: input.state,
+            request_log_id: input.request_log_id.map(ToString::to_string),
             config_snapshot: input.ctx.config_snapshot.clone(),
             request_id: input.ctx.request_id.to_string(),
             request_headers: input.ctx.request_headers.clone(),
@@ -2205,6 +2327,7 @@ impl StreamAudit {
         cache_write_tokens: i64,
     ) {
         let state = self.state.clone();
+        let request_log_id = self.request_log_id.clone();
         let request_id = self.request_id.clone();
         let request_headers = self.request_headers.clone();
         let request_protocol = self.request_protocol.clone();
@@ -2264,8 +2387,9 @@ impl StreamAudit {
 
         tokio::spawn(async move {
             // Best-effort audit logging: streaming completion should not block socket teardown.
-            if let Err(err) = audit::record_llm_request(
+            if let Err(err) = audit::complete_llm_request(
                 &state,
+                request_log_id.as_deref(),
                 NewRequestLog {
                     request_id: &request_id,
                     api_key_id: &api_key_id,
@@ -2453,6 +2577,7 @@ pub async fn proxy_to_provider(
     let mut retry_attempts = Vec::new();
     let mut request_attempt = 0u32;
     let mut pending_backoff: Option<std::time::Duration> = None;
+    let mut request_log_id: Option<String> = None;
 
     loop {
         let prepared = match prepare_attempt(&state, &req, &ctx, &mut exhausted_providers) {
@@ -2460,6 +2585,7 @@ pub async fn proxy_to_provider(
             Err(err) => {
                 return Err(finalize_proxy_failure(ProxyFailureInput {
                     state: &state,
+                    request_log_id: request_log_id.as_deref(),
                     ctx: &ctx,
                     api_key_id,
                     start,
@@ -2483,6 +2609,19 @@ pub async fn proxy_to_provider(
         last_protocol = Some(prepared.protocol.clone());
         last_upstream_base_url = Some(prepared.upstream_base_url.clone());
         last_upstream_operation = Some(prepared.operation.clone());
+
+        request_log_id = persist_running_request_log(RunningRequestLogInput {
+            state: &state,
+            request_log_id: request_log_id.as_deref(),
+            ctx: &ctx,
+            api_key_id,
+            prepared: &prepared,
+            attempts: &retry_attempts,
+            retry_count: request_attempt,
+            total_backoff_ms,
+            first_byte_latency_ms: 0,
+        })
+        .await;
 
         for provider_attempt in 0..max_attempts {
             if let Some(backoff) = pending_backoff.take() {
@@ -2510,6 +2649,7 @@ pub async fn proxy_to_provider(
                 execute_stream_attempt(
                     AttemptContext {
                         state: &state,
+                        request_log_id: request_log_id.as_deref(),
                         ctx: &ctx,
                         retry_policy: &retry_policy,
                         api_key_id,
@@ -2527,6 +2667,7 @@ pub async fn proxy_to_provider(
                 execute_non_stream_attempt(
                     AttemptContext {
                         state: &state,
+                        request_log_id: request_log_id.as_deref(),
                         ctx: &ctx,
                         retry_policy: &retry_policy,
                         api_key_id,
@@ -2545,6 +2686,18 @@ pub async fn proxy_to_provider(
             match execution {
                 AttemptExecution::Response(response) => return Ok(response),
                 AttemptExecution::Retry(err) => {
+                    persist_running_request_log(RunningRequestLogInput {
+                        state: &state,
+                        request_log_id: request_log_id.as_deref(),
+                        ctx: &ctx,
+                        api_key_id,
+                        prepared: &prepared,
+                        attempts: &retry_attempts,
+                        retry_count: request_attempt,
+                        total_backoff_ms,
+                        first_byte_latency_ms: 0,
+                    })
+                    .await;
                     last_error = Some(err);
                     pending_backoff = Some(retry_policy.backoff_for(provider_attempt));
                     if provider_attempt + 1 >= max_attempts {
@@ -2553,6 +2706,18 @@ pub async fn proxy_to_provider(
                     }
                 }
                 AttemptExecution::RetryNextProvider(err) => {
+                    persist_running_request_log(RunningRequestLogInput {
+                        state: &state,
+                        request_log_id: request_log_id.as_deref(),
+                        ctx: &ctx,
+                        api_key_id,
+                        prepared: &prepared,
+                        attempts: &retry_attempts,
+                        retry_count: request_attempt,
+                        total_backoff_ms,
+                        first_byte_latency_ms: 0,
+                    })
+                    .await;
                     last_error = Some(err);
                     exhausted_providers.insert(provider_name.clone());
                     break;

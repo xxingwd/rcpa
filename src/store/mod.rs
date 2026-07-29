@@ -8,7 +8,7 @@ mod request_log_repo;
 pub use analytics::{AnalyticsTimeBucket, DashboardAnalytics, DashboardStats};
 pub use models::*;
 pub use request_log_gc::{spawn_request_log_body_gc, RequestLogBodyGcResult};
-pub use request_log_repo::NewRequestLog;
+pub use request_log_repo::{NewRequestLog, NewRunningRequestLog, RequestLogProgress};
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 use std::path::Path;
@@ -71,7 +71,15 @@ impl Store {
 
         sqlx::migrate!("./migrations").run(&pool).await?;
 
-        Ok(Self { pool })
+        let store = Self { pool };
+        let interrupted = store.interrupt_running_request_logs().await?;
+        if interrupted > 0 {
+            tracing::warn!(
+                request_count = interrupted,
+                "Marked unfinished request logs as interrupted after gateway restart"
+            );
+        }
+        Ok(store)
     }
 
     /// Create an in-memory database — useful for unit and integration tests.
@@ -82,7 +90,9 @@ impl Store {
             .connect_with(options)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
-        Ok(Self { pool })
+        let store = Self { pool };
+        store.interrupt_running_request_logs().await?;
+        Ok(store)
     }
 }
 
@@ -297,13 +307,21 @@ mod tests {
 
         let migrated_metrics: (String, i64, i64, i64) = sqlx::query_as(
             "SELECT model, cached_tokens, cache_write_tokens, input_tokens
-             FROM request_log_metrics
+             FROM request_logs
              WHERE id = 'log-a'",
         )
         .fetch_one(&store.pool)
         .await
         .unwrap();
         assert_eq!(migrated_metrics, ("provider-gpt-4o".to_string(), 1, 0, 3));
+        let metrics_table_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'request_log_metrics'",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(metrics_table_count, 0);
 
         let migrated_versions: Vec<i64> =
             sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
@@ -319,6 +337,7 @@ mod tests {
                 20260723000000,
                 20260723010000,
                 20260723020000,
+                20260729000000,
             ]
         );
 

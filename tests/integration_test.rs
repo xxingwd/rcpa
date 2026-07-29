@@ -95,6 +95,55 @@ async fn spawn_openai_mock_provider(
     format!("http://{}/v1/chat/completions", addr)
 }
 
+async fn spawn_blocking_openai_mock_provider(
+) -> (String, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+    use axum::{routing::post, Json, Router};
+    use tokio::net::TcpListener;
+
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post({
+            let started = started.clone();
+            let release = release.clone();
+            move |Json(body): Json<serde_json::Value>| {
+                let started = started.clone();
+                let release = release.clone();
+                async move {
+                    started.notify_one();
+                    release.notified().await;
+                    (
+                        axum::http::StatusCode::OK,
+                        Json(serde_json::json!({
+                            "id": "chatcmpl-blocking-test",
+                            "object": "chat.completion",
+                            "model": body["model"],
+                            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                            "usage": {
+                                "prompt_tokens": 2,
+                                "completion_tokens": 3,
+                                "total_tokens": 5
+                            }
+                        })),
+                    )
+                }
+            }
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (
+        format!("http://{}/v1/chat/completions", addr),
+        started,
+        release,
+    )
+}
+
 async fn spawn_anthropic_mock_provider(
     status: axum::http::StatusCode,
     response: serde_json::Value,
@@ -143,15 +192,16 @@ async fn spawn_anthropic_mock_provider(
     format!("http://{}/v1/messages", addr)
 }
 
-async fn spawn_retrying_openai_mock_provider() -> String {
+async fn spawn_retrying_openai_mock_provider() -> (String, Arc<AtomicUsize>) {
     use axum::{routing::post, Json, Router};
     use tokio::net::TcpListener;
 
     let attempts = Arc::new(AtomicUsize::new(0));
+    let handler_attempts = attempts.clone();
     let app = Router::new().route(
         "/v1/chat/completions",
         post(move |Json(body): Json<serde_json::Value>| {
-            let attempts = attempts.clone();
+            let attempts = handler_attempts.clone();
             async move {
                 let attempt = attempts.fetch_add(1, Ordering::SeqCst);
                 let model = body
@@ -194,7 +244,7 @@ async fn spawn_retrying_openai_mock_provider() -> String {
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    format!("http://{}/v1/chat/completions", addr)
+    (format!("http://{}/v1/chat/completions", addr), attempts)
 }
 
 async fn spawn_always_rate_limited_openai_mock_provider() -> String {
@@ -2128,12 +2178,147 @@ async fn test_routed_provider_failure_logs_actual_provider_model() {
 }
 
 #[tokio::test]
+async fn test_routed_request_log_is_visible_before_upstream_completion() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let (mock_base_url, upstream_started, release_upstream) =
+        spawn_blocking_openai_mock_provider().await;
+    let mut config = test_config();
+    config.providers = vec![provider(
+        "blocking-provider",
+        "completions",
+        &mock_base_url,
+        vec![enabled_model("gpt-4o")],
+    )];
+    config.keys.push(auth_key(
+        "running-key",
+        "running-secret-key",
+        vec![enabled_model("gpt-4o")],
+    ));
+
+    let state = state_from_config(config).await;
+    let app = rcpa::server::router::build(state.clone());
+    let request_task = tokio::spawn(async move {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("x-api-key", "running-secret-key")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}"#,
+            ))
+            .unwrap();
+        app.oneshot(req).await.unwrap()
+    });
+
+    upstream_started.notified().await;
+    let running_logs = state
+        .store
+        .query_request_logs(&Default::default())
+        .await
+        .unwrap();
+    assert_eq!(running_logs.len(), 1);
+    assert_eq!(running_logs[0].status, "running");
+    assert!(running_logs[0].finished_at.is_none());
+    let log_id = running_logs[0].id.clone();
+    assert_eq!(
+        state
+            .store
+            .total_stats("2000-01-01T00:00:00Z", "2099-12-31T23:59:59Z")
+            .await
+            .unwrap()
+            .request_count,
+        0
+    );
+
+    release_upstream.notify_one();
+    let response = request_task.await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let completed_logs = wait_for_request_logs(&state, 1).await;
+    assert_eq!(completed_logs.len(), 1);
+    assert_eq!(completed_logs[0].id, log_id);
+    assert_eq!(completed_logs[0].status, "success");
+    assert_eq!(completed_logs[0].total_tokens, 5);
+}
+
+#[tokio::test]
+async fn test_retry_updates_the_running_request_log_before_next_attempt() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let (mock_base_url, upstream_attempts) = spawn_retrying_openai_mock_provider().await;
+    let mut config = test_config();
+    config.providers = vec![provider(
+        "retry-progress-provider",
+        "completions",
+        &mock_base_url,
+        vec![enabled_model("gpt-4o")],
+    )];
+    config.retry.initial_backoff_ms = 500;
+    config.retry.max_backoff_ms = 500;
+    config.keys.push(auth_key(
+        "retry-progress-key",
+        "retry-progress-secret",
+        vec![enabled_model("gpt-4o")],
+    ));
+
+    let state = state_from_config(config).await;
+    let app = rcpa::server::router::build(state.clone());
+    let request_task = tokio::spawn(async move {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("x-api-key", "retry-progress-secret")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}"#,
+            ))
+            .unwrap();
+        app.oneshot(req).await.unwrap()
+    });
+
+    let retrying = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if upstream_attempts.load(Ordering::SeqCst) == 1 {
+                let logs = state
+                    .store
+                    .query_request_logs(&Default::default())
+                    .await
+                    .unwrap();
+                if logs
+                    .first()
+                    .is_some_and(|log| log.status == "running" && log.retry_count == 1)
+                {
+                    break logs[0].clone();
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(retrying.status_code, 429);
+    assert_eq!(retrying.error_code.as_deref(), Some("rate_limit_exceeded"));
+
+    let response = request_task.await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let completed = wait_for_request_logs(&state, 1).await;
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].id, retrying.id);
+    assert_eq!(completed[0].status, "success");
+    assert_eq!(completed[0].retry_count, 1);
+}
+
+#[tokio::test]
 async fn test_retryable_provider_status_retries_and_logs_final_attempt_metadata() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    let mock_base_url = spawn_retrying_openai_mock_provider().await;
+    let (mock_base_url, _) = spawn_retrying_openai_mock_provider().await;
 
     let mut config = test_config();
     config.providers = vec![provider(

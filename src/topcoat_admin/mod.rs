@@ -49,6 +49,26 @@ pub(crate) fn escape_inline_js_string(value: &str) -> String {
     escape_html(&serde_json::to_string(value).expect("serializing a string cannot fail"))
 }
 
+pub(crate) fn format_duration_ms(milliseconds: f64) -> String {
+    let milliseconds = if milliseconds.is_finite() {
+        milliseconds.max(0.0)
+    } else {
+        0.0
+    };
+    if milliseconds < 1_000.0 {
+        return format!("{:.0}ms", milliseconds.round().min(999.0));
+    }
+
+    let mut seconds = format!("{:.2}", milliseconds / 1_000.0);
+    while seconds.ends_with('0') {
+        seconds.pop();
+    }
+    if seconds.ends_with('.') {
+        seconds.pop();
+    }
+    format!("{seconds}s")
+}
+
 const SHANGHAI_UTC_OFFSET_SECONDS: i32 = 8 * 60 * 60;
 
 fn shanghai_time(value: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
@@ -73,7 +93,7 @@ pub(crate) fn format_shanghai_time_full(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        escape_html, escape_inline_js_string, format_shanghai_time_full,
+        escape_html, escape_inline_js_string, format_duration_ms, format_shanghai_time_full,
         format_shanghai_time_short, render_shared_styles,
     };
 
@@ -115,5 +135,15 @@ mod tests {
             "2026-07-29 00:30:45 UTC+8"
         );
         assert_eq!(format_shanghai_time_short("invalid"), "invalid");
+    }
+
+    #[test]
+    fn formats_admin_durations_with_compact_units() {
+        assert_eq!(format_duration_ms(0.0), "0ms");
+        assert_eq!(format_duration_ms(999.9), "999ms");
+        assert_eq!(format_duration_ms(1_000.0), "1s");
+        assert_eq!(format_duration_ms(1_250.0), "1.25s");
+        assert_eq!(format_duration_ms(12_500.0), "12.5s");
+        assert_eq!(format_duration_ms(f64::NAN), "0ms");
     }
 }

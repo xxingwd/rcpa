@@ -61,7 +61,10 @@ impl Store {
             .await?;
         let failed_logs_cleared = self
             .clear_expired_request_log_bodies("failed", &failed_cutoff, batch_size)
-            .await?;
+            .await?
+            + self
+                .clear_expired_request_log_bodies("interrupted", &failed_cutoff, batch_size)
+                .await?;
 
         Ok(RequestLogBodyGcResult {
             success_logs_cleared,
@@ -266,12 +269,6 @@ mod tests {
             .execute(&store.pool)
             .await
             .unwrap();
-        sqlx::query("UPDATE request_log_metrics SET created_at = ? WHERE id = ?")
-            .bind(created_at)
-            .bind(id)
-            .execute(&store.pool)
-            .await
-            .unwrap();
     }
 
     #[tokio::test]
@@ -310,11 +307,11 @@ mod tests {
             assert_eq!(detail.response_body.is_none(), should_be_cleared);
         }
 
-        let metrics_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_log_metrics")
+        let log_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_logs")
             .fetch_one(&store.pool)
             .await
             .unwrap();
-        assert_eq!(metrics_count, 4);
+        assert_eq!(log_count, 4);
 
         let second_result = store.gc_request_log_bodies(now, 1).await.unwrap();
         assert_eq!(second_result, RequestLogBodyGcResult::default());

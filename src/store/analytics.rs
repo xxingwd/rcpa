@@ -119,8 +119,9 @@ impl Store {
                 COALESCE(AVG(NULLIF(first_byte_latency_ms, 0)), 0.0) as avg_first_byte_latency_ms,
                 COALESCE(MAX(first_byte_latency_ms), 0) as max_first_byte_latency_ms,
                 COALESCE(SUM(CASE WHEN status <> 'success' THEN 1 ELSE 0 END), 0) as error_count
-             FROM request_log_metrics
-             WHERE created_at >= ?1 AND created_at <= ?2",
+             FROM request_logs
+             WHERE created_at >= ?1 AND created_at <= ?2
+               AND status <> 'running'",
         )
         .bind(from)
         .bind(to)
@@ -162,7 +163,7 @@ impl Store {
         })
     }
 
-    /// Build every dashboard aggregation from one narrow metrics-table scan.
+    /// Build every dashboard aggregation from completed request logs.
     pub async fn dashboard_analytics(
         &self,
         from: &str,
@@ -173,8 +174,9 @@ impl Store {
             "SELECT created_at, api_key_id, provider_name, protocol, model, status,
                     status_code, input_tokens, output_tokens, cached_tokens,
                     cache_write_tokens, cost_cents, latency_ms, first_byte_latency_ms
-             FROM request_log_metrics
-             WHERE created_at >= ?1 AND created_at <= ?2",
+             FROM request_logs
+             WHERE created_at >= ?1 AND created_at <= ?2
+               AND status <> 'running'",
         )
         .bind(from)
         .bind(to)
@@ -251,10 +253,11 @@ impl Store {
                 COALESCE(SUM(cost_cents), 0) as total_cost_cents,
                 COALESCE(AVG(latency_ms), 0.0) as avg_latency_ms,
                 COALESCE(AVG(NULLIF(first_byte_latency_ms, 0)), 0.0) as avg_first_byte_latency_ms
-             FROM request_log_metrics
+             FROM request_logs
              WHERE created_at >= ?1 AND created_at <= ?2
+               AND status <> 'running'
              GROUP BY {col}
-             ORDER BY total_cost_cents DESC",
+             ORDER BY total_tokens DESC, group_key ASC",
             col = column,
             success_condition = SUCCESS_CONDITION,
         );
@@ -287,8 +290,9 @@ impl Store {
                 COALESCE(SUM(cost_cents), 0) as total_cost_cents,
                 COALESCE(AVG(latency_ms), 0.0) as avg_latency_ms,
                 COALESCE(AVG(NULLIF(first_byte_latency_ms, 0)), 0.0) as avg_first_byte_latency_ms
-             FROM request_log_metrics
+             FROM request_logs
              WHERE created_at >= ?1 AND created_at <= ?2
+               AND status <> 'running'
              GROUP BY {expr}
              ORDER BY group_key ASC",
             expr = time_expr,
@@ -435,8 +439,8 @@ fn sorted_aggregate_rows(groups: HashMap<String, MetricsAccumulator>) -> Vec<Agg
         .collect();
     rows.sort_by(|left, right| {
         right
-            .total_cost_cents
-            .cmp(&left.total_cost_cents)
+            .total_tokens
+            .cmp(&left.total_tokens)
             .then_with(|| left.group_key.cmp(&right.group_key))
     });
     rows
@@ -501,8 +505,109 @@ fn average(total: i64, count: i64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::super::{NewRequestLog, Store};
-    use super::AnalyticsTimeBucket;
+    use super::{sorted_aggregate_rows, AnalyticsTimeBucket, MetricsAccumulator};
+
+    #[test]
+    fn aggregate_rankings_are_sorted_by_total_tokens() {
+        let groups = HashMap::from([
+            (
+                "high-cost".to_string(),
+                MetricsAccumulator {
+                    total_input_tokens: 10,
+                    total_cost_cents: 1_000,
+                    ..Default::default()
+                },
+            ),
+            (
+                "zeta".to_string(),
+                MetricsAccumulator {
+                    total_input_tokens: 200,
+                    total_cost_cents: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "alpha".to_string(),
+                MetricsAccumulator {
+                    total_input_tokens: 200,
+                    total_cost_cents: 2,
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        let rows = sorted_aggregate_rows(groups);
+        let keys: Vec<_> = rows.iter().map(|row| row.group_key.as_str()).collect();
+
+        assert_eq!(keys, vec!["alpha", "zeta", "high-cost"]);
+    }
+
+    #[tokio::test]
+    async fn persisted_usage_rankings_use_tokens_instead_of_cost() {
+        let store = Store::open_in_memory().await.unwrap();
+        for (request_id, key_id, model, input_tokens, cost_cents) in [
+            (
+                "req-high-cost",
+                "key-high-cost",
+                "model-high-cost",
+                10,
+                1_000,
+            ),
+            (
+                "req-high-token",
+                "key-high-token",
+                "model-high-token",
+                200,
+                1,
+            ),
+        ] {
+            store
+                .insert_request_log_entry(NewRequestLog {
+                    request_id,
+                    api_key_id: key_id,
+                    session_hash: None,
+                    provider_name: "provider",
+                    protocol: "responses",
+                    model,
+                    operation: "responses",
+                    status_code: 200,
+                    success: true,
+                    input_tokens,
+                    output_tokens: 0,
+                    total_tokens: input_tokens,
+                    cached_tokens: 0,
+                    cache_write_tokens: 0,
+                    cost_cents,
+                    latency_ms: 10,
+                    first_byte_latency_ms: 5,
+                    metadata_json: "{}",
+                    request_body: None,
+                    response_body: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let model_rows = store
+            .aggregate_by_model("2000-01-01T00:00:00Z", "2099-12-31T23:59:59Z")
+            .await
+            .unwrap();
+        let dashboard = store
+            .dashboard_analytics(
+                "2000-01-01T00:00:00Z",
+                "2099-12-31T23:59:59Z",
+                AnalyticsTimeBucket::Day,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(model_rows[0].group_key, "model-high-token");
+        assert_eq!(dashboard.by_model[0].group_key, "model-high-token");
+        assert_eq!(dashboard.by_key[0].group_key, "key-high-token");
+    }
 
     async fn seed_logs(store: &Store) {
         let key_ids = ["analytics-key-0", "analytics-key-1"];
@@ -666,7 +771,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_dashboard_analytics_groups_from_metrics_table() {
+    async fn test_dashboard_analytics_groups_from_request_logs() {
         let store = Store::open_in_memory().await.unwrap();
         seed_logs(&store).await;
 
@@ -713,17 +818,18 @@ mod tests {
              SELECT created_at, api_key_id, provider_name, protocol, model, status,
                     status_code, input_tokens, output_tokens, cached_tokens,
                     cache_write_tokens, cost_cents, latency_ms, first_byte_latency_ms
-             FROM request_log_metrics
+             FROM request_logs
              WHERE created_at >= '2000-01-01T00:00:00Z'
-               AND created_at <= '2099-12-31T23:59:59Z'",
+               AND created_at <= '2099-12-31T23:59:59Z'
+               AND status <> 'running'",
         )
         .fetch_all(&store.pool)
         .await
         .unwrap();
 
-        assert!(plan.iter().any(|(_, _, _, detail)| {
-            detail.contains("idx_request_log_metrics_analytics_created_at")
-        }));
+        assert!(plan
+            .iter()
+            .any(|(_, _, _, detail)| { detail.contains("idx_request_logs_analytics_created_at") }));
     }
 
     #[tokio::test]

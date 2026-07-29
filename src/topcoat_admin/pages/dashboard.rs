@@ -7,7 +7,7 @@ use topcoat::{
 
 use crate::topcoat_admin::app::{app_state, require_admin};
 use crate::topcoat_admin::{
-    render_page, render_shared_scripts, render_shared_styles, render_sidebar,
+    format_duration_ms, render_page, render_shared_scripts, render_shared_styles, render_sidebar,
     render_theme_bootstrap, render_toast_container, trusted_html, PageLayout,
 };
 
@@ -116,6 +116,10 @@ async fn render_dashboard(cx: &Cx) -> Result {
         .dashboard-content > .mt-4 {{ margin-top: 0; }}
         .dashboard-chart-card {{ display: flex; flex-direction: column; }}
         .dashboard-chart-card .chart-container {{ min-height: 14rem; flex: 1 1 auto; }}
+        .dashboard-table-card {{ display: flex; min-height: 0; flex-direction: column; }}
+        .dashboard-table-scroll {{ min-height: 0; flex: 1 1 auto; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }}
+        .dashboard-table-scroll thead th {{ position: sticky; top: 0; z-index: 1; background: var(--card); }}
+        .dashboard-table-scroll:focus-visible {{ outline: 2px solid var(--ring); outline-offset: 2px; }}
         @media (min-width: 1024px) {{
             .dashboard-content {{ grid-template-rows: minmax(0, 1fr) minmax(0, 2fr) minmax(0, 2fr); overflow: hidden; }}
             .dashboard-content > .grid {{ min-height: 0; gap: .75rem; }}
@@ -189,11 +193,11 @@ async fn render_dashboard(cx: &Cx) -> Result {
                             </div>
                             <div>
                                 <div class="text-[0.68rem] uppercase tracking-wider text-zinc-500 mb-1">平均首字节</div>
-                                <div id="metric-first-byte" class="font-mono text-sm font-semibold">{:.0}ms</div>
+                                <div id="metric-first-byte" class="font-mono text-sm font-semibold">{}</div>
                             </div>
                             <div>
                                 <div class="text-[0.68rem] uppercase tracking-wider text-zinc-500 mb-1">平均延迟</div>
-                                <div id="metric-latency" class="font-mono text-sm font-semibold">{:.0}ms</div>
+                                <div id="metric-latency" class="font-mono text-sm font-semibold">{}</div>
                             </div>
                             <div>
                                 <div class="text-[0.68rem] uppercase tracking-wider text-zinc-500 mb-1">平均 Tokens</div>
@@ -225,7 +229,7 @@ async fn render_dashboard(cx: &Cx) -> Result {
                 </div>
 
                 <div class="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-2">
-                    <div class="rounded-xl border border-zinc-200 bg-white p-4">
+                    <div class="dashboard-table-card rounded-xl border border-zinc-200 bg-white p-4">
                         <div class="mb-3 flex items-center justify-between">
                             <h3 class="text-sm font-semibold" id="operations-title">API Key 用量</h3>
                             <div class="dimension-switch">
@@ -233,14 +237,14 @@ async fn render_dashboard(cx: &Cx) -> Result {
                                 <button class="dimension-btn" data-dim="provider" onclick="switchOperationDim('provider')">供应商</button>
                             </div>
                         </div>
-                        <div class="overflow-x-auto">
+                        <div class="dashboard-table-scroll" role="region" aria-label="API Key Token 用量排行榜" tabindex="0">
                             <table class="w-full text-xs min-w-[640px]">
                                 <thead class="border-b border-zinc-200 bg-zinc-50">
                                     <tr>
                                         <th class="px-3 py-2 text-left font-medium text-zinc-500">API 密钥</th>
                                         <th class="px-3 py-2 text-left font-medium text-zinc-500">请求数</th>
                                         <th class="px-3 py-2 text-left font-medium text-zinc-500">成功率</th>
-                                        <th class="px-3 py-2 text-left font-medium text-zinc-500">Tokens</th>
+                                        <th class="px-3 py-2 text-left font-medium text-zinc-500" aria-sort="descending" title="按 Token 用量降序">Tokens</th>
                                         <th class="px-3 py-2 text-left font-medium text-zinc-500">缓存</th>
                                         <th class="px-3 py-2 text-left font-medium text-zinc-500">CHR</th>
                                         <th class="px-3 py-2 text-left font-medium text-zinc-500">延迟</th>
@@ -254,7 +258,7 @@ async fn render_dashboard(cx: &Cx) -> Result {
                         </div>
                     </div>
 
-                    <div class="rounded-xl border border-zinc-200 bg-white p-4">
+                    <div class="dashboard-table-card rounded-xl border border-zinc-200 bg-white p-4">
                         <div class="mb-3 flex items-center justify-between">
                             <h3 class="text-sm font-semibold" id="traffic-title">上游模型用量</h3>
                             <div class="dimension-switch">
@@ -263,14 +267,14 @@ async fn render_dashboard(cx: &Cx) -> Result {
                                 <button class="dimension-btn" data-dim="status_code" onclick="switchTrafficDim('status_code')">状态码</button>
                             </div>
                         </div>
-                        <div class="overflow-x-auto">
+                        <div class="dashboard-table-scroll" role="region" aria-label="上游模型 Token 用量排行榜" tabindex="0">
                             <table class="w-full text-xs min-w-[640px]">
                                 <thead class="border-b border-zinc-200 bg-zinc-50">
                                     <tr>
                                         <th class="px-3 py-2 text-left font-medium text-zinc-500">上游模型</th>
                                         <th class="px-3 py-2 text-left font-medium text-zinc-500">请求数</th>
                                         <th class="px-3 py-2 text-left font-medium text-zinc-500">成功率</th>
-                                        <th class="px-3 py-2 text-left font-medium text-zinc-500">Tokens</th>
+                                        <th class="px-3 py-2 text-left font-medium text-zinc-500" aria-sort="descending" title="按 Token 用量降序">Tokens</th>
                                         <th class="px-3 py-2 text-left font-medium text-zinc-500">缓存</th>
                                         <th class="px-3 py-2 text-left font-medium text-zinc-500">CHR</th>
                                         <th class="px-3 py-2 text-left font-medium text-zinc-500">延迟</th>
@@ -314,9 +318,10 @@ async fn render_dashboard(cx: &Cx) -> Result {
         }}
 
         function formatDuration(ms) {{
-            ms = parseFloat(ms) || 0;
-            if (ms < 1000) return Math.round(ms) + 'ms';
-            return (ms / 1000).toFixed(2) + 's';
+            ms = Number(ms);
+            if (!Number.isFinite(ms) || ms < 0) ms = 0;
+            if (ms < 1000) return Math.min(999, Math.round(ms)) + 'ms';
+            return (ms / 1000).toFixed(2).replace(/\.?0+$/, '') + 's';
         }}
 
         function formatCost(cents) {{
@@ -673,8 +678,8 @@ async fn render_dashboard(cx: &Cx) -> Result {
         cache_hit_rate * 100.0,
         format_tokens(total_requests),
         success_rate * 100.0,
-        avg_first_byte,
-        avg_latency,
+        format_duration_ms(avg_first_byte),
+        format_duration_ms(avg_latency),
         avg_tokens_per_req,
         page_end,
         shared_scripts
