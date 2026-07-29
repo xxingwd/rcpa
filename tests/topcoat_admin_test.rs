@@ -245,6 +245,18 @@ async fn admin_pages_require_cookie_and_render_the_shared_rust_shell() {
         "/dashboard"
     );
 
+    let oversized_response = client
+        .post(format!("{base}/v1/responses"))
+        .header("x-api-key", "rcpa_fixture_secret")
+        .json(&serde_json::json!({
+            "model": "missing-model",
+            "input": "x".repeat(2 * 1024 * 1024),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(oversized_response.status().as_u16(), 404);
+
     let logs_table = client
         .get(format!("{base}/logs/table"))
         .header("cookie", &cookie)

@@ -1,4 +1,5 @@
 use axum::{
+    extract::DefaultBodyLimit,
     middleware,
     routing::{delete, get, post, put},
     Router,
@@ -6,7 +7,6 @@ use axum::{
 use std::sync::Arc;
 use tower_http::{
     cors::{Any, CorsLayer},
-    limit::RequestBodyLimitLayer,
     trace::TraceLayer,
 };
 
@@ -25,7 +25,6 @@ pub fn build(state: Arc<AppState>) -> Router {
         .nest("/v1", api)
         .merge(meta)
         .layer(TraceLayer::new_for_http())
-        .layer(RequestBodyLimitLayer::new(20 * 1024 * 1024 * 1024))
         .layer(cors())
 }
 
@@ -130,6 +129,7 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
             metrics_middleware,
         ))
         .layer(middleware::from_fn(request_id_middleware))
+        .layer(DefaultBodyLimit::disable())
         .with_state(state.clone())
 }
 
