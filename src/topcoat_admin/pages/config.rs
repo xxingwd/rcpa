@@ -4,7 +4,8 @@ use crate::topcoat_admin::api::fetch_config_yaml;
 use crate::topcoat_admin::app::{app_state, require_admin};
 use crate::topcoat_admin::{
     render_page, render_shared_scripts, render_shared_styles, render_sidebar,
-    render_theme_bootstrap, render_toast_container, trusted_html, PageLayout,
+    render_sidebar_bootstrap, render_theme_bootstrap, render_toast_container, trusted_html,
+    PageLayout,
 };
 
 #[page("/config")]
@@ -17,6 +18,7 @@ pub async fn config(cx: &Cx) -> Result {
     let shared_styles = render_shared_styles();
     let shared_scripts = render_shared_scripts();
     let theme_bootstrap = render_theme_bootstrap();
+    let sidebar_bootstrap = render_sidebar_bootstrap();
     let actions: Result = view! {
         <span id="config-path" class="config-path" title=(config_path.as_str())>(config_path.as_str())</span>
         <span id="dirty-badge" class="dirty-badge" hidden="">"已修改"</span>
@@ -54,6 +56,7 @@ pub async fn config(cx: &Cx) -> Result {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>RCPA Admin - 配置</title>
     {theme_bootstrap}
+    {sidebar_bootstrap}
     <link rel="stylesheet" href="/_topcoat/tailwind.css">
     <link rel="stylesheet" href="/_topcoat/codemirror/codemirror.min.css">
     <link rel="stylesheet" href="/_topcoat/codemirror/dracula.min.css">

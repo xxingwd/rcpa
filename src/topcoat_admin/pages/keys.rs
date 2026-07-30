@@ -10,8 +10,8 @@ use crate::topcoat_admin::app::require_admin;
 use crate::topcoat_admin::{
     escape_html, escape_inline_js_string, render_dialog, render_list, render_modal_backdrop,
     render_page, render_shared_scripts, render_shared_styles, render_sidebar,
-    render_theme_bootstrap, render_toast_container, trusted_html, DialogLayout, ListLayout,
-    PageLayout,
+    render_sidebar_bootstrap, render_theme_bootstrap, render_toast_container, trusted_html,
+    DialogLayout, ListLayout, PageLayout,
 };
 
 #[path_param]
@@ -27,6 +27,7 @@ pub async fn keys(cx: &Cx) -> Result {
     let shared_styles = render_shared_styles();
     let shared_scripts = render_shared_scripts();
     let theme_bootstrap = render_theme_bootstrap();
+    let sidebar_bootstrap = render_sidebar_bootstrap();
     let list_body: Result = view! { <div class="list-loading">"加载中..."</div> };
     let list_view = render_list(
         cx,
@@ -65,9 +66,19 @@ pub async fn keys(cx: &Cx) -> Result {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>RCPA Admin - 密钥管理</title>
     {theme_bootstrap}
+    {sidebar_bootstrap}
     <link rel="stylesheet" href="/_topcoat/tailwind.css">
     <script src="/_topcoat/htmx.min.js"></script>
     {}
+    <style>
+        .drag-handle {{ display: inline-flex; width: 44px; min-width: 44px; height: 44px; align-items: center; justify-content: center; border: 0; border-radius: 0.375rem; color: var(--muted-foreground); cursor: grab; touch-action: none; transition: background-color 150ms, color 150ms, opacity 150ms; }}
+        .drag-handle:hover:not(:disabled) {{ background: var(--muted); color: var(--foreground); }}
+        .drag-handle:focus-visible {{ outline: 2px solid var(--ring); outline-offset: 2px; }}
+        .drag-handle:disabled {{ cursor: not-allowed; opacity: 0.32; }}
+        [data-sortable-row].is-dragging {{ border-color: var(--ring); box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1); opacity: 0.72; }}
+        [data-sortable-row].is-dragging .drag-handle {{ cursor: grabbing; }}
+        @media (prefers-reduced-motion: reduce) {{ .drag-handle {{ transition: none; }} }}
+    </style>
 </head>
 <body class="bg-zinc-50 text-zinc-900">
     {}
@@ -95,11 +106,124 @@ pub async fn keys(cx: &Cx) -> Result {
             }});
         }}
 
+        let orderSaving = false;
+        let sortablePointer = null;
+
+        function saveKeyOrder() {{
+            if (orderSaving) return;
+            const ids = Array.from(document.querySelectorAll('[data-key-order-id]'))
+                .map(row => row.dataset.keyOrderId);
+
+            orderSaving = true;
+            const orderHandles = Array.from(document.querySelectorAll('.drag-handle[data-persist-order]'));
+            orderHandles.forEach(handle => handle.disabled = true);
+            fetch('/v1/admin/keys/order', {{
+                method: 'PUT',
+                headers: {{ 'Content-Type': 'application/json' }},
+                credentials: 'include',
+                body: JSON.stringify({{ ids }})
+            }})
+            .then(async response => {{
+                if (response.status === 401) {{
+                    window.location.href = '/login';
+                    return null;
+                }}
+                const result = await response.json();
+                if (!response.ok) throw new Error(result?.error?.message || '调整密钥顺序失败');
+                return result;
+            }})
+            .then(result => {{
+                if (!result) return;
+                Toast.success('密钥顺序已更新');
+                refreshData('keys');
+            }})
+            .catch(error => {{
+                Toast.error(error.message);
+                refreshData('keys');
+            }})
+            .finally(() => {{
+                orderSaving = false;
+                orderHandles.forEach(handle => handle.disabled = false);
+            }});
+        }}
+
+        function commitSortableOrder(kind) {{
+            if (kind === 'keys') saveKeyOrder();
+        }}
+
+        function beginSortablePointer(event, handle, kind) {{
+            if (event.button !== 0 || handle.disabled || orderSaving) return;
+            const row = handle.closest('[data-sortable-row]');
+            if (!row) return;
+            sortablePointer = {{
+                pointerId: event.pointerId,
+                handle,
+                row,
+                container: row.parentElement,
+                startY: event.clientY,
+                moved: false,
+                kind
+            }};
+            handle.setPointerCapture(event.pointerId);
+        }}
+
+        function moveSortablePointer(event) {{
+            const state = sortablePointer;
+            if (!state || event.pointerId !== state.pointerId) return;
+            if (!state.moved && Math.abs(event.clientY - state.startY) < 6) return;
+            event.preventDefault();
+            state.moved = true;
+            state.row.classList.add('is-dragging');
+            const target = document.elementFromPoint(event.clientX, event.clientY)?.closest('[data-sortable-row]');
+            if (!target || target === state.row || target.parentElement !== state.container) return;
+            const bounds = target.getBoundingClientRect();
+            state.container.insertBefore(
+                state.row,
+                event.clientY < bounds.top + bounds.height / 2 ? target : target.nextSibling
+            );
+        }}
+
+        function endSortablePointer(event) {{
+            const state = sortablePointer;
+            if (!state || event.pointerId !== state.pointerId) return;
+            sortablePointer = null;
+            state.row.classList.remove('is-dragging');
+            if (state.handle.hasPointerCapture(event.pointerId)) {{
+                state.handle.releasePointerCapture(event.pointerId);
+            }}
+            if (state.moved) commitSortableOrder(state.kind);
+        }}
+
+        function moveSortableWithKeyboard(event, handle, kind) {{
+            if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return;
+            event.preventDefault();
+            const row = handle.closest('[data-sortable-row]');
+            if (!row) return;
+            const rows = Array.from(row.parentElement.children)
+                .filter(candidate => candidate.matches('[data-sortable-row]'));
+            const index = rows.indexOf(row);
+            const targetIndex = index + (event.key === 'ArrowUp' ? -1 : 1);
+            if (index < 0 || targetIndex < 0 || targetIndex >= rows.length) return;
+            if (targetIndex < index) row.parentElement.insertBefore(row, rows[targetIndex]);
+            else row.parentElement.insertBefore(row, rows[targetIndex].nextSibling);
+            handle.focus();
+            commitSortableOrder(kind);
+        }}
+
+        function removeKeyModelRow(button) {{
+            button.closest('[data-key-model-row]')?.remove();
+        }}
+
         function addModelRow() {{
             const container = document.getElementById('model-rows');
             const row = document.createElement('div');
-            row.className = 'flex gap-2 items-end bg-zinc-50 border border-zinc-200 p-3 rounded-lg mb-2';
+            row.dataset.keyModelRow = '';
+            row.dataset.sortableRow = '';
+            row.className = 'flex gap-2 bg-zinc-50 border border-zinc-200 p-3 rounded-lg mb-2';
             row.innerHTML = `
+                <button type="button" class="drag-handle self-center" title="拖动调整顺序" aria-label="拖动调整模型规则" onpointerdown="beginSortablePointer(event, this, 'form')" onpointermove="moveSortablePointer(event)" onpointerup="endSortablePointer(event)" onpointercancel="endSortablePointer(event)" onkeydown="moveSortableWithKeyboard(event, this, 'form')">
+                    <svg class="h-5 w-5" aria-hidden="true" viewBox="0 0 24 24" fill="currentColor"><circle cx="9" cy="5" r="1.5"/><circle cx="15" cy="5" r="1.5"/><circle cx="9" cy="12" r="1.5"/><circle cx="15" cy="12" r="1.5"/><circle cx="9" cy="19" r="1.5"/><circle cx="15" cy="19" r="1.5"/></svg>
+                </button>
                 <div class="flex-1 grid grid-cols-12 gap-2">
                     <div class="col-span-5">
                         <label class="block text-[10px] text-zinc-500 mb-1">有效模型名 *</label>
@@ -120,7 +244,7 @@ pub async fn keys(cx: &Cx) -> Result {
                         </div>
                     </div>
                 </div>
-                <button type="button" class="h-8 w-8 shrink-0 rounded border border-red-200 text-red-600 hover:bg-red-50 flex items-center justify-center" onclick="this.parentElement.remove()">
+                <button type="button" class="inline-flex min-h-[44px] min-w-[44px] self-end items-center justify-center rounded border border-red-200 text-red-600 hover:bg-red-50" onclick="removeKeyModelRow(this)" title="删除模型规则" aria-label="删除模型规则">
                     <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
                 </button>
             `;
@@ -267,6 +391,7 @@ pub async fn keys_table(cx: &Cx) -> Result {
     html.push_str(r##"<div class="overflow-x-auto"><table class="w-full text-sm">
         <thead class="border-b border-zinc-200 bg-zinc-50">
             <tr>
+                <th class="w-12 px-2 py-3 text-left"><span class="sr-only">排序</span></th>
                 <th class="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-500">名称</th>
                 <th class="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-500">API 密钥</th>
                 <th class="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-500">状态</th>
@@ -295,6 +420,7 @@ pub async fn keys_table(cx: &Cx) -> Result {
         };
         let labels = escape_html(key.labels.as_deref().unwrap_or("—"));
         let id = &key.id;
+        let id_html = escape_html(id);
         let id_js = escape_inline_js_string(id);
         let is_enabled = key.status == "enabled";
 
@@ -349,7 +475,12 @@ pub async fn keys_table(cx: &Cx) -> Result {
         let toggle_text = if is_enabled { "禁用" } else { "启用" };
 
         html.push_str(&format!(
-            r##"<tr class="hover:bg-zinc-50">
+            r##"<tr class="hover:bg-zinc-50" data-sortable-row data-key-order-id="{}">
+                <td class="px-2 py-2">
+                    <button type="button" class="drag-handle" data-persist-order title="拖动调整顺序" aria-label="拖动调整密钥 {}" onpointerdown="beginSortablePointer(event, this, 'keys')" onpointermove="moveSortablePointer(event)" onpointerup="endSortablePointer(event)" onpointercancel="endSortablePointer(event)" onkeydown="moveSortableWithKeyboard(event, this, 'keys')">
+                        <svg class="h-5 w-5" aria-hidden="true" viewBox="0 0 24 24" fill="currentColor"><circle cx="9" cy="5" r="1.5"/><circle cx="15" cy="5" r="1.5"/><circle cx="9" cy="12" r="1.5"/><circle cx="15" cy="12" r="1.5"/><circle cx="9" cy="19" r="1.5"/><circle cx="15" cy="19" r="1.5"/></svg>
+                    </button>
+                </td>
                 <td class="px-4 py-3 font-medium">{}</td>
                 <td class="px-4 py-3">
                     <div class="flex items-center gap-1.5">
@@ -379,6 +510,7 @@ pub async fn keys_table(cx: &Cx) -> Result {
                     </div>
                 </td>
             </tr>"##,
+            id_html, name,
             name, key_val, key_val_js, status_class, status_text,
             model_badges, provider_badges, alias_badges, labels,
             id_js, id_js, escape_inline_js_string(&key.status), toggle_text
@@ -567,7 +699,10 @@ pub async fn keys_edit(cx: &Cx) -> Result {
                 "text-zinc-500"
             };
             rows.push_str(&format!(
-                r##"<div class="flex gap-2 items-end bg-zinc-50 border border-zinc-200 p-3 rounded-lg mb-2">
+                r##"<div data-key-model-row data-sortable-row class="flex gap-2 bg-zinc-50 border border-zinc-200 p-3 rounded-lg mb-2">
+                    <button type="button" class="drag-handle self-center" title="拖动调整顺序" aria-label="拖动调整模型规则" onpointerdown="beginSortablePointer(event, this, 'form')" onpointermove="moveSortablePointer(event)" onpointerup="endSortablePointer(event)" onpointercancel="endSortablePointer(event)" onkeydown="moveSortableWithKeyboard(event, this, 'form')">
+                        <svg class="h-5 w-5" aria-hidden="true" viewBox="0 0 24 24" fill="currentColor"><circle cx="9" cy="5" r="1.5"/><circle cx="15" cy="5" r="1.5"/><circle cx="9" cy="12" r="1.5"/><circle cx="15" cy="12" r="1.5"/><circle cx="9" cy="19" r="1.5"/><circle cx="15" cy="19" r="1.5"/></svg>
+                    </button>
                     <div class="flex-1 grid grid-cols-12 gap-2">
                         <div class="col-span-5">
                             <label class="block text-[10px] text-zinc-500 mb-1">有效模型名 *</label>
@@ -588,7 +723,7 @@ pub async fn keys_edit(cx: &Cx) -> Result {
                             </div>
                         </div>
                     </div>
-                    <button type="button" class="h-8 w-8 shrink-0 rounded border border-red-200 text-red-600 hover:bg-red-50 flex items-center justify-center" onclick="this.parentElement.remove()">
+                    <button type="button" class="inline-flex min-h-[44px] min-w-[44px] self-end items-center justify-center rounded border border-red-200 text-red-600 hover:bg-red-50" onclick="removeKeyModelRow(this)" title="删除模型规则" aria-label="删除模型规则">
                         <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
                     </button>
                 </div>"##,

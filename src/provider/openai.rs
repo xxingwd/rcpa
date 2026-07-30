@@ -254,7 +254,6 @@ mod tests {
     };
     use crate::protocol::common::{Operation, Protocol, ProxyRequest};
     use crate::provider::ProviderAdapter;
-    use std::collections::HashMap;
     use uuid::Uuid;
 
     #[test]
@@ -309,7 +308,7 @@ mod tests {
                 protocol: ProviderProtocol::Completions,
                 base_url: "https://api.openai.com/v1/chat/completions".to_string(),
             }],
-            headers: HashMap::new(),
+            headers: Default::default(),
             priority: 1,
             status: "enabled".to_string(),
         };
@@ -347,7 +346,7 @@ mod tests {
                 protocol: ProviderProtocol::Completions,
                 base_url: "https://api.openai.com/v1/chat/completions".to_string(),
             }],
-            headers: HashMap::new(),
+            headers: Default::default(),
             priority: 1,
             status: "enabled".to_string(),
         };

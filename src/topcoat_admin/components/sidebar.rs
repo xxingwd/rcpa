@@ -90,15 +90,23 @@ pub fn render_modal_backdrop() -> &'static str {
     r#"<div id="modal-backdrop" class="modal-overlay" hidden><section class="modal-content" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><div id="modal-body"></div></section></div>"#
 }
 
+pub fn render_sidebar_bootstrap() -> &'static str {
+    r#"<script>
+    (() => {
+        document.documentElement.classList.toggle(
+            'sidebar-collapsed',
+            localStorage.getItem('rcpa_sidebar_collapsed') === 'true'
+        );
+    })();
+    </script>"#
+}
+
 pub fn render_shared_scripts() -> String {
     [
         render_theme_scripts(),
         r#"<script>
     const SidebarManager = {
         key: 'rcpa_sidebar_collapsed',
-        init() {
-            document.documentElement.classList.toggle('sidebar-collapsed', localStorage.getItem(this.key) === 'true');
-        },
         toggle() {
             const collapsed = !document.documentElement.classList.contains('sidebar-collapsed');
             document.documentElement.classList.toggle('sidebar-collapsed', collapsed);
@@ -209,7 +217,6 @@ pub fn render_shared_scripts() -> String {
         }
     });
     document.addEventListener('DOMContentLoaded', () => {
-        SidebarManager.init();
         verifyAdminSession();
     });
     </script>"#,

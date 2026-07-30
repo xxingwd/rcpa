@@ -8,7 +8,8 @@ use topcoat::{
 use crate::topcoat_admin::app::{app_state, require_admin};
 use crate::topcoat_admin::{
     format_duration_ms, render_page, render_shared_scripts, render_shared_styles, render_sidebar,
-    render_theme_bootstrap, render_toast_container, trusted_html, PageLayout,
+    render_sidebar_bootstrap, render_theme_bootstrap, render_toast_container, trusted_html,
+    PageLayout,
 };
 
 #[page("/")]
@@ -53,6 +54,7 @@ async fn render_dashboard(cx: &Cx) -> Result {
     let shared_styles = render_shared_styles();
     let shared_scripts = render_shared_scripts();
     let theme_bootstrap = render_theme_bootstrap();
+    let sidebar_bootstrap = render_sidebar_bootstrap();
     let __cx = cx;
     let page_actions: Result = view! {
         <select id="time-range" class="h-8 rounded-lg border border-zinc-200 bg-white px-3 text-xs">
@@ -93,6 +95,7 @@ async fn render_dashboard(cx: &Cx) -> Result {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>RCPA Admin - 仪表盘</title>
     {theme_bootstrap}
+    {sidebar_bootstrap}
     <link rel="stylesheet" href="/_topcoat/tailwind.css">
     <script src="/_topcoat/htmx.min.js"></script>
     <script src="/_topcoat/chart.umd.min.js"></script>

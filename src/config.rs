@@ -1,3 +1,4 @@
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -45,7 +46,7 @@ pub struct ProviderConfig {
     pub models: Vec<ModelRule>,
     pub endpoints: Vec<EndpointConfig>,
     #[serde(default)]
-    pub headers: HashMap<String, String>,
+    pub headers: IndexMap<String, String>,
     #[serde(default = "default_status")]
     pub status: String,
     pub priority: i64,
@@ -250,7 +251,7 @@ pub struct AuthKey {
     pub name: Option<String>,
     pub key: String,
     pub models: Vec<ModelRule>,
-    pub model_aliases: HashMap<String, String>,
+    pub model_aliases: IndexMap<String, String>,
     #[serde(default)]
     pub allowed_providers: Vec<String>,
     pub status: String,
@@ -434,8 +435,16 @@ impl AppConfig {
             if !seen_names.insert(provider.name.clone()) {
                 anyhow::bail!("Duplicate provider name '{}'", provider.name);
             }
+            let mut seen_model_names = HashSet::new();
             for model in &provider.models {
                 validate_model_name(&model.name, "provider model")?;
+                if !seen_model_names.insert(&model.name) {
+                    anyhow::bail!(
+                        "Provider '{}' defines duplicate model '{}'",
+                        provider.name,
+                        model.name
+                    );
+                }
                 match model.status.as_str() {
                     "enabled" | "disabled" => {}
                     other => anyhow::bail!(
@@ -476,9 +485,13 @@ impl AppConfig {
         let platform_names = self.key_visible_model_names();
         let provider_names: HashSet<&String> = self.providers.iter().map(|p| &p.name).collect();
 
+        let mut seen_key_ids = HashSet::new();
         for key in &self.keys {
             if key.id.trim().is_empty() {
                 anyhow::bail!("Auth key id cannot be empty");
+            }
+            if !seen_key_ids.insert(&key.id) {
+                anyhow::bail!("Duplicate auth key id '{}'", key.id);
             }
             if key.key.trim().is_empty() {
                 anyhow::bail!("Auth key '{}' has empty key", key.id);
@@ -525,8 +538,16 @@ impl AppConfig {
                     );
                 }
             }
+            let mut seen_key_models = HashSet::new();
             for model in &key.models {
                 validate_model_name(&model.name, "allowed model")?;
+                if !seen_key_models.insert(&model.name) {
+                    anyhow::bail!(
+                        "Auth key '{}' defines duplicate model rule '{}'",
+                        key.id,
+                        model.name
+                    );
+                }
                 match model.status.as_str() {
                     "enabled" | "disabled" => {}
                     other => anyhow::bail!(
@@ -870,7 +891,7 @@ keys: []
                 ModelRule::enabled("gpt-4*"),
                 ModelRule::enabled("claude-sonnet-4-6"),
             ],
-            model_aliases: HashMap::new(),
+            model_aliases: Default::default(),
             allowed_providers: Vec::new(),
             status: "enabled".into(),
             labels: None,
@@ -894,7 +915,7 @@ keys: []
                 pricing: None,
                 aliases: Vec::new(),
             }],
-            model_aliases: HashMap::new(),
+            model_aliases: Default::default(),
             allowed_providers: Vec::new(),
             status: "enabled".into(),
             labels: None,
@@ -972,7 +993,7 @@ keys: []
                     base_url: "https://api.example.com/v1/responses".into(),
                 },
             ],
-            headers: HashMap::new(),
+            headers: Default::default(),
             status: "enabled".into(),
             priority: 1,
         }];
@@ -1001,6 +1022,47 @@ keys: []
 
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("duplicate endpoint protocol"));
+    }
+
+    #[test]
+    fn test_validate_rejects_duplicate_order_identifiers() {
+        let mut config = test_config();
+        let mut provider = test_provider();
+        provider.models.push(ModelRule::enabled("gpt-4o"));
+        config.providers.push(provider);
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("duplicate model 'gpt-4o'"));
+
+        let mut config = test_config();
+        config.providers.push(test_provider());
+        let key = AuthKey {
+            id: "duplicate-key".into(),
+            name: None,
+            key: "secret".into(),
+            models: Vec::new(),
+            model_aliases: Default::default(),
+            allowed_providers: Vec::new(),
+            status: "enabled".into(),
+            labels: None,
+        };
+        config.keys = vec![key.clone(), key];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("Duplicate auth key id 'duplicate-key'"));
+
+        let mut config = test_config();
+        config.providers.push(test_provider());
+        config.keys.push(AuthKey {
+            id: "key".into(),
+            name: None,
+            key: "secret".into(),
+            models: vec![ModelRule::enabled("gpt-4o"), ModelRule::enabled("gpt-4o")],
+            model_aliases: Default::default(),
+            allowed_providers: Vec::new(),
+            status: "enabled".into(),
+            labels: None,
+        });
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("duplicate model rule 'gpt-4o'"));
     }
 
     #[test]
@@ -1126,7 +1188,7 @@ keys: []
                 protocol: ProviderProtocol::Completions,
                 base_url: "https://api.example.com/v1/chat/completions".into(),
             }],
-            headers: HashMap::new(),
+            headers: Default::default(),
             status: "enabled".into(),
             priority: 0,
         }

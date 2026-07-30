@@ -4,6 +4,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use indexmap::IndexMap;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -123,7 +124,7 @@ pub struct CreateKeyPayload {
     pub name: Option<String>,
     pub labels: Option<String>,
     pub allowed_models: Option<Vec<KeyModelPayload>>,
-    pub model_aliases: Option<HashMap<String, String>>,
+    pub model_aliases: Option<IndexMap<String, String>>,
     pub allowed_providers: Option<Vec<String>>,
 }
 
@@ -136,7 +137,7 @@ pub struct UpdateKeyPayload {
     #[serde(default, deserialize_with = "deserialize_patch_field")]
     pub allowed_models: PatchField<Vec<KeyModelPayload>>,
     #[serde(default, deserialize_with = "deserialize_patch_field")]
-    pub model_aliases: PatchField<HashMap<String, String>>,
+    pub model_aliases: PatchField<IndexMap<String, String>>,
     #[serde(default, deserialize_with = "deserialize_patch_field")]
     pub allowed_providers: PatchField<Vec<String>>,
 }
@@ -209,7 +210,7 @@ fn ensure_model_name_is_canonical(value: &str, field: &str) -> Result<(), AppErr
 fn validate_key_model_config(
     config: &AppConfig,
     allowed_models: &[ModelRule],
-    model_aliases: &HashMap<String, String>,
+    model_aliases: &IndexMap<String, String>,
     allowed_providers: &[String],
 ) -> Result<(), AppError> {
     let target_names = config.key_visible_model_names();
@@ -310,6 +311,23 @@ pub async fn list_all_keys(
     Ok(Json(state.config_service.snapshot().auth_keys()))
 }
 
+pub async fn reorder_keys(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<ReorderPayload>,
+) -> Result<impl IntoResponse, AppError> {
+    check_admin(&state, &headers)?;
+    let mut candidate = state.config_service.snapshot().raw_config.clone();
+    reorder_items(&mut candidate.keys, &payload.ids, |key| &key.id)
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+
+    state
+        .config_service
+        .update(|config| reorder_items(&mut config.keys, &payload.ids, |key| &key.id))
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
 pub async fn create_key(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -387,7 +405,7 @@ pub async fn update_key(
     };
     let model_aliases = match &payload.model_aliases {
         PatchField::Value(aliases) => aliases.clone(),
-        PatchField::Null => HashMap::new(),
+        PatchField::Null => IndexMap::new(),
         PatchField::Missing => existing_key.model_aliases.clone(),
     };
     let allowed_providers = match &payload.allowed_providers {
@@ -644,9 +662,68 @@ pub struct CreateProviderPayload {
     pub api_key: String,
     pub models: Vec<ModelRule>,
     pub endpoints: Vec<EndpointConfig>,
-    pub headers: Option<HashMap<String, String>>,
+    pub headers: Option<IndexMap<String, String>>,
     pub status: Option<String>,
     pub priority: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReorderPayload {
+    pub ids: Vec<String>,
+}
+
+fn reorder_items<T, F>(items: &mut [T], ids: &[String], item_id: F) -> anyhow::Result<()>
+where
+    F: Fn(&T) -> &str,
+{
+    if ids.len() != items.len() {
+        anyhow::bail!(
+            "Order must contain exactly {} item identifiers",
+            items.len()
+        );
+    }
+
+    let positions: HashMap<&str, usize> = ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| (id.as_str(), index))
+        .collect();
+    if positions.len() != ids.len() {
+        anyhow::bail!("Order contains duplicate item identifiers");
+    }
+
+    for item in items.iter() {
+        let id = item_id(item);
+        if !positions.contains_key(id) {
+            anyhow::bail!("Order is missing configured item '{}'", id);
+        }
+    }
+    items.sort_by_key(|item| positions[item_id(item)]);
+    Ok(())
+}
+
+pub async fn reorder_providers(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<ReorderPayload>,
+) -> Result<impl IntoResponse, AppError> {
+    check_admin(&state, &headers)?;
+    let mut candidate = state.config_service.snapshot().raw_config.clone();
+    reorder_items(&mut candidate.providers, &payload.ids, |provider| {
+        &provider.name
+    })
+    .map_err(|error| AppError::BadRequest(error.to_string()))?;
+
+    state
+        .config_service
+        .update(|config| {
+            reorder_items(&mut config.providers, &payload.ids, |provider| {
+                &provider.name
+            })
+        })
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
 fn replace_provider_config(

@@ -18,7 +18,7 @@ pub use components::page::{
 // Re-export shared components for convenience
 pub use components::sidebar::{
     render_modal_backdrop, render_shared_scripts, render_shared_styles, render_sidebar,
-    render_toast_container,
+    render_sidebar_bootstrap, render_toast_container,
 };
 pub use components::theme::{render_theme_bootstrap, render_theme_scripts, render_theme_toggle};
 

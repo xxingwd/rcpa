@@ -608,7 +608,7 @@ fn provider_with_endpoints(
         api_key: "sk-mock-key".to_string(),
         models,
         endpoints,
-        headers: HashMap::new(),
+        headers: Default::default(),
         status: "enabled".to_string(),
         priority: 5,
     }
@@ -630,7 +630,7 @@ fn auth_key(id: &str, key: &str, models: Vec<ModelRule>) -> AuthKey {
         name: None,
         key: key.to_string(),
         models,
-        model_aliases: HashMap::new(),
+        model_aliases: Default::default(),
         allowed_providers: Vec::new(),
         status: "enabled".to_string(),
         labels: None,
@@ -839,6 +839,265 @@ async fn test_admin_provider_update_changes_status() {
     let provider = snapshot.find_provider("openai-test-provider").unwrap();
     assert_eq!(provider.status, "disabled");
     assert_eq!(provider.api_key, "sk-updated");
+}
+
+#[tokio::test]
+async fn test_admin_reorders_config_lists_and_persists_yaml_order() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let mut first_provider = provider(
+        "provider-first",
+        "completions",
+        "https://first.example.com/v1/chat/completions",
+        vec![
+            ModelRule {
+                name: "model-a".to_string(),
+                status: "enabled".to_string(),
+                pricing: None,
+                aliases: vec!["z-public".to_string(), "a-public".to_string()],
+            },
+            enabled_model("model-b"),
+        ],
+    );
+    first_provider
+        .headers
+        .insert("X-Second".to_string(), "2".to_string());
+    first_provider
+        .headers
+        .insert("X-First".to_string(), "1".to_string());
+    let second_provider = provider(
+        "provider-second",
+        "completions",
+        "https://second.example.com/v1/chat/completions",
+        vec![enabled_model("model-c")],
+    );
+
+    let mut first_key = auth_key("key-first", "secret-first", Vec::new());
+    first_key
+        .model_aliases
+        .insert("private-z".to_string(), "model-c".to_string());
+    first_key
+        .model_aliases
+        .insert("private-a".to_string(), "model-c".to_string());
+    let second_key = auth_key("key-second", "secret-second", Vec::new());
+
+    let mut config = test_config();
+    config.providers = vec![first_provider, second_provider];
+    config.keys = vec![first_key, second_key];
+
+    let temp_dir = std::env::temp_dir().join(format!("rcpa-order-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let config_path = temp_dir.join("config.yaml");
+    std::fs::write(&config_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+
+    let config_service = Arc::new(ConfigService::new(&config_path).unwrap());
+    let state = Arc::new(
+        rcpa::server::AppState::new(config_service, RuntimeConfig::in_memory("admin-token"))
+            .await
+            .unwrap(),
+    );
+    let app = rcpa::server::router::build(state.clone());
+
+    let unauthorized = Request::builder()
+        .method("PUT")
+        .uri("/v1/admin/providers/order")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"ids":["provider-second","provider-first"]}"#,
+        ))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(unauthorized).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    for (path, body) in [
+        (
+            "/v1/admin/providers/order",
+            r#"{"ids":["provider-second","provider-first"]}"#,
+        ),
+        (
+            "/v1/admin/keys/order",
+            r#"{"ids":["key-second","key-first"]}"#,
+        ),
+    ] {
+        let request = Request::builder()
+            .method("PUT")
+            .uri(path)
+            .header("x-admin-token", "admin-token")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::OK,
+            "path: {path}"
+        );
+    }
+
+    let provider_update = Request::builder()
+        .method("PUT")
+        .uri("/v1/admin/providers/provider-first")
+        .header("x-admin-token", "admin-token")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{
+                "name":"provider-first",
+                "api_key":"sk-mock-key",
+                "models":[
+                    {"name":"model-b","status":"enabled","pricing":null,"aliases":[]},
+                    {"name":"model-a","status":"enabled","pricing":null,"aliases":["z-public","a-public"]}
+                ],
+                "endpoints":[{"protocol":"completions","base_url":"https://first.example.com/v1/chat/completions"}],
+                "headers":{"X-Second":"2","X-First":"1"},
+                "status":"enabled",
+                "priority":5
+            }"#,
+        ))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(provider_update).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    let invalid = Request::builder()
+        .method("PUT")
+        .uri("/v1/admin/keys/order")
+        .header("x-admin-token", "admin-token")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"ids":["key-second","key-second"]}"#))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(invalid).await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    let persisted = AppConfig::load_raw(&config_path).unwrap();
+    assert_eq!(
+        persisted
+            .providers
+            .iter()
+            .map(|provider| provider.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["provider-second", "provider-first"]
+    );
+    assert_eq!(
+        persisted.providers[1]
+            .models
+            .iter()
+            .map(|model| model.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["model-b", "model-a"]
+    );
+    assert_eq!(
+        persisted
+            .keys
+            .iter()
+            .map(|key| key.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["key-second", "key-first"]
+    );
+    assert_eq!(
+        persisted.providers[1]
+            .headers
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["X-Second", "X-First"]
+    );
+    assert_eq!(
+        persisted.keys[1]
+            .model_aliases
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["private-z", "private-a"]
+    );
+
+    let providers_request = Request::builder()
+        .uri("/v1/admin/providers")
+        .header("x-admin-token", "admin-token")
+        .body(Body::empty())
+        .unwrap();
+    let providers_response = app.clone().oneshot(providers_request).await.unwrap();
+    let providers_body = axum::body::to_bytes(providers_response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let providers: serde_json::Value = serde_json::from_slice(&providers_body).unwrap();
+    assert_eq!(providers[0]["name"], "provider-second");
+    assert_eq!(providers[1]["models"][0]["name"], "model-b");
+
+    let catalog_request = Request::builder()
+        .uri("/v1/admin/model-catalog")
+        .header("x-admin-token", "admin-token")
+        .body(Body::empty())
+        .unwrap();
+    let catalog_response = app.clone().oneshot(catalog_request).await.unwrap();
+    let catalog_body = axum::body::to_bytes(catalog_response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let catalog: serde_json::Value = serde_json::from_slice(&catalog_body).unwrap();
+    assert_eq!(
+        catalog
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| model["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["model-c", "model-b", "z-public", "a-public"]
+    );
+
+    let aliases_request = Request::builder()
+        .uri("/v1/admin/aliases")
+        .header("x-admin-token", "admin-token")
+        .body(Body::empty())
+        .unwrap();
+    let aliases_response = app.clone().oneshot(aliases_request).await.unwrap();
+    let aliases_body = axum::body::to_bytes(aliases_response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let aliases: serde_json::Value = serde_json::from_slice(&aliases_body).unwrap();
+    assert_eq!(
+        aliases
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|alias| alias["alias"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["z-public", "a-public"]
+    );
+
+    let models_request = Request::builder()
+        .uri("/v1/models")
+        .header("x-api-key", "secret-first")
+        .body(Body::empty())
+        .unwrap();
+    let models_response = app.clone().oneshot(models_request).await.unwrap();
+    let models_body = axum::body::to_bytes(models_response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let models: serde_json::Value = serde_json::from_slice(&models_body).unwrap();
+    let model_ids = models["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|model| model["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        model_ids,
+        vec![
+            "model-c",
+            "model-b",
+            "z-public",
+            "a-public",
+            "private-z",
+            "private-a"
+        ]
+    );
+
+    std::fs::remove_dir_all(temp_dir).unwrap();
 }
 
 #[tokio::test]

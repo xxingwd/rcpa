@@ -51,7 +51,9 @@ fn populated_config() -> AppConfig {
             protocol: ProviderProtocol::Responses,
             base_url: "https://fixture.example/v1/responses".to_string(),
         }],
-        headers: HashMap::from([("X-Fixture".to_string(), "fixture-header".to_string())]),
+        headers: [("X-Fixture".to_string(), "fixture-header".to_string())]
+            .into_iter()
+            .collect(),
         status: "enabled".to_string(),
         priority: 7,
     });
@@ -65,7 +67,9 @@ fn populated_config() -> AppConfig {
             pricing: None,
             aliases: Vec::new(),
         }],
-        model_aliases: HashMap::from([("fast-fixture".to_string(), "public-model".to_string())]),
+        model_aliases: [("fast-fixture".to_string(), "public-model".to_string())]
+            .into_iter()
+            .collect(),
         allowed_providers: vec!["fixture-provider".to_string()],
         status: "enabled".to_string(),
         labels: Some("fixture-label".to_string()),
@@ -328,6 +332,17 @@ async fn admin_pages_require_cookie_and_render_the_shared_rust_shell() {
         assert!(html.contains("class=\"sidebar\""), "path: {path}");
         assert!(html.contains("class=\"mobile-header\""), "path: {path}");
         assert!(html.contains("/_topcoat/tailwind.css"), "path: {path}");
+        let sidebar_bootstrap = html
+            .find("localStorage.getItem('rcpa_sidebar_collapsed')")
+            .expect("sidebar state bootstrap should be present");
+        let stylesheet = html
+            .find("/_topcoat/tailwind.css")
+            .expect("admin stylesheet should be present");
+        assert!(
+            sidebar_bootstrap < stylesheet,
+            "sidebar state must be restored before styles load: {path}"
+        );
+        assert!(!html.contains("SidebarManager.init()"), "path: {path}");
         assert!(html.contains("class=\"page "), "path: {path}");
         assert!(html.contains("class=\"page-header\""), "path: {path}");
         assert!(html.contains("class=\"page-title\""), "path: {path}");
@@ -356,6 +371,11 @@ async fn admin_pages_require_cookie_and_render_the_shared_rust_shell() {
             assert!(html.contains("id=\"keys-list\""));
             assert!(html.contains("hx-trigger=\"load, rcpa-keys-refresh from:body\""));
             assert!(html.contains("refreshData('keys')"));
+            assert!(html.contains("function beginSortablePointer(event, handle, kind)"));
+            assert!(html.contains("function moveSortableWithKeyboard(event, handle, kind)"));
+            assert!(html.contains("function saveKeyOrder()"));
+            assert!(html.contains("/v1/admin/keys/order"));
+            assert!(!html.contains("function moveKeyModelRow"));
         }
         if path == "/dashboard" {
             assert!(html.contains("animation: false"));
@@ -383,6 +403,11 @@ async fn admin_pages_require_cookie_and_render_the_shared_rust_shell() {
             assert!(html.contains("refreshData('providers')"));
             assert!(html.contains("data.priority = Number.isFinite(priority) ? priority : 0"));
             assert!(html.contains("pricing: hasPricing ?"));
+            assert!(html.contains("function beginSortablePointer(event, handle, kind)"));
+            assert!(html.contains("function moveSortableWithKeyboard(event, handle, kind)"));
+            assert!(html.contains("/v1/admin/providers/order"));
+            assert!(!html.contains("/models/order"));
+            assert!(!html.contains("function moveFormRow"));
         }
         if path == "/logs" {
             assert!(html.contains("id=\"logs-list\""));
@@ -393,6 +418,34 @@ async fn admin_pages_require_cookie_and_render_the_shared_rust_shell() {
             assert!(html.contains("let logsRequest = null"));
         }
     }
+
+    let providers_table = client
+        .get(format!("{base}/providers/table"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert!(providers_table.status().is_success());
+    let providers_table_html = providers_table.text().await.unwrap();
+    assert!(providers_table_html.contains("data-provider-order-id=\"fixture-provider\""));
+    assert!(providers_table_html.contains("data-sortable-row"));
+    assert!(providers_table_html.contains("aria-label=\"拖动调整供应商 fixture-provider\""));
+    assert!(providers_table_html.contains("class=\"drag-handle\" data-persist-order"));
+    assert!(!providers_table_html.contains("data-model-provider"));
+    assert!(!providers_table_html.contains("拖动调整模型"));
+
+    let keys_table = client
+        .get(format!("{base}/keys/table"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert!(keys_table.status().is_success());
+    let keys_table_html = keys_table.text().await.unwrap();
+    assert!(keys_table_html.contains("data-key-order-id=\"fixture-key\""));
+    assert!(keys_table_html.contains("data-sortable-row"));
+    assert!(keys_table_html.contains("aria-label=\"拖动调整密钥 Fixture Key\""));
+    assert!(keys_table_html.contains("class=\"drag-handle\" data-persist-order"));
 
     for (path, title) in [
         ("/keys/new", "生成 API 密钥"),
@@ -422,6 +475,10 @@ async fn admin_pages_require_cookie_and_render_the_shared_rust_shell() {
         if path == "/providers/new" {
             assert!(html.contains("var endpointIndex = 100"));
             assert!(html.contains("function addEndpointRow()"));
+            assert!(html.contains("data-empty-state"));
+            assert!(html.contains("div.dataset.orderRow = ''"));
+            assert!(html.contains("div.dataset.sortableRow = ''"));
+            assert!(html.contains("aria-label=\"拖动调整模型\""));
         }
     }
 
@@ -460,6 +517,10 @@ async fn admin_pages_require_cookie_and_render_the_shared_rust_shell() {
         assert!(html.contains("value=\"public-model\""), "path: {path}");
         assert!(html.contains("value=\"0.125\""), "path: {path}");
         assert!(html.contains("value=\"0.25\""), "path: {path}");
+        assert!(html.contains("data-order-row"), "path: {path}");
+        assert!(html.contains("data-sortable-row"), "path: {path}");
+        assert!(html.contains("aria-label=\"拖动调整模型\""), "path: {path}");
+        assert!(!html.contains("aria-label=\"上移模型\""), "path: {path}");
 
         if path.ends_with("/edit") {
             assert!(html.contains("value=\"fixture-provider\""));
@@ -484,6 +545,10 @@ async fn admin_pages_require_cookie_and_render_the_shared_rust_shell() {
     assert!(key_html.contains("value=\"public-model\""));
     assert!(key_html.contains("value=\"fast-fixture\""));
     assert!(key_html.contains("value=\"fixture-label\""));
+    assert!(key_html.contains("data-key-model-row"));
+    assert!(key_html.contains("data-sortable-row"));
+    assert!(key_html.contains("aria-label=\"拖动调整模型规则\""));
+    assert!(!key_html.contains("aria-label=\"上移模型规则\""));
 
     let _ = shutdown_tx.send(());
     server.await.unwrap();

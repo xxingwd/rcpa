@@ -226,7 +226,6 @@ mod tests {
     use crate::config::{
         EndpointConfig, ModelRule, ProviderConfig, ProviderProtocol, UpstreamConfig,
     };
-    use std::collections::HashMap;
 
     #[test]
     fn extracts_anthropic_usage_with_cache_tokens() {
@@ -257,7 +256,7 @@ mod tests {
                 protocol: ProviderProtocol::Messages,
                 base_url: "https://api.anthropic.com/v1/messages".to_string(),
             }],
-            headers: HashMap::new(),
+            headers: Default::default(),
             priority: 1,
             status: "enabled".to_string(),
         };

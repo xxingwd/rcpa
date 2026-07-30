@@ -2,7 +2,7 @@ use crate::error::AppError;
 use crate::middleware::auth;
 use crate::server::AppState;
 use axum::{extract::State, response::IntoResponse, Json};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// GET /v1/models
@@ -14,18 +14,27 @@ pub async fn list_models(
     let auth_result = auth::authenticate(&state, &headers)?;
 
     let snapshot = state.config_service.snapshot();
-    let mut available: BTreeMap<String, String> = BTreeMap::new();
-
-    let mut visible_names = BTreeSet::new();
-    for entry in snapshot.model_catalog() {
-        for model_name in entry.selectable_names {
-            visible_names.insert(model_name);
+    let mut visible_names = Vec::new();
+    if auth_result.key.models.is_empty() {
+        for entry in snapshot.model_catalog() {
+            visible_names.extend(entry.selectable_names);
         }
+        visible_names.extend(auth_result.key.model_aliases.keys().cloned());
+    } else {
+        visible_names.extend(
+            auth_result
+                .key
+                .models
+                .iter()
+                .map(|model| model.name.clone()),
+        );
     }
-    visible_names.extend(auth_result.key.model_aliases.keys().cloned());
 
+    let mut seen = HashSet::new();
+    let mut models = Vec::new();
     for model_name in visible_names {
-        if crate::config::AppConfig::key_can_use_model(&auth_result.key, &model_name)
+        if seen.insert(model_name.clone())
+            && crate::config::AppConfig::key_can_use_model(&auth_result.key, &model_name)
             && state
                 .validate_model_name_for_key(&model_name, &auth_result.key)
                 .is_ok()
@@ -39,21 +48,14 @@ pub async fn list_models(
                     .map(|endpoint| endpoint.provider_name.clone())
                     .unwrap_or_else(|| "provider".to_string())
             };
-            available.insert(model_name, owner);
-        }
-    }
-
-    let models: Vec<serde_json::Value> = available
-        .into_iter()
-        .map(|(model, owned_by)| {
-            serde_json::json!({
-                "id": model,
+            models.push(serde_json::json!({
+                "id": model_name,
                 "object": "model",
                 "created": 0,
-                "owned_by": owned_by,
-            })
-        })
-        .collect();
+                "owned_by": owner,
+            }));
+        }
+    }
 
     Ok(Json(serde_json::json!({
         "object": "list",

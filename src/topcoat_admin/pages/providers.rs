@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use indexmap::IndexMap;
 
 use topcoat::{
     context::Cx,
@@ -14,8 +14,8 @@ use crate::topcoat_admin::app::require_admin;
 use crate::topcoat_admin::{
     escape_html, escape_inline_js_string, render_dialog, render_list, render_modal_backdrop,
     render_page, render_shared_scripts, render_shared_styles, render_sidebar,
-    render_theme_bootstrap, render_toast_container, trusted_html, DialogLayout, ListLayout,
-    PageLayout,
+    render_sidebar_bootstrap, render_theme_bootstrap, render_toast_container, trusted_html,
+    DialogLayout, ListLayout, PageLayout,
 };
 
 #[path_param]
@@ -30,6 +30,7 @@ pub async fn providers(cx: &Cx) -> Result {
     let shared_styles = render_shared_styles();
     let shared_scripts = render_shared_scripts();
     let theme_bootstrap = render_theme_bootstrap();
+    let sidebar_bootstrap = render_sidebar_bootstrap();
     let list_body: Result = view! { <div class="list-loading">"加载中..."</div> };
     let list_view = render_list(
         cx,
@@ -68,6 +69,7 @@ pub async fn providers(cx: &Cx) -> Result {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>RCPA Admin - 供应商</title>
     {theme_bootstrap}
+    {sidebar_bootstrap}
     <link rel="stylesheet" href="/_topcoat/tailwind.css">
     <script src="/_topcoat/htmx.min.js"></script>
     {}
@@ -79,6 +81,13 @@ pub async fn providers(cx: &Cx) -> Result {
         .model-badge.enabled .model-badge-dot {{ background: #10b981; }}
         .model-badge.disabled .model-badge-dot {{ background: rgba(113, 113, 122, 0.5); }}
         .modal-content:has(.provider-dialog) {{ width: min(63.75rem, calc(100vw - 2rem)); }}
+        .drag-handle {{ display: inline-flex; width: 44px; min-width: 44px; height: 44px; align-items: center; justify-content: center; border: 0; border-radius: 0.375rem; color: var(--muted-foreground); cursor: grab; touch-action: none; transition: background-color 150ms, color 150ms, opacity 150ms; }}
+        .drag-handle:hover:not(:disabled) {{ background: var(--muted); color: var(--foreground); }}
+        .drag-handle:focus-visible {{ outline: 2px solid var(--ring); outline-offset: 2px; }}
+        .drag-handle:disabled {{ cursor: not-allowed; opacity: 0.32; }}
+        [data-sortable-row].is-dragging {{ border-color: var(--ring); box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1); opacity: 0.72; }}
+        [data-sortable-row].is-dragging .drag-handle {{ cursor: grabbing; }}
+        @media (prefers-reduced-motion: reduce) {{ .drag-handle {{ transition: none; }} }}
     </style>
 </head>
 <body class="bg-zinc-50 text-zinc-900">
@@ -103,9 +112,142 @@ pub async fn providers(cx: &Cx) -> Result {
             Modal.load('/providers/' + encodeURIComponent(name) + '/copy');
         }}
 
+        let orderSaving = false;
+        let sortablePointer = null;
+
+        function saveOrder(url, ids, successMessage) {{
+            if (orderSaving) return;
+            orderSaving = true;
+            const orderHandles = Array.from(document.querySelectorAll('.drag-handle[data-persist-order]'));
+            orderHandles.forEach(handle => handle.disabled = true);
+            fetch(url, {{
+                method: 'PUT',
+                headers: {{ 'Content-Type': 'application/json' }},
+                credentials: 'include',
+                body: JSON.stringify({{ ids }})
+            }})
+            .then(async response => {{
+                if (response.status === 401) {{
+                    window.location.href = '/login';
+                    return null;
+                }}
+                const result = await response.json();
+                if (!response.ok) throw new Error(result?.error?.message || '调整顺序失败');
+                return result;
+            }})
+            .then(result => {{
+                if (!result) return;
+                Toast.success(successMessage);
+                refreshData('providers');
+            }})
+            .catch(error => {{
+                Toast.error(error.message);
+                refreshData('providers');
+            }})
+            .finally(() => {{
+                orderSaving = false;
+                orderHandles.forEach(handle => handle.disabled = false);
+            }});
+        }}
+
+        function commitSortableOrder(kind) {{
+            if (kind !== 'providers') return;
+            const ids = Array.from(document.querySelectorAll('[data-provider-order-id]'))
+                .map(row => row.dataset.providerOrderId);
+            saveOrder('/v1/admin/providers/order', ids, '供应商顺序已更新');
+        }}
+
+        function beginSortablePointer(event, handle, kind) {{
+            if (event.button !== 0 || handle.disabled || orderSaving) return;
+            const row = handle.closest('[data-sortable-row]');
+            if (!row) return;
+            sortablePointer = {{
+                pointerId: event.pointerId,
+                handle,
+                row,
+                container: row.parentElement,
+                startY: event.clientY,
+                moved: false,
+                kind
+            }};
+            handle.setPointerCapture(event.pointerId);
+        }}
+
+        function moveSortablePointer(event) {{
+            const state = sortablePointer;
+            if (!state || event.pointerId !== state.pointerId) return;
+            if (!state.moved && Math.abs(event.clientY - state.startY) < 6) return;
+            event.preventDefault();
+            state.moved = true;
+            state.row.classList.add('is-dragging');
+            const target = document.elementFromPoint(event.clientX, event.clientY)?.closest('[data-sortable-row]');
+            if (!target || target === state.row || target.parentElement !== state.container) return;
+            const bounds = target.getBoundingClientRect();
+            state.container.insertBefore(
+                state.row,
+                event.clientY < bounds.top + bounds.height / 2 ? target : target.nextSibling
+            );
+        }}
+
+        function endSortablePointer(event) {{
+            const state = sortablePointer;
+            if (!state || event.pointerId !== state.pointerId) return;
+            sortablePointer = null;
+            state.row.classList.remove('is-dragging');
+            if (state.handle.hasPointerCapture(event.pointerId)) {{
+                state.handle.releasePointerCapture(event.pointerId);
+            }}
+            if (state.moved) commitSortableOrder(state.kind);
+        }}
+
+        function moveSortableWithKeyboard(event, handle, kind) {{
+            if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return;
+            event.preventDefault();
+            const row = handle.closest('[data-sortable-row]');
+            if (!row) return;
+            const rows = Array.from(row.parentElement.children)
+                .filter(candidate => candidate.matches('[data-sortable-row]'));
+            const index = rows.indexOf(row);
+            const targetIndex = index + (event.key === 'ArrowUp' ? -1 : 1);
+            if (index < 0 || targetIndex < 0 || targetIndex >= rows.length) return;
+            if (targetIndex < index) row.parentElement.insertBefore(row, rows[targetIndex]);
+            else row.parentElement.insertBefore(row, rows[targetIndex].nextSibling);
+            handle.focus();
+            commitSortableOrder(kind);
+        }}
+
+        function removeFormRow(button) {{
+            const row = button.closest('[data-order-row]');
+            if (!row) return;
+            row.remove();
+        }}
+
+        function prepareListContainer(container) {{
+            container.querySelectorAll('[data-empty-state]').forEach(node => node.remove());
+        }}
+
+        function renumberFormRows(containerId, prefix) {{
+            const container = document.getElementById(containerId);
+            Array.from(container.querySelectorAll(':scope > [data-order-row]')).forEach((row, index) => {{
+                row.querySelectorAll('[name]').forEach(field => {{
+                    field.name = field.name.replace(
+                        new RegExp('^' + prefix + '\\[\\d+\\]'),
+                        prefix + '[' + index + ']'
+                    );
+                }});
+            }});
+        }}
+
+        function prepareProviderFormOrder() {{
+            renumberFormRows('endpoints-container', 'endpoints');
+            renumberFormRows('headers-container', 'headers');
+            renumberFormRows('models-container', 'models');
+        }}
+
         function submitProviderForm(event, method, url) {{
             event.preventDefault();
             const form = event.target;
+            prepareProviderFormOrder();
             const formData = new FormData(form);
             const data = {{}};
 
@@ -283,9 +425,10 @@ pub async fn providers_table(cx: &Cx) -> Result {
     }
 
     let mut html = String::new();
-    html.push_str(r##"<div class="overflow-x-auto"><table class="w-full min-w-[1040px] text-sm">
+    html.push_str(r##"<div class="overflow-x-auto"><table class="w-full min-w-[1080px] text-sm">
         <thead class="border-b border-zinc-200 bg-zinc-50">
             <tr>
+                <th class="w-12 px-2 py-3 text-left"><span class="sr-only">排序</span></th>
                 <th class="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-500">供应商名称</th>
                 <th class="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-500">Base URL</th>
                 <th class="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-zinc-500">支持协议</th>
@@ -322,7 +465,12 @@ pub async fn providers_table(cx: &Cx) -> Result {
         let _headers_json = serde_json::to_string(&provider.headers).unwrap_or_default();
 
         html.push_str(&format!(
-            r##"<tr class="hover:bg-zinc-50">
+            r##"<tr class="hover:bg-zinc-50" data-sortable-row data-provider-order-id="{}">
+                <td class="px-2 py-2">
+                    <button type="button" class="drag-handle" data-persist-order title="拖动调整顺序" aria-label="拖动调整供应商 {}" onpointerdown="beginSortablePointer(event, this, 'providers')" onpointermove="moveSortablePointer(event)" onpointerup="endSortablePointer(event)" onpointercancel="endSortablePointer(event)" onkeydown="moveSortableWithKeyboard(event, this, 'providers')">
+                        <svg class="h-5 w-5" aria-hidden="true" viewBox="0 0 24 24" fill="currentColor"><circle cx="9" cy="5" r="1.5"/><circle cx="15" cy="5" r="1.5"/><circle cx="9" cy="12" r="1.5"/><circle cx="15" cy="12" r="1.5"/><circle cx="9" cy="19" r="1.5"/><circle cx="15" cy="19" r="1.5"/></svg>
+                    </button>
+                </td>
                 <td class="max-w-[150px] px-4 py-3 font-mono text-xs font-medium" title="{}">
                     <span class="block truncate">{}</span>
                 </td>
@@ -359,6 +507,8 @@ pub async fn providers_table(cx: &Cx) -> Result {
                     </div>
                 </td>
             </tr>"##,
+            name_html,
+            name_html,
             name_html, name_html,
             render_endpoints(&provider.endpoints),
             render_protocol_badges(&provider.endpoints),
@@ -400,7 +550,7 @@ fn render_model_badges(provider_name: &str, models: &[crate::config::ModelRule])
         .map(|m| {
             let status = if m.status == "enabled" { "enabled" } else { "disabled" };
             format!(
-                r#"<button type="button" onclick="toggleModelStatus({}, {}, {})" class="model-badge {}" title="{}">
+                r#"<button type="button" onclick="toggleModelStatus({}, {}, {})" class="model-badge {}" title="切换模型状态：{}">
                     <span class="model-badge-dot"></span>{}
                 </button>"#,
                 escape_inline_js_string(provider_name),
@@ -418,7 +568,7 @@ fn render_model_badges(provider_name: &str, models: &[crate::config::ModelRule])
 #[page("/providers/new")]
 pub async fn providers_new(cx: &Cx) -> Result {
     require_admin(cx)?;
-    let empty_headers = HashMap::new();
+    let empty_headers = IndexMap::new();
     let html = render_provider_form(ProviderForm {
         name: "",
         api_key: "",
@@ -508,7 +658,7 @@ struct ProviderForm<'a> {
     priority: i64,
     endpoints: &'a [EndpointConfig],
     models: &'a [ModelRule],
-    headers: &'a HashMap<String, String>,
+    headers: &'a IndexMap<String, String>,
     method: &'a str,
     url: &'a str,
     name_readonly: bool,
@@ -570,45 +720,53 @@ fn render_provider_form(form: ProviderForm<'_>) -> String {
     } = form;
 
     let endpoints_html = if endpoints.is_empty() {
-        r#"<div class="rounded-lg border border-dashed border-zinc-300 py-5 text-center text-xs text-zinc-500">点击"添加 Endpoint"开始配置</div>"#.to_string()
+        r#"<div data-empty-state class="rounded-lg border border-dashed border-zinc-300 py-5 text-center text-xs text-zinc-500">点击"添加 Endpoint"开始配置</div>"#.to_string()
     } else {
         endpoints.iter().enumerate().map(|(i, ep)| {
             let protocol = ep.protocol.to_string();
-            format!(r#"<div class="grid grid-cols-12 gap-2 rounded-lg border border-zinc-200 bg-zinc-50/50 p-3">
-                <div class="col-span-4">
-                    <label class="mb-1 block text-[10px] text-zinc-500">协议</label>
-                    <select name="endpoints[{}][protocol]" class="h-9 w-full rounded-lg border border-zinc-200 bg-white px-2 text-sm">
-                        <option value="completions" {}>completions</option>
-                        <option value="responses" {}>responses</option>
-                        <option value="messages" {}>messages</option>
-                    </select>
+            format!(r#"<div data-order-row data-sortable-row class="flex gap-2 rounded-lg border border-zinc-200 bg-zinc-50/50 p-3">
+                <button type="button" class="drag-handle self-center" title="拖动调整顺序" aria-label="拖动调整 Endpoint" onpointerdown="beginSortablePointer(event, this, 'form')" onpointermove="moveSortablePointer(event)" onpointerup="endSortablePointer(event)" onpointercancel="endSortablePointer(event)" onkeydown="moveSortableWithKeyboard(event, this, 'form')">
+                    <svg class="h-5 w-5" aria-hidden="true" viewBox="0 0 24 24" fill="currentColor"><circle cx="9" cy="5" r="1.5"/><circle cx="15" cy="5" r="1.5"/><circle cx="9" cy="12" r="1.5"/><circle cx="15" cy="12" r="1.5"/><circle cx="9" cy="19" r="1.5"/><circle cx="15" cy="19" r="1.5"/></svg>
+                </button>
+                <div class="grid min-w-0 flex-1 grid-cols-12 gap-2">
+                    <div class="col-span-4">
+                        <label class="mb-1 block text-[10px] text-zinc-500">协议</label>
+                        <select name="endpoints[{}][protocol]" class="h-9 w-full rounded-lg border border-zinc-200 bg-white px-2 text-sm">
+                            <option value="completions" {}>completions</option>
+                            <option value="responses" {}>responses</option>
+                            <option value="messages" {}>messages</option>
+                            <option value="embeddings" {}>embeddings</option>
+                        </select>
+                    </div>
+                    <div class="col-span-8">
+                        <label class="mb-1 block text-[10px] text-zinc-500">Base URL</label>
+                        <input type="text" name="endpoints[{}][base_url]" value="{}" placeholder="https://api.openai.com" class="h-9 w-full rounded-lg border border-zinc-200 bg-white px-3 text-sm">
+                    </div>
                 </div>
-                <div class="col-span-7">
-                    <label class="mb-1 block text-[10px] text-zinc-500">Base URL</label>
-                    <input type="text" name="endpoints[{}][base_url]" value="{}" placeholder="https://api.openai.com" class="h-9 w-full rounded-lg border border-zinc-200 bg-white px-3 text-sm">
-                </div>
-                <div class="col-span-1 flex items-end">
-                    <button type="button" onclick="this.closest('.grid').remove()" class="inline-flex h-9 w-9 items-center justify-center rounded border border-red-200 text-red-600 hover:bg-red-50">
-                        <svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
-                    </button>
-                </div>
+                <button type="button" onclick="removeFormRow(this)" class="inline-flex min-h-[44px] min-w-[44px] self-end items-center justify-center rounded border border-red-200 text-red-600 hover:bg-red-50" title="删除 Endpoint" aria-label="删除 Endpoint">
+                    <svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+                </button>
             </div>"#,
                 i, if protocol == "completions" { "selected" } else { "" },
                 if protocol == "responses" { "selected" } else { "" },
                 if protocol == "messages" { "selected" } else { "" },
+                if protocol == "embeddings" { "selected" } else { "" },
                 i, escape_html(&ep.base_url)
             )
         }).collect::<Vec<_>>().join("")
     };
 
     let models_html = if models.is_empty() {
-        r#"<div class="rounded-lg border border-dashed border-zinc-300 py-5 text-center text-xs text-zinc-500">点击"添加模型"开始配置</div>"#.to_string()
+        r#"<div data-empty-state class="rounded-lg border border-dashed border-zinc-300 py-5 text-center text-xs text-zinc-500">点击"添加模型"开始配置</div>"#.to_string()
     } else {
         models.iter().enumerate().map(|(i, m)| {
             let input_price = m.pricing.as_ref().map(|pricing| pricing.input_per_1k.to_string()).unwrap_or_default();
             let output_price = m.pricing.as_ref().map(|pricing| pricing.output_per_1k.to_string()).unwrap_or_default();
             let aliases = m.aliases.join(", ");
-            format!(r#"<div class="flex items-end gap-2 rounded-lg border border-zinc-200 bg-zinc-50/50 p-3">
+            format!(r#"<div data-order-row data-sortable-row class="flex gap-2 rounded-lg border border-zinc-200 bg-zinc-50/50 p-3">
+                <button type="button" class="drag-handle self-center" title="拖动调整顺序" aria-label="拖动调整模型" onpointerdown="beginSortablePointer(event, this, 'form')" onpointermove="moveSortablePointer(event)" onpointerup="endSortablePointer(event)" onpointercancel="endSortablePointer(event)" onkeydown="moveSortableWithKeyboard(event, this, 'form')">
+                    <svg class="h-5 w-5" aria-hidden="true" viewBox="0 0 24 24" fill="currentColor"><circle cx="9" cy="5" r="1.5"/><circle cx="15" cy="5" r="1.5"/><circle cx="9" cy="12" r="1.5"/><circle cx="15" cy="12" r="1.5"/><circle cx="9" cy="19" r="1.5"/><circle cx="15" cy="19" r="1.5"/></svg>
+                </button>
                 <div class="grid flex-1 grid-cols-12 gap-2">
                     <div class="col-span-3">
                         <label class="mb-1 block text-[10px] text-zinc-500">模型名称 *</label>
@@ -634,7 +792,7 @@ fn render_provider_form(form: ProviderForm<'_>) -> String {
                         </select>
                     </div>
                 </div>
-                <button type="button" onclick="this.closest('.flex').remove()" class="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded border border-red-200 text-red-600 hover:bg-red-50">
+                <button type="button" onclick="removeFormRow(this)" class="inline-flex min-h-[44px] min-w-[44px] self-end items-center justify-center rounded border border-red-200 text-red-600 hover:bg-red-50" title="删除模型" aria-label="删除模型">
                     <svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
                 </button>
             </div>"#,
@@ -646,23 +804,26 @@ fn render_provider_form(form: ProviderForm<'_>) -> String {
     };
 
     let headers_html = if headers.is_empty() {
-        r#"<div class="rounded-lg border border-dashed border-zinc-300 py-5 text-center text-xs text-zinc-500">未配置自定义 Header</div>"#.to_string()
+        r#"<div data-empty-state class="rounded-lg border border-dashed border-zinc-300 py-5 text-center text-xs text-zinc-500">未配置自定义 Header</div>"#.to_string()
     } else {
         headers.iter().enumerate().map(|(i, (k, v))| {
-            format!(r#"<div class="grid grid-cols-12 gap-2 rounded-lg border border-zinc-200 bg-zinc-50/50 p-3">
-                <div class="col-span-4">
-                    <label class="mb-1 block text-[10px] text-zinc-500">Header 名称</label>
-                    <input type="text" name="headers[{}][name]" value="{}" placeholder="Authorization" class="h-9 w-full rounded-lg border border-zinc-200 bg-white px-3 font-mono text-sm">
+            format!(r#"<div data-order-row data-sortable-row class="flex gap-2 rounded-lg border border-zinc-200 bg-zinc-50/50 p-3">
+                <button type="button" class="drag-handle self-center" title="拖动调整顺序" aria-label="拖动调整 Header" onpointerdown="beginSortablePointer(event, this, 'form')" onpointermove="moveSortablePointer(event)" onpointerup="endSortablePointer(event)" onpointercancel="endSortablePointer(event)" onkeydown="moveSortableWithKeyboard(event, this, 'form')">
+                    <svg class="h-5 w-5" aria-hidden="true" viewBox="0 0 24 24" fill="currentColor"><circle cx="9" cy="5" r="1.5"/><circle cx="15" cy="5" r="1.5"/><circle cx="9" cy="12" r="1.5"/><circle cx="15" cy="12" r="1.5"/><circle cx="9" cy="19" r="1.5"/><circle cx="15" cy="19" r="1.5"/></svg>
+                </button>
+                <div class="grid min-w-0 flex-1 grid-cols-12 gap-2">
+                    <div class="col-span-4">
+                        <label class="mb-1 block text-[10px] text-zinc-500">Header 名称</label>
+                        <input type="text" name="headers[{}][name]" value="{}" placeholder="Authorization" class="h-9 w-full rounded-lg border border-zinc-200 bg-white px-3 font-mono text-sm">
+                    </div>
+                    <div class="col-span-8">
+                        <label class="mb-1 block text-[10px] text-zinc-500">Header 值</label>
+                        <input type="text" name="headers[{}][value]" value="{}" placeholder="Bearer ..." class="h-9 w-full rounded-lg border border-zinc-200 bg-white px-3 font-mono text-sm">
+                    </div>
                 </div>
-                <div class="col-span-7">
-                    <label class="mb-1 block text-[10px] text-zinc-500">Header 值</label>
-                    <input type="text" name="headers[{}][value]" value="{}" placeholder="Bearer ..." class="h-9 w-full rounded-lg border border-zinc-200 bg-white px-3 font-mono text-sm">
-                </div>
-                <div class="col-span-1 flex items-end">
-                    <button type="button" onclick="this.closest('.grid').remove()" class="inline-flex h-9 w-9 items-center justify-center rounded border border-red-200 text-red-600 hover:bg-red-50">
-                        <svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
-                    </button>
-                </div>
+                <button type="button" onclick="removeFormRow(this)" class="inline-flex min-h-[44px] min-w-[44px] self-end items-center justify-center rounded border border-red-200 text-red-600 hover:bg-red-50" title="删除 Header" aria-label="删除 Header">
+                    <svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+                </button>
             </div>"#, i, escape_html(k), i, escape_html(v))
         }).collect::<Vec<_>>().join("")
     };
@@ -749,26 +910,33 @@ fn render_provider_form(form: ProviderForm<'_>) -> String {
 
         function addEndpointRow() {{
             const container = document.getElementById('endpoints-container');
+            prepareListContainer(container);
             const div = document.createElement('div');
-            div.className = 'grid grid-cols-12 gap-2 rounded-lg border border-zinc-200 bg-zinc-50/50 p-3';
+            div.dataset.orderRow = '';
+            div.dataset.sortableRow = '';
+            div.className = 'flex gap-2 rounded-lg border border-zinc-200 bg-zinc-50/50 p-3';
             div.innerHTML = `
-                <div class="col-span-4">
-                    <label class="mb-1 block text-[10px] text-zinc-500">协议</label>
-                    <select name="endpoints[${{endpointIndex}}][protocol]" class="h-9 w-full rounded-lg border border-zinc-200 bg-white px-2 text-sm">
-                        <option value="completions">completions</option>
-                        <option value="responses">responses</option>
-                        <option value="messages">messages</option>
-                    </select>
+                <button type="button" class="drag-handle self-center" title="拖动调整顺序" aria-label="拖动调整 Endpoint" onpointerdown="beginSortablePointer(event, this, 'form')" onpointermove="moveSortablePointer(event)" onpointerup="endSortablePointer(event)" onpointercancel="endSortablePointer(event)" onkeydown="moveSortableWithKeyboard(event, this, 'form')">
+                    <svg class="h-5 w-5" aria-hidden="true" viewBox="0 0 24 24" fill="currentColor"><circle cx="9" cy="5" r="1.5"/><circle cx="15" cy="5" r="1.5"/><circle cx="9" cy="12" r="1.5"/><circle cx="15" cy="12" r="1.5"/><circle cx="9" cy="19" r="1.5"/><circle cx="15" cy="19" r="1.5"/></svg>
+                </button>
+                <div class="grid min-w-0 flex-1 grid-cols-12 gap-2">
+                    <div class="col-span-4">
+                        <label class="mb-1 block text-[10px] text-zinc-500">协议</label>
+                        <select name="endpoints[${{endpointIndex}}][protocol]" class="h-9 w-full rounded-lg border border-zinc-200 bg-white px-2 text-sm">
+                            <option value="completions">completions</option>
+                            <option value="responses">responses</option>
+                            <option value="messages">messages</option>
+                            <option value="embeddings">embeddings</option>
+                        </select>
+                    </div>
+                    <div class="col-span-8">
+                        <label class="mb-1 block text-[10px] text-zinc-500">Base URL</label>
+                        <input type="text" name="endpoints[${{endpointIndex}}][base_url]" placeholder="https://api.openai.com" class="h-9 w-full rounded-lg border border-zinc-200 bg-white px-3 text-sm">
+                    </div>
                 </div>
-                <div class="col-span-7">
-                    <label class="mb-1 block text-[10px] text-zinc-500">Base URL</label>
-                    <input type="text" name="endpoints[${{endpointIndex}}][base_url]" placeholder="https://api.openai.com" class="h-9 w-full rounded-lg border border-zinc-200 bg-white px-3 text-sm">
-                </div>
-                <div class="col-span-1 flex items-end">
-                    <button type="button" onclick="this.closest('.grid').remove()" class="inline-flex h-9 w-9 items-center justify-center rounded border border-red-200 text-red-600 hover:bg-red-50">
-                        <svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
-                    </button>
-                </div>
+                <button type="button" onclick="removeFormRow(this)" class="inline-flex min-h-[44px] min-w-[44px] self-end items-center justify-center rounded border border-red-200 text-red-600 hover:bg-red-50" title="删除 Endpoint" aria-label="删除 Endpoint">
+                    <svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+                </button>
             `;
             container.appendChild(div);
             endpointIndex++;
@@ -776,9 +944,15 @@ fn render_provider_form(form: ProviderForm<'_>) -> String {
 
         function addModelRow() {{
             const container = document.getElementById('models-container');
+            prepareListContainer(container);
             const div = document.createElement('div');
-            div.className = 'flex items-end gap-2 rounded-lg border border-zinc-200 bg-zinc-50/50 p-3';
+            div.dataset.orderRow = '';
+            div.dataset.sortableRow = '';
+            div.className = 'flex gap-2 rounded-lg border border-zinc-200 bg-zinc-50/50 p-3';
             div.innerHTML = `
+                <button type="button" class="drag-handle self-center" title="拖动调整顺序" aria-label="拖动调整模型" onpointerdown="beginSortablePointer(event, this, 'form')" onpointermove="moveSortablePointer(event)" onpointerup="endSortablePointer(event)" onpointercancel="endSortablePointer(event)" onkeydown="moveSortableWithKeyboard(event, this, 'form')">
+                    <svg class="h-5 w-5" aria-hidden="true" viewBox="0 0 24 24" fill="currentColor"><circle cx="9" cy="5" r="1.5"/><circle cx="15" cy="5" r="1.5"/><circle cx="9" cy="12" r="1.5"/><circle cx="15" cy="12" r="1.5"/><circle cx="9" cy="19" r="1.5"/><circle cx="15" cy="19" r="1.5"/></svg>
+                </button>
                 <div class="grid flex-1 grid-cols-12 gap-2">
                     <div class="col-span-3">
                         <label class="mb-1 block text-[10px] text-zinc-500">模型名称 *</label>
@@ -804,7 +978,7 @@ fn render_provider_form(form: ProviderForm<'_>) -> String {
                         </select>
                     </div>
                 </div>
-                <button type="button" onclick="this.closest('.flex').remove()" class="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded border border-red-200 text-red-600 hover:bg-red-50">
+                <button type="button" onclick="removeFormRow(this)" class="inline-flex min-h-[44px] min-w-[44px] self-end items-center justify-center rounded border border-red-200 text-red-600 hover:bg-red-50" title="删除模型" aria-label="删除模型">
                     <svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
                 </button>
             `;
@@ -814,22 +988,28 @@ fn render_provider_form(form: ProviderForm<'_>) -> String {
 
         function addHeaderRow() {{
             const container = document.getElementById('headers-container');
+            prepareListContainer(container);
             const div = document.createElement('div');
-            div.className = 'grid grid-cols-12 gap-2 rounded-lg border border-zinc-200 bg-zinc-50/50 p-3';
+            div.dataset.orderRow = '';
+            div.dataset.sortableRow = '';
+            div.className = 'flex gap-2 rounded-lg border border-zinc-200 bg-zinc-50/50 p-3';
             div.innerHTML = `
-                <div class="col-span-4">
-                    <label class="mb-1 block text-[10px] text-zinc-500">Header 名称</label>
-                    <input type="text" name="headers[${{headerIndex}}][name]" placeholder="Authorization" class="h-9 w-full rounded-lg border border-zinc-200 bg-white px-3 font-mono text-sm">
+                <button type="button" class="drag-handle self-center" title="拖动调整顺序" aria-label="拖动调整 Header" onpointerdown="beginSortablePointer(event, this, 'form')" onpointermove="moveSortablePointer(event)" onpointerup="endSortablePointer(event)" onpointercancel="endSortablePointer(event)" onkeydown="moveSortableWithKeyboard(event, this, 'form')">
+                    <svg class="h-5 w-5" aria-hidden="true" viewBox="0 0 24 24" fill="currentColor"><circle cx="9" cy="5" r="1.5"/><circle cx="15" cy="5" r="1.5"/><circle cx="9" cy="12" r="1.5"/><circle cx="15" cy="12" r="1.5"/><circle cx="9" cy="19" r="1.5"/><circle cx="15" cy="19" r="1.5"/></svg>
+                </button>
+                <div class="grid min-w-0 flex-1 grid-cols-12 gap-2">
+                    <div class="col-span-4">
+                        <label class="mb-1 block text-[10px] text-zinc-500">Header 名称</label>
+                        <input type="text" name="headers[${{headerIndex}}][name]" placeholder="Authorization" class="h-9 w-full rounded-lg border border-zinc-200 bg-white px-3 font-mono text-sm">
+                    </div>
+                    <div class="col-span-8">
+                        <label class="mb-1 block text-[10px] text-zinc-500">Header 值</label>
+                        <input type="text" name="headers[${{headerIndex}}][value]" placeholder="Bearer ..." class="h-9 w-full rounded-lg border border-zinc-200 bg-white px-3 font-mono text-sm">
+                    </div>
                 </div>
-                <div class="col-span-7">
-                    <label class="mb-1 block text-[10px] text-zinc-500">Header 值</label>
-                    <input type="text" name="headers[${{headerIndex}}][value]" placeholder="Bearer ..." class="h-9 w-full rounded-lg border border-zinc-200 bg-white px-3 font-mono text-sm">
-                </div>
-                <div class="col-span-1 flex items-end">
-                    <button type="button" onclick="this.closest('.grid').remove()" class="inline-flex h-9 w-9 items-center justify-center rounded border border-red-200 text-red-600 hover:bg-red-50">
-                        <svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
-                    </button>
-                </div>
+                <button type="button" onclick="removeFormRow(this)" class="inline-flex min-h-[44px] min-w-[44px] self-end items-center justify-center rounded border border-red-200 text-red-600 hover:bg-red-50" title="删除 Header" aria-label="删除 Header">
+                    <svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+                </button>
             `;
             container.appendChild(div);
             headerIndex++;

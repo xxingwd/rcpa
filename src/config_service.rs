@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use arc_swap::ArcSwap;
+use indexmap::IndexMap;
 use parking_lot::Mutex;
 use serde::Serialize;
 
@@ -62,7 +63,7 @@ pub struct ProviderView {
     pub api_key: String,
     pub models: Vec<ModelRule>,
     pub endpoints: Vec<EndpointConfig>,
-    pub headers: HashMap<String, String>,
+    pub headers: IndexMap<String, String>,
     pub status: String,
     pub priority: i64,
 }
@@ -75,7 +76,7 @@ pub struct AuthKeyView {
     pub status: String,
     pub labels: Option<String>,
     pub allowed_models: Vec<ModelRule>,
-    pub model_aliases: HashMap<String, String>,
+    pub model_aliases: IndexMap<String, String>,
     pub allowed_providers: Vec<String>,
 }
 
@@ -392,12 +393,6 @@ impl ConfigSnapshot {
                 }
             }
         }
-        values.sort_by(|left, right| {
-            left.provider_name
-                .cmp(&right.provider_name)
-                .then_with(|| left.target_model.cmp(&right.target_model))
-                .then_with(|| left.alias.cmp(&right.alias))
-        });
         values
     }
 
@@ -493,12 +488,6 @@ impl ConfigSnapshot {
             }
         }
 
-        values.sort_by(|left, right| {
-            left.provider_name
-                .cmp(&right.provider_name)
-                .then_with(|| left.model_name.cmp(&right.model_name))
-                .then_with(|| left.name.cmp(&right.name))
-        });
         values
     }
 
@@ -577,7 +566,7 @@ mod tests {
                     protocol: ProviderProtocol::Completions,
                     base_url: "https://api.example.com/v1/chat/completions".to_string(),
                 }],
-                headers: HashMap::new(),
+                headers: Default::default(),
                 status: "enabled".to_string(),
                 priority: 1,
             }],

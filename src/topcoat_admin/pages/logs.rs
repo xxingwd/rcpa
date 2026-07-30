@@ -9,8 +9,8 @@ use crate::topcoat_admin::app::{app_state, require_admin};
 use crate::topcoat_admin::{
     escape_html, escape_inline_js_string, format_duration_ms, format_shanghai_time_full,
     format_shanghai_time_short, render_list, render_page, render_shared_scripts,
-    render_shared_styles, render_sidebar, render_theme_bootstrap, render_toast_container,
-    trusted_html, ListLayout, PageLayout,
+    render_shared_styles, render_sidebar, render_sidebar_bootstrap, render_theme_bootstrap,
+    render_toast_container, trusted_html, ListLayout, PageLayout,
 };
 
 const PAGE_SIZE: i64 = 20;
@@ -149,6 +149,7 @@ pub async fn logs(cx: &Cx) -> Result {
     let shared_styles = render_shared_styles();
     let shared_scripts = render_shared_scripts();
     let theme_bootstrap = render_theme_bootstrap();
+    let sidebar_bootstrap = render_sidebar_bootstrap();
     let list_view = render_list(
         cx,
         ListLayout {
@@ -180,6 +181,7 @@ pub async fn logs(cx: &Cx) -> Result {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>RCPA Admin - 调用日志</title>
     {theme_bootstrap}
+    {sidebar_bootstrap}
     <link rel="stylesheet" href="/_topcoat/tailwind.css">
     <script src="/_topcoat/htmx.min.js"></script>
     {}

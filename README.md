@@ -41,6 +41,9 @@ Gateway settings live in `config.yaml`:
 - `providers[].endpoints[].protocol` values must be unique within a provider.
 - `providers[].models[].name` is the real upstream model name.
 - `providers[].models[].aliases` are the public model names exposed by RCPA.
+- Config-backed lists preserve their YAML order. The admin UI can reorder providers,
+  provider models, endpoints, headers, API keys, and key model rules; saving writes
+  the new order back to `config.yaml`.
 - Provider `priority` controls tiered routing: lower values are preferred first. Providers with the same `priority` are load-balanced round-robin. Degraded fallback also prefers lower priority values.
 - `keys[]` defines client API keys, allowed model rules, optional `allowed_providers`, and private `model_aliases`.
 - API keys use `model_aliases` for private aliases that point to an existing public model name.

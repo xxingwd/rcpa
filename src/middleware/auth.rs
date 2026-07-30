@@ -68,7 +68,6 @@ pub fn check_model_access_for_request(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
 
     use super::*;
 
@@ -81,7 +80,7 @@ mod tests {
                 .into_iter()
                 .map(crate::config::ModelRule::enabled)
                 .collect(),
-            model_aliases: HashMap::new(),
+            model_aliases: Default::default(),
             allowed_providers: Vec::new(),
             status: "enabled".to_string(),
             labels: None,

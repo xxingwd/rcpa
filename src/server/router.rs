@@ -42,6 +42,10 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
             get(crate::admin::list_providers).post(crate::admin::create_provider),
         )
         .route(
+            "/admin/providers/order",
+            put(crate::admin::reorder_providers),
+        )
+        .route(
             "/admin/providers/{name}",
             put(crate::admin::update_provider).delete(crate::admin::delete_provider),
         )
@@ -57,6 +61,7 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
             "/admin/keys",
             get(crate::admin::list_all_keys).post(crate::admin::create_key),
         )
+        .route("/admin/keys/order", put(crate::admin::reorder_keys))
         .route("/admin/keys/{id}", put(crate::admin::update_key))
         .route("/admin/keys/revoke/{id}", delete(crate::admin::delete_key))
         .route(
