@@ -688,6 +688,29 @@ async fn wait_for_request_logs(
         .unwrap()
 }
 
+async fn wait_for_completed_request_logs(
+    state: &Arc<rcpa::server::AppState>,
+    expected: usize,
+) -> Vec<rcpa::store::models::DbRequestLog> {
+    for _ in 0..40 {
+        let logs = state
+            .store
+            .query_request_logs(&rcpa::store::models::RequestLogFilter::default())
+            .await
+            .unwrap();
+        if logs.len() >= expected && logs.iter().all(|log| log.status != "running") {
+            return logs;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    state
+        .store
+        .query_request_logs(&rcpa::store::models::RequestLogFilter::default())
+        .await
+        .unwrap()
+}
+
 async fn state_from_config(config: AppConfig) -> Arc<rcpa::server::AppState> {
     let path = std::env::temp_dir().join(format!("rcpa-test-{}.yaml", uuid::Uuid::new_v4()));
     std::fs::write(&path, serde_yaml::to_string(&config).unwrap()).unwrap();
@@ -2615,6 +2638,63 @@ async fn test_retry_switches_to_different_provider_within_same_request() {
     assert_eq!(attempts[3]["status_code"], 200);
     assert_eq!(attempts[3]["retryable"], false);
     assert_eq!(attempts[3]["selected_via"], "healthy");
+}
+
+#[tokio::test]
+async fn test_streaming_terminal_event_completes_audit_before_client_closes_body() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use std::time::Duration;
+    use tower::ServiceExt;
+
+    let mock_base_url = spawn_lingering_streaming_openai_mock_provider().await;
+    let mut config = test_config();
+    config.providers = vec![provider(
+        "lingering-provider",
+        "completions",
+        &mock_base_url,
+        vec![enabled_model("gpt-4o")],
+    )];
+    config.keys.push(auth_key(
+        "stream-key",
+        "stream-secret-key",
+        vec![enabled_model("gpt-4o")],
+    ));
+
+    let state = state_from_config(config).await;
+    let app = rcpa::server::router::build(state.clone());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("x-api-key", "stream-secret-key")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hello"}]}"#,
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let mut body = res.into_body();
+    let frame = tokio::time::timeout(Duration::from_millis(300), body.frame())
+        .await
+        .expect("terminal SSE frame should arrive promptly")
+        .expect("stream should yield a frame")
+        .expect("stream frame should be readable");
+    let data = match frame.into_data() {
+        Ok(data) => data,
+        Err(_) => panic!("first stream frame should contain data"),
+    };
+    assert!(String::from_utf8_lossy(&data).contains("data: [DONE]"));
+    drop(body);
+
+    let logs = wait_for_completed_request_logs(&state, 1).await;
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].status, "success");
+    assert_eq!(logs[0].status_code, 200);
+    assert_eq!(logs[0].total_tokens, 5);
+    assert_eq!(logs[0].error_code, None);
 }
 
 #[tokio::test]

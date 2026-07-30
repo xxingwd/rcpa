@@ -142,6 +142,13 @@ fn trim_ascii_whitespace(mut value: &[u8]) -> &[u8] {
     value
 }
 
+fn is_terminal_stream_event(value: &serde_json::Value) -> bool {
+    matches!(
+        value.get("type").and_then(|event_type| event_type.as_str()),
+        Some("message_stop" | "response.completed")
+    )
+}
+
 fn trim_ascii_start(mut value: &[u8]) -> &[u8] {
     while value.first().is_some_and(u8::is_ascii_whitespace) {
         value = &value[1..];
@@ -2135,6 +2142,7 @@ struct StreamAudit {
     error_code: Option<String>,
     error_message: Option<String>,
     sse_buffer: Vec<u8>,
+    terminal_event_seen: bool,
     finished: bool,
 }
 
@@ -2193,11 +2201,12 @@ impl StreamAudit {
             error_code: None,
             error_message: None,
             sse_buffer: Vec::new(),
+            terminal_event_seen: false,
             finished: false,
         }
     }
 
-    fn observe_chunk(&mut self, chunk: &[u8]) {
+    fn observe_chunk(&mut self, chunk: &[u8]) -> bool {
         if !self.first_chunk_seen {
             self.first_chunk_seen = true;
             self.first_byte_latency_ms = self.start.elapsed().as_millis() as i64;
@@ -2217,6 +2226,8 @@ impl StreamAudit {
         if self.sse_buffer.len() > 256 * 1024 {
             self.sse_buffer.clear();
         }
+
+        self.terminal_event_seen
     }
 
     fn observe_sse_line(&mut self, line: &[u8]) {
@@ -2224,12 +2235,19 @@ impl StreamAudit {
             return;
         };
         let data = trim_ascii_whitespace(data);
-        if data.is_empty() || data == b"[DONE]" {
+        if data.is_empty() {
+            return;
+        }
+        if data == b"[DONE]" {
+            self.terminal_event_seen = true;
             return;
         }
         let Ok(value) = serde_json::from_slice::<serde_json::Value>(data) else {
             return;
         };
+        if is_terminal_stream_event(&value) {
+            self.terminal_event_seen = true;
+        }
         self.observe_json_event(&value);
     }
 
@@ -2482,7 +2500,7 @@ impl Stream for AuditedSseStream {
             match self.inner.as_mut().poll_next(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Some(Ok(chunk))) => {
-                    self.audit.observe_chunk(&chunk);
+                    let terminal_event_seen = self.audit.observe_chunk(&chunk);
                     let outputs = if let Some(transform) = self.transform.as_mut() {
                         transform.push_chunk(&chunk)
                     } else {
@@ -2494,6 +2512,9 @@ impl Stream for AuditedSseStream {
                         vec![output]
                     };
                     self.pending_output.extend(outputs);
+                    if terminal_event_seen {
+                        self.audit.finish(None);
+                    }
                     if let Some(output) = self.pending_output.pop_front() {
                         return Poll::Ready(Some(Ok(output)));
                     }
@@ -2731,6 +2752,21 @@ pub async fn proxy_to_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recognizes_json_stream_terminal_events() {
+        for event_type in ["message_stop", "response.completed"] {
+            assert!(is_terminal_stream_event(&serde_json::json!({
+                "type": event_type
+            })));
+        }
+
+        for event_type in ["message_delta", "response.output_text.done"] {
+            assert!(!is_terminal_stream_event(&serde_json::json!({
+                "type": event_type
+            })));
+        }
+    }
 
     #[test]
     fn test_rewrite_sse_model_single_event() {
