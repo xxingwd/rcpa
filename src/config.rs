@@ -435,16 +435,8 @@ impl AppConfig {
             if !seen_names.insert(provider.name.clone()) {
                 anyhow::bail!("Duplicate provider name '{}'", provider.name);
             }
-            let mut seen_model_names = HashSet::new();
             for model in &provider.models {
                 validate_model_name(&model.name, "provider model")?;
-                if !seen_model_names.insert(&model.name) {
-                    anyhow::bail!(
-                        "Provider '{}' defines duplicate model '{}'",
-                        provider.name,
-                        model.name
-                    );
-                }
                 match model.status.as_str() {
                     "enabled" | "disabled" => {}
                     other => anyhow::bail!(
@@ -538,16 +530,8 @@ impl AppConfig {
                     );
                 }
             }
-            let mut seen_key_models = HashSet::new();
             for model in &key.models {
                 validate_model_name(&model.name, "allowed model")?;
-                if !seen_key_models.insert(&model.name) {
-                    anyhow::bail!(
-                        "Auth key '{}' defines duplicate model rule '{}'",
-                        key.id,
-                        model.name
-                    );
-                }
                 match model.status.as_str() {
                     "enabled" | "disabled" => {}
                     other => anyhow::bail!(
@@ -1025,14 +1009,7 @@ keys: []
     }
 
     #[test]
-    fn test_validate_rejects_duplicate_order_identifiers() {
-        let mut config = test_config();
-        let mut provider = test_provider();
-        provider.models.push(ModelRule::enabled("gpt-4o"));
-        config.providers.push(provider);
-        let err = config.validate().unwrap_err().to_string();
-        assert!(err.contains("duplicate model 'gpt-4o'"));
-
+    fn test_validate_rejects_duplicate_key_ids() {
         let mut config = test_config();
         config.providers.push(test_provider());
         let key = AuthKey {
@@ -1048,9 +1025,25 @@ keys: []
         config.keys = vec![key.clone(), key];
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("Duplicate auth key id 'duplicate-key'"));
+    }
 
+    #[test]
+    fn test_validate_allows_duplicate_model_names_for_ordered_rules() {
         let mut config = test_config();
-        config.providers.push(test_provider());
+        let mut provider = test_provider();
+        provider.models.push(ModelRule {
+            name: "gpt-4o".into(),
+            status: "enabled".into(),
+            pricing: None,
+            aliases: vec!["gpt-4o-public-a".into()],
+        });
+        provider.models.push(ModelRule {
+            name: "gpt-4o".into(),
+            status: "enabled".into(),
+            pricing: None,
+            aliases: vec!["gpt-4o-public-b".into()],
+        });
+        config.providers.push(provider);
         config.keys.push(AuthKey {
             id: "key".into(),
             name: None,
@@ -1061,8 +1054,7 @@ keys: []
             status: "enabled".into(),
             labels: None,
         });
-        let err = config.validate().unwrap_err().to_string();
-        assert!(err.contains("duplicate model rule 'gpt-4o'"));
+        assert!(config.validate().is_ok());
     }
 
     #[test]
