@@ -553,3 +553,88 @@ async fn admin_pages_require_cookie_and_render_the_shared_rust_shell() {
     let _ = shutdown_tx.send(());
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn logs_table_shows_failure_label_instead_of_success_range_status_code() {
+    let state = Arc::new(AppState::from_config(empty_config()).await.unwrap());
+    // A legacy/interrupted record can carry a 2xx status_code while being
+    // persisted as failed; the table must never render a red success-range code.
+    state
+        .store
+        .insert_request_log_entry(NewRequestLog {
+            request_id: "legacy-failed-request",
+            api_key_id: "fixture-key",
+            session_hash: None,
+            provider_name: "fixture-provider",
+            protocol: "responses",
+            model: "upstream-model",
+            operation: "responses",
+            status_code: 200,
+            success: false,
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            cached_tokens: 0,
+            cache_write_tokens: 0,
+            cost_cents: 0,
+            latency_ms: 500,
+            first_byte_latency_ms: 500,
+            metadata_json: "{}",
+            request_body: None,
+            response_body: None,
+        })
+        .await
+        .unwrap();
+
+    let app = build_topcoat_app(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        topcoat::serve_until(listener, app, async {
+            let _ = shutdown_rx.await;
+        })
+        .await
+        .unwrap();
+    });
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let base = format!("http://{address}");
+
+    let login = client
+        .post(format!("{base}/v1/admin/login"))
+        .json(&serde_json::json!({ "token": "admin-token" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(login.status().is_success());
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    let logs_table = client
+        .get(format!("{base}/logs/table"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert!(logs_table.status().is_success());
+    let logs_table_html = logs_table.text().await.unwrap();
+    assert!(logs_table_html.contains(">失败</span>"));
+    assert!(logs_table_html.contains("badge-error"));
+    assert!(!logs_table_html.contains("badge-success"));
+    assert!(!logs_table_html.contains(">200</span>"));
+
+    let _ = shutdown_tx.send(());
+    server.await.unwrap();
+}

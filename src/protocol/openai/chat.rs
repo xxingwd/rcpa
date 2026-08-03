@@ -2299,7 +2299,12 @@ impl StreamAudit {
                     .then(|| format!("Streaming response returned {}", self.status_code))
             })
         });
-        let success = self.status_code < 400 && error_message.is_none();
+        // The success flag mirrors the HTTP status the client actually received.
+        // Upstream providers sometimes embed an error payload inside a 200 stream
+        // (e.g. Anthropic `event: error` frames) or the stream may be cut short;
+        // those errors are still recorded in the log metadata below, but a 2xx/3xx
+        // gateway response must never be persisted as "failed".
+        let success = self.status_code < 400;
         let latency = self.start.elapsed();
         let cost_cents = if success {
             calculate_cost_cents(

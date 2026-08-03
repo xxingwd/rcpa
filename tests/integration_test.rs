@@ -440,6 +440,43 @@ async fn spawn_streaming_openai_mock_provider() -> String {
     format!("http://{}/v1/chat/completions", addr)
 }
 
+/// Upstream that answers HTTP 200 but embeds an error event inside the SSE
+/// stream before [DONE] (Anthropic `event: error` frames behave this way).
+async fn spawn_error_event_streaming_openai_mock_provider() -> String {
+    use axum::{response::IntoResponse, routing::post, Json, Router};
+    use tokio::net::TcpListener;
+
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |Json(body): Json<serde_json::Value>| async move {
+            let model = body
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            (
+                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                format!(
+                    concat!(
+                        "data: {{\"id\":\"chatcmpl-stream\",\"object\":\"chat.completion.chunk\",\"model\":\"{model}\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"hello\"}},\"finish_reason\":null}}]}}\n\n",
+                        "data: {{\"error\":{{\"message\":\"upstream oops\",\"type\":\"server_error\",\"code\":\"upstream_error\"}}}}\n\n",
+                        "data: [DONE]\n\n"
+                    ),
+                    model = model
+                ),
+            )
+                .into_response()
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{}/v1/chat/completions", addr)
+}
+
 async fn spawn_lingering_streaming_openai_mock_provider() -> String {
     use axum::{body::Body, response::IntoResponse, routing::post, Json, Router};
     use bytes::Bytes;
@@ -2954,6 +2991,61 @@ async fn test_streaming_terminal_event_completes_audit_before_client_closes_body
     assert_eq!(logs[0].status_code, 200);
     assert_eq!(logs[0].total_tokens, 5);
     assert_eq!(logs[0].error_code, None);
+}
+
+#[tokio::test]
+async fn test_streaming_200_with_embedded_error_event_is_recorded_successful() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    // Upstream answers HTTP 200 but injects an error frame into the SSE stream.
+    // The gateway must still persist the request as successful (the client
+    // received 200) while keeping the upstream error in the log metadata.
+    let mock_base_url = spawn_error_event_streaming_openai_mock_provider().await;
+    let mut config = test_config();
+    config.providers = vec![provider(
+        "error-event-provider",
+        "completions",
+        &mock_base_url,
+        vec![enabled_model("gpt-4o")],
+    )];
+    config.keys.push(auth_key(
+        "stream-key",
+        "stream-secret-key",
+        vec![enabled_model("gpt-4o")],
+    ));
+
+    let state = state_from_config(config).await;
+    let app = rcpa::server::router::build(state.clone());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("x-api-key", "stream-secret-key")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hello"}]}"#,
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let body_bytes = axum::body::to_bytes(res.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body = String::from_utf8(body_bytes.to_vec()).unwrap();
+    assert!(body.contains("\"content\":\"hello\""));
+    assert!(body.contains("data: [DONE]"));
+
+    let logs = wait_for_completed_request_logs(&state, 1).await;
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].status, "success");
+    assert_eq!(logs[0].success, 1);
+    assert_eq!(logs[0].status_code, 200);
+    // The upstream error is preserved for the log detail view even though the
+    // request itself is counted as successful.
+    assert_eq!(logs[0].error_code.as_deref(), Some("upstream_error"));
+    assert_eq!(logs[0].error.as_deref(), Some("upstream oops"));
 }
 
 #[tokio::test]

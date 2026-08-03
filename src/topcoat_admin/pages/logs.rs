@@ -403,6 +403,14 @@ pub async fn logs(cx: &Cx) -> Result {
             const log = d.log || d;
             const isRunning = log.status === 'running';
             const isErr = !isRunning && log.status !== 'success';
+            let statusDisplay;
+            if (isRunning) {{
+                statusDisplay = log.retry_count > 0 ? '重试中' : '处理中';
+            }} else if (isErr && log.status_code < 400) {{
+                statusDisplay = (log.status === 'interrupted' ? '中断' : '失败') + ' (' + log.status_code + ')';
+            }} else {{
+                statusDisplay = log.status_code;
+            }}
             const firstByte = log.first_byte_latency_ms || 0;
             const inputTokens = log.input_tokens || 0;
             const outputTokens = log.output_tokens || 0;
@@ -421,7 +429,7 @@ pub async fn logs(cx: &Cx) -> Result {
                 <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
                     <div class="rounded-lg border bg-zinc-50 p-3">
                         <div class="text-[0.65rem] uppercase tracking-wider text-zinc-500 mb-1">状态码</div>
-                        <div class="font-mono text-sm ${{isRunning ? 'text-amber-700' : (isErr ? 'text-red-600' : 'text-emerald-600')}}">${{isRunning ? (log.retry_count > 0 ? '重试中' : '处理中') : log.status_code}}</div>
+                        <div class="font-mono text-sm ${{isRunning ? 'text-amber-700' : (isErr ? 'text-red-600' : 'text-emerald-600')}}">${{statusDisplay}}</div>
                     </div>
                     <div class="rounded-lg border bg-zinc-50 p-3">
                         <div class="text-[0.65rem] uppercase tracking-wider text-zinc-500 mb-1">耗时</div>
@@ -659,7 +667,18 @@ pub async fn logs_table(cx: &Cx) -> Result {
                     },
                 )
             } else if is_err {
-                ("badge-error", log.status_code.to_string())
+                // A failure with a 2xx/3xx code is not a real HTTP error; show the
+                // failure reason instead of a misleading success-range code.
+                let label = if log.status_code < 400 {
+                    if log.status == "interrupted" {
+                        "中断".to_string()
+                    } else {
+                        "失败".to_string()
+                    }
+                } else {
+                    log.status_code.to_string()
+                };
+                ("badge-error", label)
             } else {
                 ("badge-success", log.status_code.to_string())
             };
