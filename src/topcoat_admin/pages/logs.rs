@@ -82,6 +82,13 @@ fn logs_actions() -> String {
     <select id="filter-protocol" class="filter-select w-28">
         <option value="all">全部协议</option>
     </select>
+    <select id="filter-status" class="filter-select w-28">
+        <option value="all">全部状态</option>
+        <option value="success">成功</option>
+        <option value="failed">失败</option>
+        <option value="running">处理中</option>
+        <option value="interrupted">中断</option>
+    </select>
     <select id="filter-refresh" class="filter-select w-24">
         <option value="1000">1秒刷新</option>
         <option value="5000">5秒刷新</option>
@@ -315,6 +322,7 @@ pub async fn logs(cx: &Cx) -> Result {
             const model = document.getElementById('filter-model').value;
             const provider = document.getElementById('filter-provider').value;
             const protocol = document.getElementById('filter-protocol').value;
+            const status = document.getElementById('filter-status').value;
             const params = new URLSearchParams({{
                 page: page.toString(),
                 limit: '20',
@@ -322,6 +330,7 @@ pub async fn logs(cx: &Cx) -> Result {
                 model: model === 'all' ? '' : model,
                 provider_name: provider === 'all' ? '' : provider,
                 protocol: protocol === 'all' ? '' : protocol,
+                status: status === 'all' ? '' : status,
             }});
             return fetch('/logs/table?' + params.toString(), {{ signal: request.signal }})
                 .then(r => {{
@@ -567,7 +576,7 @@ pub async fn logs(cx: &Cx) -> Result {
                     loadPage(currentPage);
                 }}
             }});
-            ['filter-key', 'filter-model', 'filter-provider', 'filter-protocol'].forEach((id) => {{
+            ['filter-key', 'filter-model', 'filter-provider', 'filter-protocol', 'filter-status'].forEach((id) => {{
                 document.getElementById(id).addEventListener('change', () => loadPage(1));
             }});
             loadFilterOptions().finally(() => {{
@@ -575,6 +584,7 @@ pub async fn logs(cx: &Cx) -> Result {
                 document.getElementById('filter-model').value = query.get('model') || 'all';
                 document.getElementById('filter-provider').value = query.get('provider_name') || 'all';
                 document.getElementById('filter-protocol').value = query.get('protocol') || 'all';
+                document.getElementById('filter-status').value = query.get('status') || 'all';
                 loadPage(Math.max(1, parseInt(query.get('page')) || 1));
             }});
         }});
@@ -611,7 +621,7 @@ pub async fn logs_table(cx: &Cx) -> Result {
         model: get_param(&params, "model"),
         provider_name: get_param(&params, "provider_name"),
         protocol: get_param(&params, "protocol"),
-        status: None,
+        status: get_param(&params, "status"),
         status_code: None,
         success: None,
         limit: Some(limit),

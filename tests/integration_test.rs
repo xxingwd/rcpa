@@ -1870,6 +1870,65 @@ async fn test_admin_api_endpoints() {
     assert_eq!(items[0]["api_key_id"], "key-alpha");
     assert_eq!(filtered_logs["total"], 1);
 
+    state
+        .store
+        .insert_request_log_entry(NewRequestLog {
+            request_id: "req-admin-filter-3",
+            api_key_id: "key-gamma",
+            session_hash: None,
+            provider_name: "openai-1",
+            protocol: "completions",
+            model: "gpt-4o",
+            operation: "completions",
+            status_code: 500,
+            success: false,
+            input_tokens: 10,
+            output_tokens: 0,
+            total_tokens: 10,
+            cached_tokens: 0,
+            cache_write_tokens: 0,
+            cost_cents: 2,
+            latency_ms: 80,
+            first_byte_latency_ms: 80,
+            metadata_json: "{}",
+            request_body: None,
+            response_body: None,
+        })
+        .await
+        .unwrap();
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/v1/admin/logs?limit=10&status=failed")
+        .header("x-admin-token", "admin-token")
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(res.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let failed_logs: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    let items = failed_logs["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["status"], "failed");
+    assert_eq!(failed_logs["total"], 1);
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/v1/admin/logs?limit=10&status=success")
+        .header("x-admin-token", "admin-token")
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(res.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let success_logs: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(success_logs["items"].as_array().unwrap().len(), 2);
+    assert_eq!(success_logs["total"], 2);
+
     let req = Request::builder()
         .method("GET")
         .uri(
@@ -1884,13 +1943,13 @@ async fn test_admin_api_endpoints() {
         .await
         .unwrap();
     let dashboard: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-    assert_eq!(dashboard["total"]["request_count"], 2);
+    assert_eq!(dashboard["total"]["request_count"], 3);
     assert_eq!(dashboard["by_model"].as_array().unwrap().len(), 2);
-    assert_eq!(dashboard["by_model"][0]["success_rate"], 1.0);
-    assert_eq!(dashboard["by_key"].as_array().unwrap().len(), 2);
+    assert_eq!(dashboard["by_model"][0]["success_rate"], 0.5);
+    assert_eq!(dashboard["by_key"].as_array().unwrap().len(), 3);
     assert_eq!(dashboard["by_provider"].as_array().unwrap().len(), 1);
     assert_eq!(dashboard["by_protocol"].as_array().unwrap().len(), 1);
-    assert_eq!(dashboard["by_status_code"].as_array().unwrap().len(), 1);
+    assert_eq!(dashboard["by_status_code"].as_array().unwrap().len(), 2);
     assert_eq!(dashboard["timeline"].as_array().unwrap().len(), 1);
 }
 
