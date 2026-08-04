@@ -564,6 +564,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_queries_use_created_at_composite_indexes() {
+        let store = Store::open_in_memory().await.unwrap();
+        insert_sample_logs(&store).await;
+
+        async fn assert_plan_uses_index(store: &Store, where_clause: &str, expected_index: &str) {
+            assert_plan_uses_any_index(store, where_clause, &[expected_index]).await;
+        }
+
+        async fn assert_plan_uses_any_index(
+            store: &Store,
+            where_clause: &str,
+            expected_indexes: &[&str],
+        ) {
+            let query = format!(
+                "EXPLAIN QUERY PLAN SELECT {fields} FROM request_logs l WHERE 1 = 1 AND {where_clause} ORDER BY l.created_at DESC LIMIT 20 OFFSET 0",
+                fields = super::REQUEST_LOG_SELECT_FIELDS
+            );
+            let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(&query)
+                .bind("gpt-4")
+                .fetch_all(&store.pool)
+                .await
+                .unwrap();
+            let details: Vec<String> = plan
+                .iter()
+                .map(|(_, _, _, detail)| detail.clone())
+                .collect();
+            assert!(
+                expected_indexes
+                    .iter()
+                    .any(|expected| details.iter().any(|detail| detail.contains(expected))),
+                "query did not use any of {expected_indexes:?}: {details:?}"
+            );
+            assert!(
+                !details.iter().any(|detail| detail.contains("TEMP B-TREE")),
+                "query still sorts with a temp b-tree: {details:?}"
+            );
+        }
+
+        assert_plan_uses_index(&store, "l.model = ?", "idx_request_logs_model_created_at").await;
+        assert_plan_uses_index(
+            &store,
+            "l.api_key_id = ?",
+            "idx_request_logs_api_key_created_at",
+        )
+        .await;
+        assert_plan_uses_index(
+            &store,
+            "l.provider_name = ?",
+            "idx_request_logs_provider_created_at",
+        )
+        .await;
+        assert_plan_uses_index(
+            &store,
+            "l.protocol = ?",
+            "idx_request_logs_protocol_created_at",
+        )
+        .await;
+        // 状态筛选可走 body GC 的 (status, created_at) 索引；小表上优化器也可能选
+        // analytics 覆盖索引（created_at 开头，按时间倒序扫描可提前停止），
+        // 两者都不产生临时排序。
+        assert_plan_uses_any_index(
+            &store,
+            "l.status = ?",
+            &[
+                "idx_request_logs_body_gc",
+                "idx_request_logs_analytics_created_at",
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn test_get_request_log_detail() {
         let store = Store::open_in_memory().await.unwrap();
         insert_sample_logs(&store).await;
