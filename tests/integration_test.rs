@@ -1340,7 +1340,7 @@ async fn test_responses_prefers_native_endpoint_before_conversion() {
 }
 
 #[tokio::test]
-async fn test_responses_does_not_fall_back_to_chat_completions() {
+async fn test_responses_falls_back_to_chat_completions() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
@@ -1373,18 +1373,94 @@ async fn test_responses_does_not_fall_back_to_chat_completions() {
         ))
         .unwrap();
     let res = app.oneshot(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    assert_eq!(res.status(), StatusCode::OK);
     let body_bytes = axum::body::to_bytes(res.into_body(), 1024 * 1024)
         .await
         .unwrap();
     let response: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-    assert_eq!(response["error"]["code"], "model_not_found");
+    assert_eq!(response["object"], "response");
+    assert_eq!(response["model"], "gpt-4o");
+    assert_eq!(response["status"], "completed");
+    assert_eq!(response["output"][0]["type"], "message");
+    assert_eq!(response["output"][0]["content"][0]["type"], "output_text");
+    assert_eq!(response["output"][0]["content"][0]["text"], "ok");
+    assert_eq!(response["usage"]["input_tokens"], 5);
+    assert_eq!(response["usage"]["output_tokens"], 7);
+    // The request log metadata records the upstream protocol translation.
+    let logs = wait_for_request_logs(&state, 1).await;
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].provider_name, "chat-only");
+    assert_eq!(logs[0].protocol, "completions");
+    assert_eq!(logs[0].operation, "responses");
+    assert!(logs[0].meta.contains("\"target_protocol\":\"completions\""));
+    assert!(logs[0]
+        .meta
+        .contains("\"target_operation\":\"completions\""));
+    assert!(logs[0].meta.contains("\"upstream_base_url\":"));
+}
+
+#[tokio::test]
+async fn test_responses_streaming_falls_back_to_chat_completions() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let mock_base_url = spawn_streaming_openai_mock_provider().await;
+
+    let mut config = test_config();
+    config.providers = vec![provider(
+        "chat-only",
+        "completions",
+        &mock_base_url,
+        vec![enabled_model("gpt-4o")],
+    )];
+    config.keys.push(auth_key(
+        "user-key",
+        "user-secret-key",
+        vec![enabled_model("gpt-4o")],
+    ));
+
+    let state = state_from_config(config).await;
+    let app = rcpa::server::router::build(state.clone());
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header("x-api-key", "user-secret-key")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"model":"gpt-4o","input":"hello","stream":true}"#,
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+    let body_bytes = axum::body::to_bytes(res.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body = String::from_utf8(body_bytes.to_vec()).unwrap();
+    assert!(body.contains("event: response.created"));
+    assert!(body.contains("event: response.output_text.delta"));
+    assert!(body.contains("\"delta\":\"hello\""));
+    assert!(body.contains("event: response.output_text.done"));
+    assert!(body.contains("event: response.completed"));
+    assert!(body.contains("\"status\":\"completed\""));
+    assert!(!body.contains("[DONE]"));
 
     let logs = wait_for_request_logs(&state, 1).await;
     assert_eq!(logs.len(), 1);
-    assert_eq!(logs[0].provider_name, "unrouted");
-    assert_eq!(logs[0].protocol, "responses");
+    assert_eq!(logs[0].provider_name, "chat-only");
+    assert_eq!(logs[0].protocol, "completions");
     assert_eq!(logs[0].operation, "responses");
+    assert!(logs[0].meta.contains("\"target_protocol\":\"completions\""));
+    assert!(logs[0]
+        .meta
+        .contains("\"target_operation\":\"completions\""));
 }
 
 #[tokio::test]

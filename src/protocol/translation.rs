@@ -15,7 +15,10 @@ pub fn candidate_protocols(operation: Operation, _stream: bool) -> Vec<ProviderP
         Operation::Messages => {
             vec![ProviderProtocol::Messages, ProviderProtocol::Completions]
         }
-        Operation::Responses | Operation::Embeddings | Operation::ListModels => vec![native],
+        Operation::Responses => {
+            vec![ProviderProtocol::Responses, ProviderProtocol::Completions]
+        }
+        Operation::Embeddings | Operation::ListModels => vec![native],
     }
 }
 
@@ -31,6 +34,7 @@ pub fn operation_for_target(
     match (source_operation, target_protocol) {
         (Operation::Completions, ProviderProtocol::Messages) => Some(Operation::Messages),
         (Operation::Messages, ProviderProtocol::Completions) => Some(Operation::Completions),
+        (Operation::Responses, ProviderProtocol::Completions) => Some(Operation::Completions),
         _ => None,
     }
 }
@@ -52,6 +56,9 @@ pub fn translate_request_body(
         }
         (Operation::Messages, ProviderProtocol::Completions) => {
             Ok(messages_to_chat_completions_request(body, model, stream))
+        }
+        (Operation::Responses, ProviderProtocol::Completions) => {
+            Ok(responses_to_chat_completions_request(body, model, stream))
         }
         _ => Err(AppError::ProtocolError(format!(
             "Protocol conversion from '{}' to '{}' is not supported",
@@ -77,6 +84,9 @@ pub fn translate_response_body(
         }
         (ProviderProtocol::Messages, Operation::Completions) => {
             Ok(messages_to_chat_completions_response(&body, public_model))
+        }
+        (ProviderProtocol::Completions, Operation::Responses) => {
+            Ok(chat_completions_to_responses_response(&body, public_model))
         }
         _ => Err(AppError::ProtocolError(format!(
             "Protocol response conversion from '{}' to '{}' is not supported",
@@ -189,6 +199,222 @@ fn chat_completions_to_messages_request(
     }
 
     serde_json::Value::Object(out)
+}
+
+/// Convert an OpenAI Responses API request into a chat/completions request.
+///
+/// Maps `instructions` to a system message, `input` items (messages,
+/// function calls, tool results) to chat messages, and renames
+/// `max_output_tokens` to `max_tokens`. Unsupported Responses-only fields
+/// (e.g. `store`, `previous_response_id`, `include`) are dropped.
+fn responses_to_chat_completions_request(
+    body: &serde_json::Value,
+    model: &str,
+    stream: bool,
+) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    out.insert(
+        "model".to_string(),
+        serde_json::Value::String(model.to_string()),
+    );
+    out.insert("stream".to_string(), serde_json::Value::Bool(stream));
+
+    let mut messages = Vec::new();
+    if let Some(instructions) = body.get("instructions") {
+        let text = responses_content_to_text(instructions);
+        if !text.is_empty() {
+            messages.push(serde_json::json!({
+                "role": "system",
+                "content": text
+            }));
+        }
+    }
+    if let Some(input) = body.get("input") {
+        messages.extend(responses_input_to_chat_messages(input));
+    }
+    if !messages.is_empty() {
+        out.insert("messages".to_string(), serde_json::Value::Array(messages));
+    }
+
+    copy_field(body, &mut out, "temperature", "temperature");
+    copy_field(body, &mut out, "top_p", "top_p");
+    copy_field(body, &mut out, "metadata", "metadata");
+    copy_field(body, &mut out, "user", "user");
+    copy_field(body, &mut out, "parallel_tool_calls", "parallel_tool_calls");
+    if let Some(max_output_tokens) = body.get("max_output_tokens") {
+        out.insert("max_tokens".to_string(), max_output_tokens.clone());
+    }
+    if let Some(tools) = body.get("tools") {
+        out.insert("tools".to_string(), responses_tools_to_openai_tools(tools));
+    }
+    if let Some(tool_choice) = body.get("tool_choice") {
+        out.insert(
+            "tool_choice".to_string(),
+            responses_tool_choice_to_openai(tool_choice),
+        );
+    }
+
+    serde_json::Value::Object(out)
+}
+
+/// Convert a Responses API `input` (string or item array) into chat messages.
+fn responses_input_to_chat_messages(input: &serde_json::Value) -> Vec<serde_json::Value> {
+    match input {
+        serde_json::Value::String(text) => vec![serde_json::json!({
+            "role": "user",
+            "content": text
+        })],
+        serde_json::Value::Array(items) => {
+            let mut messages = Vec::new();
+            // Accumulate consecutive `function_call` items into one assistant
+            // message with parallel `tool_calls` (mirrors how the Responses
+            // API groups an assistant tool turn).
+            let mut pending_assistant: Option<serde_json::Value> = None;
+            for item in items {
+                match item.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                    "message" => {
+                        if let Some(assistant) = pending_assistant.take() {
+                            messages.push(assistant);
+                        }
+                        let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+                        let content = responses_content_to_openai_content(
+                            item.get("content").unwrap_or(&serde_json::Value::Null),
+                        );
+                        messages.push(serde_json::json!({
+                            "role": if role == "assistant" { "assistant" } else { "user" },
+                            "content": content
+                        }));
+                    }
+                    "function_call" => {
+                        let entry = pending_assistant.get_or_insert_with(|| {
+                            serde_json::json!({
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": []
+                            })
+                        });
+                        let tool_calls = entry
+                            .get_mut("tool_calls")
+                            .and_then(|value| value.as_array_mut())
+                            .expect("tool_calls array");
+                        tool_calls.push(serde_json::json!({
+                            "id": item.get("call_id").and_then(|v| v.as_str()).unwrap_or("call_0"),
+                            "type": "function",
+                            "function": {
+                                "name": item.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                                "arguments": item.get("arguments").and_then(|v| v.as_str()).unwrap_or("")
+                            }
+                        }));
+                    }
+                    "function_call_output" => {
+                        if let Some(assistant) = pending_assistant.take() {
+                            messages.push(assistant);
+                        }
+                        messages.push(serde_json::json!({
+                            "role": "tool",
+                            "tool_call_id": item.get("call_id").and_then(|v| v.as_str()).unwrap_or(""),
+                            "content": item.get("output").and_then(|v| v.as_str()).unwrap_or("")
+                        }));
+                    }
+                    // `reasoning`, `web_search_call`, ... have no chat
+                    // completions equivalent and are dropped.
+                    _ => {}
+                }
+            }
+            if let Some(assistant) = pending_assistant.take() {
+                messages.push(assistant);
+            }
+            messages
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn responses_content_to_text(content: &serde_json::Value) -> String {
+    match content {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(|v| v.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+fn responses_content_to_openai_content(content: &serde_json::Value) -> serde_json::Value {
+    match content {
+        serde_json::Value::String(text) => serde_json::Value::String(text.clone()),
+        serde_json::Value::Array(parts) => {
+            let converted: Vec<serde_json::Value> = parts
+                .iter()
+                .filter_map(responses_content_part_to_openai)
+                .collect();
+            if converted.len() == 1 {
+                if let Some(text) = converted[0].get("text").and_then(|v| v.as_str()) {
+                    return serde_json::Value::String(text.to_string());
+                }
+            }
+            serde_json::Value::Array(converted)
+        }
+        _ => serde_json::Value::String(String::new()),
+    }
+}
+
+fn responses_content_part_to_openai(part: &serde_json::Value) -> Option<serde_json::Value> {
+    match part.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+        "input_text" | "output_text" => Some(serde_json::json!({
+            "type": "text",
+            "text": part.get("text").and_then(|v| v.as_str()).unwrap_or("")
+        })),
+        "input_image" => Some(serde_json::json!({
+            "type": "image_url",
+            "image_url": {
+                "url": part.get("image_url").and_then(|v| v.as_str()).unwrap_or("")
+            }
+        })),
+        _ => None,
+    }
+}
+
+fn responses_tools_to_openai_tools(tools: &serde_json::Value) -> serde_json::Value {
+    serde_json::Value::Array(
+        tools
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|tool| {
+                if tool.get("type").and_then(|value| value.as_str()) != Some("function") {
+                    return None;
+                }
+                Some(serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": tool.get("name").and_then(|value| value.as_str()).unwrap_or(""),
+                        "description": tool.get("description").and_then(|value| value.as_str()).unwrap_or(""),
+                        "parameters": tool.get("parameters").cloned().unwrap_or_else(|| serde_json::json!({ "type": "object" }))
+                    }
+                }))
+            })
+            .collect(),
+    )
+}
+
+fn responses_tool_choice_to_openai(tool_choice: &serde_json::Value) -> serde_json::Value {
+    match tool_choice {
+        serde_json::Value::String(_) => tool_choice.clone(),
+        serde_json::Value::Object(_)
+            if tool_choice.get("type").and_then(|value| value.as_str()) == Some("function") =>
+        {
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": tool_choice.get("name").and_then(|value| value.as_str()).unwrap_or("")
+                }
+            })
+        }
+        _ => tool_choice.clone(),
+    }
 }
 
 fn chat_message_to_anthropic_messages(message: &serde_json::Value) -> Vec<serde_json::Value> {
@@ -776,12 +1002,154 @@ fn openai_finish_reason_to_anthropic(reason: Option<&str>) -> &'static str {
     }
 }
 
+/// Convert a chat/completions response into an OpenAI Responses API response.
+fn chat_completions_to_responses_response(
+    body: &serde_json::Value,
+    public_model: &str,
+) -> serde_json::Value {
+    let message = body
+        .pointer("/choices/0/message")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({ "role": "assistant", "content": "" }));
+    let finish_reason = body
+        .pointer("/choices/0/finish_reason")
+        .and_then(|v| v.as_str());
+
+    let mut output: Vec<serde_json::Value> = Vec::new();
+
+    if let Some(reasoning) = message
+        .get("reasoning")
+        .or_else(|| message.get("reasoning_content"))
+    {
+        let text = message_content_to_output_text(reasoning);
+        if !text.is_empty() {
+            output.push(serde_json::json!({
+                "id": "rs_converted",
+                "type": "reasoning",
+                "status": "completed",
+                "summary": [],
+                "content": [{ "type": "reasoning_text", "text": text }]
+            }));
+        }
+    }
+
+    let content_text =
+        message_content_to_output_text(message.get("content").unwrap_or(&serde_json::Value::Null));
+    let tool_calls = message
+        .get("tool_calls")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    if tool_calls.is_empty() || !content_text.is_empty() {
+        output.push(serde_json::json!({
+            "id": "msg_converted",
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{
+                "type": "output_text",
+                "text": content_text,
+                "annotations": []
+            }]
+        }));
+    }
+    for (index, tool_call) in tool_calls.iter().enumerate() {
+        output.push(serde_json::json!({
+            "id": format!("fc_converted_{}", index),
+            "type": "function_call",
+            "status": "completed",
+            "call_id": tool_call.get("id").and_then(|v| v.as_str()).unwrap_or("call_0"),
+            "name": tool_call.pointer("/function/name").and_then(|v| v.as_str()).unwrap_or(""),
+            "arguments": tool_call.pointer("/function/arguments").and_then(|v| v.as_str()).unwrap_or("")
+        }));
+    }
+
+    let status = match finish_reason {
+        Some("length" | "content_filter") => "incomplete",
+        _ => "completed",
+    };
+    let incomplete_details = match finish_reason {
+        Some("length") => serde_json::json!({ "reason": "max_output_tokens" }),
+        Some("content_filter") => serde_json::json!({ "reason": "content_filter" }),
+        _ => serde_json::Value::Null,
+    };
+
+    serde_json::json!({
+        "id": body.get("id")
+            .and_then(|v| v.as_str())
+            .map(|id| format!("resp_{}", id))
+            .unwrap_or_else(|| "resp_converted".to_string()),
+        "object": "response",
+        "created_at": chrono::Utc::now().timestamp(),
+        "status": status,
+        "error": serde_json::Value::Null,
+        "incomplete_details": incomplete_details,
+        "instructions": serde_json::Value::Null,
+        "max_output_tokens": serde_json::Value::Null,
+        "model": public_model,
+        "output": serde_json::Value::Array(output),
+        "parallel_tool_calls": true,
+        "previous_response_id": serde_json::Value::Null,
+        "reasoning": serde_json::json!({ "effort": null, "summary": null }),
+        "store": false,
+        "temperature": serde_json::Value::Null,
+        "text": serde_json::json!({ "format": { "type": "text" } }),
+        "tool_choice": "auto",
+        "tools": [],
+        "top_p": serde_json::Value::Null,
+        "truncation": "disabled",
+        "usage": body
+            .get("usage")
+            .and_then(chat_usage_to_responses_usage)
+            .unwrap_or_else(|| serde_json::json!({
+                "input_tokens": 0,
+                "input_tokens_details": { "cached_tokens": 0 },
+                "output_tokens": 0,
+                "output_tokens_details": { "reasoning_tokens": 0 },
+                "total_tokens": 0
+            })),
+        "user": serde_json::Value::Null,
+        "metadata": {}
+    })
+}
+
+fn chat_usage_to_responses_usage(usage: &serde_json::Value) -> Option<serde_json::Value> {
+    let input = usage.get("prompt_tokens").and_then(|v| v.as_u64());
+    let output = usage.get("completion_tokens").and_then(|v| v.as_u64());
+    if input.is_none() && output.is_none() {
+        return None;
+    }
+    let input = input.unwrap_or(0);
+    let output = output.unwrap_or(0);
+    Some(serde_json::json!({
+        "input_tokens": input,
+        "input_tokens_details": {
+            "cached_tokens": usage
+                .pointer("/prompt_tokens_details/cached_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+        },
+        "output_tokens": output,
+        "output_tokens_details": {
+            "reasoning_tokens": usage
+                .pointer("/completion_tokens_details/reasoning_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+        },
+        "total_tokens": usage
+            .get("total_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(input + output)
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn responses_request_cross_protocol_conversion_is_rejected() {
+    fn responses_request_converts_to_completions_but_not_messages() {
         let body = serde_json::json!({
             "model": "public",
             "instructions": "be direct",
@@ -789,12 +1157,30 @@ mod tests {
             "max_output_tokens": 20
         });
 
-        for target in [ProviderProtocol::Completions, ProviderProtocol::Messages] {
-            let err =
-                translate_request_body(Operation::Responses, target, &body, "gpt-real", false)
-                    .unwrap_err();
-            assert!(err.to_string().contains("not supported"));
-        }
+        let converted = translate_request_body(
+            Operation::Responses,
+            ProviderProtocol::Completions,
+            &body,
+            "deepseek-real",
+            false,
+        )
+        .unwrap();
+        assert_eq!(converted["model"], "deepseek-real");
+        assert_eq!(converted["stream"], false);
+        assert_eq!(converted["max_tokens"], 20);
+        assert_eq!(converted["messages"][0]["role"], "system");
+        assert_eq!(converted["messages"][1]["role"], "user");
+        assert_eq!(converted["messages"][1]["content"], "hello");
+
+        let err = translate_request_body(
+            Operation::Responses,
+            ProviderProtocol::Messages,
+            &body,
+            "gpt-real",
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not supported"));
     }
 
     #[test]
@@ -1029,7 +1415,249 @@ mod tests {
     }
 
     #[test]
-    fn responses_cross_protocol_response_conversion_is_rejected() {
+    fn responses_request_converts_tools_and_function_items() {
+        let body = serde_json::json!({
+            "model": "public",
+            "instructions": [
+                { "type": "input_text", "text": "be precise" }
+            ],
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        { "type": "input_text", "text": "look" },
+                        { "type": "input_image", "image_url": "https://example.com/a.png" }
+                    ]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "weather",
+                    "arguments": "{\"city\":\"Paris\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "sunny"
+                }
+            ],
+            "tools": [{
+                "type": "function",
+                "name": "weather",
+                "description": "Get weather",
+                "parameters": { "type": "object", "properties": { "city": { "type": "string" } } },
+                "strict": false
+            }],
+            "tool_choice": { "type": "function", "name": "weather" },
+            "temperature": 0.2,
+            "metadata": { "user_id": "session-1" },
+            "parallel_tool_calls": true
+        });
+
+        let out = translate_request_body(
+            Operation::Responses,
+            ProviderProtocol::Completions,
+            &body,
+            "deepseek-real",
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(out["model"], "deepseek-real");
+        assert_eq!(out["stream"], true);
+        assert_eq!(out["messages"][0]["role"], "system");
+        assert_eq!(out["messages"][0]["content"], "be precise");
+        assert_eq!(out["messages"][1]["content"][1]["type"], "image_url");
+        assert_eq!(
+            out["messages"][1]["content"][1]["image_url"]["url"],
+            "https://example.com/a.png"
+        );
+        assert_eq!(out["messages"][2]["role"], "assistant");
+        assert_eq!(out["messages"][2]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(
+            out["messages"][2]["tool_calls"][0]["function"]["arguments"],
+            "{\"city\":\"Paris\"}"
+        );
+        assert_eq!(out["messages"][3]["role"], "tool");
+        assert_eq!(out["messages"][3]["content"], "sunny");
+        assert_eq!(out["tools"][0]["function"]["name"], "weather");
+        assert_eq!(out["tools"][0]["function"]["parameters"]["type"], "object");
+        assert_eq!(out["tool_choice"]["function"]["name"], "weather");
+        assert_eq!(out["temperature"], 0.2);
+        assert_eq!(out["metadata"]["user_id"], "session-1");
+        assert_eq!(out["parallel_tool_calls"], true);
+        assert!(out.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn responses_request_with_string_input_maps_to_user_message() {
+        let body = serde_json::json!({
+            "model": "public",
+            "input": "plain hello"
+        });
+
+        let out = translate_request_body(
+            Operation::Responses,
+            ProviderProtocol::Completions,
+            &body,
+            "deepseek-real",
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(out["messages"][0]["role"], "user");
+        assert_eq!(out["messages"][0]["content"], "plain hello");
+    }
+
+    #[test]
+    fn responses_request_drops_unsupported_items_and_fields() {
+        let body = serde_json::json!({
+            "model": "public",
+            "input": [
+                { "type": "reasoning", "summary": [{ "type": "summary_text", "text": "thinking" }] },
+                { "type": "message", "role": "user", "content": "hi" },
+                { "type": "web_search_call", "id": "ws_1" }
+            ],
+            "store": true,
+            "previous_response_id": "resp_prev",
+            "include": ["usage"]
+        });
+
+        let out = translate_request_body(
+            Operation::Responses,
+            ProviderProtocol::Completions,
+            &body,
+            "deepseek-real",
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(out["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(out["messages"][0]["content"], "hi");
+        assert!(out.get("store").is_none());
+        assert!(out.get("previous_response_id").is_none());
+        assert!(out.get("include").is_none());
+    }
+
+    #[test]
+    fn chat_response_converts_to_responses() {
+        let body = serde_json::json!({
+            "id": "chatcmpl_1",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": "calling",
+                    "reasoning": "need weather",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": { "name": "weather", "arguments": "{\"city\":\"Paris\"}" }
+                    }]
+                }
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 4,
+                "total_tokens": 14,
+                "prompt_tokens_details": { "cached_tokens": 6 },
+                "completion_tokens_details": { "reasoning_tokens": 2 }
+            }
+        });
+
+        let out = translate_response_body(
+            ProviderProtocol::Completions,
+            Operation::Responses,
+            body,
+            "deepseek-public",
+        )
+        .unwrap();
+
+        assert_eq!(out["object"], "response");
+        assert_eq!(out["model"], "deepseek-public");
+        assert_eq!(out["status"], "completed");
+        assert_eq!(out["id"], "resp_chatcmpl_1");
+        assert_eq!(out["output"][0]["type"], "reasoning");
+        assert_eq!(out["output"][0]["content"][0]["text"], "need weather");
+        assert_eq!(out["output"][1]["type"], "message");
+        assert_eq!(out["output"][1]["content"][0]["type"], "output_text");
+        assert_eq!(out["output"][1]["content"][0]["text"], "calling");
+        assert_eq!(out["output"][2]["type"], "function_call");
+        assert_eq!(out["output"][2]["call_id"], "call_1");
+        assert_eq!(out["output"][2]["name"], "weather");
+        assert_eq!(out["output"][2]["arguments"], "{\"city\":\"Paris\"}");
+        assert_eq!(out["usage"]["input_tokens"], 10);
+        assert_eq!(out["usage"]["input_tokens_details"]["cached_tokens"], 6);
+        assert_eq!(out["usage"]["output_tokens"], 4);
+        assert_eq!(out["usage"]["output_tokens_details"]["reasoning_tokens"], 2);
+        assert_eq!(out["usage"]["total_tokens"], 14);
+    }
+
+    #[test]
+    fn chat_response_without_tool_calls_keeps_single_message_item() {
+        let body = serde_json::json!({
+            "id": "chatcmpl_2",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "length",
+                "message": { "role": "assistant", "content": "cut off" }
+            }]
+        });
+
+        let out = translate_response_body(
+            ProviderProtocol::Completions,
+            Operation::Responses,
+            body,
+            "deepseek-public",
+        )
+        .unwrap();
+
+        assert_eq!(out["status"], "incomplete");
+        assert_eq!(out["incomplete_details"]["reason"], "max_output_tokens");
+        assert_eq!(out["output"].as_array().unwrap().len(), 1);
+        assert_eq!(out["output"][0]["type"], "message");
+        assert_eq!(out["output"][0]["content"][0]["text"], "cut off");
+    }
+
+    #[test]
+    fn chat_response_converts_reasoning_content_and_skips_empty_message() {
+        let body = serde_json::json!({
+            "id": "chatcmpl_3",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning_content": "thinking hard",
+                    "tool_calls": [{
+                        "id": "call_2",
+                        "type": "function",
+                        "function": { "name": "weather", "arguments": "{}" }
+                    }]
+                }
+            }]
+        });
+
+        let out = translate_response_body(
+            ProviderProtocol::Completions,
+            Operation::Responses,
+            body,
+            "deepseek-public",
+        )
+        .unwrap();
+
+        assert_eq!(out["output"].as_array().unwrap().len(), 2);
+        assert_eq!(out["output"][0]["type"], "reasoning");
+        assert_eq!(out["output"][0]["content"][0]["text"], "thinking hard");
+        assert_eq!(out["output"][1]["type"], "function_call");
+        assert_eq!(out["output"][1]["arguments"], "{}");
+    }
+
+    #[test]
+    fn responses_cross_protocol_response_conversion_rejects_messages() {
         let body = serde_json::json!({
             "id": "resp_1",
             "status": "completed",
@@ -1051,16 +1679,14 @@ mod tests {
             ]
         });
 
-        for entry in [Operation::Completions, Operation::Messages] {
-            let err = translate_response_body(
-                ProviderProtocol::Responses,
-                entry,
-                body.clone(),
-                "gpt-public",
-            )
-            .unwrap_err();
-            assert!(err.to_string().contains("not supported"));
-        }
+        let err = translate_response_body(
+            ProviderProtocol::Messages,
+            Operation::Responses,
+            body,
+            "gpt-public",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not supported"));
     }
 
     #[test]
@@ -1099,7 +1725,7 @@ mod tests {
     }
 
     #[test]
-    fn completions_and_messages_are_the_only_advertised_protocol_conversions() {
+    fn advertised_protocol_conversions_include_responses_to_completions() {
         for stream in [false, true] {
             assert_eq!(
                 candidate_protocols(Operation::Completions, stream),
@@ -1111,8 +1737,28 @@ mod tests {
             );
             assert_eq!(
                 candidate_protocols(Operation::Responses, stream),
-                vec![ProviderProtocol::Responses]
+                vec![ProviderProtocol::Responses, ProviderProtocol::Completions]
             );
         }
+    }
+
+    #[test]
+    fn operation_for_target_maps_responses_to_completions() {
+        assert_eq!(
+            operation_for_target(Operation::Responses, ProviderProtocol::Responses),
+            Some(Operation::Responses)
+        );
+        assert_eq!(
+            operation_for_target(Operation::Responses, ProviderProtocol::Completions),
+            Some(Operation::Completions)
+        );
+        assert_eq!(
+            operation_for_target(Operation::Responses, ProviderProtocol::Messages),
+            None
+        );
+        assert_eq!(
+            operation_for_target(Operation::Completions, ProviderProtocol::Responses),
+            None
+        );
     }
 }
