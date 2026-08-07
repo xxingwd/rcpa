@@ -412,6 +412,7 @@ mod tests {
             headers: Default::default(),
             status: "enabled".to_string(),
             priority: 0,
+            reasoning_effort_map: Default::default(),
         }
     }
 
@@ -770,6 +771,7 @@ mod tests {
             headers: Default::default(),
             status: "enabled".to_string(),
             priority: 0,
+            reasoning_effort_map: Default::default(),
         }];
 
         let snapshot = ConfigSnapshot::build(config).unwrap();

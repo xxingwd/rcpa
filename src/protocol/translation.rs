@@ -45,6 +45,7 @@ pub fn translate_request_body(
     body: &serde_json::Value,
     model: &str,
     stream: bool,
+    reasoning_effort_map: &std::collections::BTreeMap<String, String>,
 ) -> AppResult<serde_json::Value> {
     let source_protocol = source_protocol(source_operation);
     if source_protocol == target_protocol {
@@ -57,9 +58,9 @@ pub fn translate_request_body(
         (Operation::Messages, ProviderProtocol::Completions) => {
             Ok(messages_to_chat_completions_request(body, model, stream))
         }
-        (Operation::Responses, ProviderProtocol::Completions) => {
-            Ok(responses_to_chat_completions_request(body, model, stream))
-        }
+        (Operation::Responses, ProviderProtocol::Completions) => Ok(
+            responses_to_chat_completions_request(body, model, stream, reasoning_effort_map),
+        ),
         _ => Err(AppError::ProtocolError(format!(
             "Protocol conversion from '{}' to '{}' is not supported",
             source_protocol, target_protocol
@@ -207,10 +208,42 @@ fn chat_completions_to_messages_request(
 /// function calls, tool results) to chat messages, and renames
 /// `max_output_tokens` to `max_tokens`. Unsupported Responses-only fields
 /// (e.g. `store`, `previous_response_id`, `include`) are dropped.
+/// Default reasoning effort mapping when translating Responses API requests
+/// to chat/completions. Values follow the Responses API enumeration
+/// (none/minimal/low/medium/high/xhigh/max/ultra) mapped onto the
+/// chat/completions values supported by DeepSeek (low/high/xhigh/max) and
+/// OpenAI (minimal/low/medium/high). `none` disables thinking mode.
+const DEFAULT_REASONING_EFFORT_MAP: [(&str, &str); 8] = [
+    ("none", "none"),
+    ("minimal", "low"),
+    ("low", "low"),
+    ("medium", "high"),
+    ("high", "high"),
+    ("xhigh", "xhigh"),
+    ("max", "max"),
+    ("ultra", "max"),
+];
+
+/// Resolve the upstream effort value for a client effort value using the
+/// provider-specific override map (if any) falling back to the defaults.
+fn resolve_reasoning_effort(
+    effort: &str,
+    override_map: &std::collections::BTreeMap<String, String>,
+) -> Option<String> {
+    if let Some(mapped) = override_map.get(effort) {
+        return Some(mapped.clone());
+    }
+    DEFAULT_REASONING_EFFORT_MAP
+        .iter()
+        .find(|(from, _)| *from == effort)
+        .map(|(_, to)| to.to_string())
+}
+
 fn responses_to_chat_completions_request(
     body: &serde_json::Value,
     model: &str,
     stream: bool,
+    reasoning_effort_map: &std::collections::BTreeMap<String, String>,
 ) -> serde_json::Value {
     let mut out = serde_json::Map::new();
     out.insert(
@@ -241,36 +274,29 @@ fn responses_to_chat_completions_request(
     copy_field(body, &mut out, "metadata", "metadata");
     copy_field(body, &mut out, "user", "user");
     copy_field(body, &mut out, "parallel_tool_calls", "parallel_tool_calls");
-    // Reasoning effort passthrough. The OpenAI Responses API expresses
-    // thinking control via `reasoning.effort`; DeepSeek's chat completions
-    // accepts `reasoning_effort` (low/high/max) plus an explicit `thinking`
-    // toggle. `none` disables thinking mode, `medium` maps to `high`
-    // (DeepSeek has no medium tier). Unknown values are dropped.
+    // Reasoning effort mapping. The OpenAI Responses API expresses thinking
+    // control via `reasoning.effort` with a wider enumeration
+    // (none/minimal/low/medium/high/xhigh/max/ultra) than DeepSeek chat
+    // completions accepts (low/high/xhigh/max). Map through the provider
+    // override map (if any) falling back to DEFAULT_REASONING_EFFORT_MAP.
+    // `none` disables thinking mode; unknown values are dropped.
     if let Some(effort) = body
         .get("reasoning")
         .and_then(|reasoning| reasoning.get("effort"))
         .and_then(|value| value.as_str())
     {
-        match effort {
-            "none" => {
+        if let Some(mapped) = resolve_reasoning_effort(effort, reasoning_effort_map) {
+            if mapped == "none" {
                 out.insert(
                     "thinking".to_string(),
                     serde_json::json!({ "type": "disabled" }),
                 );
-            }
-            "low" | "high" | "max" => {
+            } else {
                 out.insert(
                     "reasoning_effort".to_string(),
-                    serde_json::Value::String(effort.to_string()),
+                    serde_json::Value::String(mapped),
                 );
             }
-            "medium" => {
-                out.insert(
-                    "reasoning_effort".to_string(),
-                    serde_json::Value::String("high".to_string()),
-                );
-            }
-            _ => {}
         }
     }
     if let Some(max_output_tokens) = body.get("max_output_tokens") {
@@ -1195,6 +1221,7 @@ mod tests {
             &body,
             "deepseek-real",
             false,
+            &Default::default(),
         )
         .unwrap();
         assert_eq!(converted["model"], "deepseek-real");
@@ -1210,6 +1237,7 @@ mod tests {
             &body,
             "gpt-real",
             false,
+            &Default::default(),
         )
         .unwrap_err();
         assert!(err.to_string().contains("not supported"));
@@ -1279,6 +1307,7 @@ mod tests {
             &body,
             "claude-real",
             false,
+            &Default::default(),
         )
         .unwrap();
 
@@ -1340,6 +1369,7 @@ mod tests {
             &body,
             "gpt-real",
             false,
+            &Default::default(),
         )
         .unwrap();
 
@@ -1380,6 +1410,7 @@ mod tests {
             &body,
             "claude-real",
             false,
+            &Default::default(),
         )
         .unwrap();
 
@@ -1403,6 +1434,7 @@ mod tests {
             &body,
             "claude-real",
             false,
+            &Default::default(),
         )
         .unwrap();
 
@@ -1420,6 +1452,7 @@ mod tests {
             &body,
             "claude-real",
             false,
+            &Default::default(),
         )
         .unwrap();
 
@@ -1439,6 +1472,7 @@ mod tests {
             &high,
             "deepseek-real",
             false,
+            &Default::default(),
         )
         .unwrap();
         assert_eq!(out["reasoning_effort"], "high");
@@ -1455,6 +1489,7 @@ mod tests {
             &max,
             "deepseek-real",
             false,
+            &Default::default(),
         )
         .unwrap();
         assert_eq!(out["reasoning_effort"], "max");
@@ -1470,6 +1505,7 @@ mod tests {
             &none,
             "deepseek-real",
             false,
+            &Default::default(),
         )
         .unwrap();
         assert_eq!(out["thinking"]["type"], "disabled");
@@ -1486,6 +1522,7 @@ mod tests {
             &medium,
             "deepseek-real",
             false,
+            &Default::default(),
         )
         .unwrap();
         assert_eq!(out["reasoning_effort"], "high");
@@ -1500,6 +1537,7 @@ mod tests {
             &no_reasoning,
             "deepseek-real",
             false,
+            &Default::default(),
         )
         .unwrap();
         assert!(out.get("reasoning_effort").is_none());
@@ -1516,10 +1554,120 @@ mod tests {
             &unknown,
             "deepseek-real",
             false,
+            &Default::default(),
         )
         .unwrap();
         assert!(out.get("reasoning_effort").is_none());
         assert!(out.get("thinking").is_none());
+
+        // Codex-style values: minimal, xhigh, ultra must map onto DeepSeek
+        // supported values (low/high/xhigh/max) via the default table.
+        let minimal = serde_json::json!({
+            "model": "public",
+            "input": "hello",
+            "reasoning": { "effort": "minimal" }
+        });
+        let out = translate_request_body(
+            Operation::Responses,
+            ProviderProtocol::Completions,
+            &minimal,
+            "deepseek-real",
+            false,
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(out["reasoning_effort"], "low");
+
+        let xhigh = serde_json::json!({
+            "model": "public",
+            "input": "hello",
+            "reasoning": { "effort": "xhigh" }
+        });
+        let out = translate_request_body(
+            Operation::Responses,
+            ProviderProtocol::Completions,
+            &xhigh,
+            "deepseek-real",
+            false,
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(out["reasoning_effort"], "xhigh");
+
+        let ultra = serde_json::json!({
+            "model": "public",
+            "input": "hello",
+            "reasoning": { "effort": "ultra" }
+        });
+        let out = translate_request_body(
+            Operation::Responses,
+            ProviderProtocol::Completions,
+            &ultra,
+            "deepseek-real",
+            false,
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(out["reasoning_effort"], "max");
+    }
+
+    #[test]
+    fn responses_request_reasoning_effort_uses_provider_override_map() {
+        let body = serde_json::json!({
+            "model": "public",
+            "input": "hello",
+            "reasoning": { "effort": "medium" }
+        });
+        let mut override_map = std::collections::BTreeMap::new();
+        // Provider wants medium to mean xhigh instead of the default high.
+        override_map.insert("medium".to_string(), "xhigh".to_string());
+        let out = translate_request_body(
+            Operation::Responses,
+            ProviderProtocol::Completions,
+            &body,
+            "deepseek-real",
+            false,
+            &override_map,
+        )
+        .unwrap();
+        assert_eq!(out["reasoning_effort"], "xhigh");
+
+        // Override can disable thinking for a value.
+        let mut disable_map = std::collections::BTreeMap::new();
+        disable_map.insert("high".to_string(), "none".to_string());
+        let high_body = serde_json::json!({
+            "model": "public",
+            "input": "hello",
+            "reasoning": { "effort": "high" }
+        });
+        let out = translate_request_body(
+            Operation::Responses,
+            ProviderProtocol::Completions,
+            &high_body,
+            "deepseek-real",
+            false,
+            &disable_map,
+        )
+        .unwrap();
+        assert_eq!(out["thinking"]["type"], "disabled");
+        assert!(out.get("reasoning_effort").is_none());
+
+        // Values not in the override map still use defaults.
+        let high_body = serde_json::json!({
+            "model": "public",
+            "input": "hello",
+            "reasoning": { "effort": "ultra" }
+        });
+        let out = translate_request_body(
+            Operation::Responses,
+            ProviderProtocol::Completions,
+            &high_body,
+            "deepseek-real",
+            false,
+            &disable_map,
+        )
+        .unwrap();
+        assert_eq!(out["reasoning_effort"], "max");
     }
 
     #[test]
@@ -1536,6 +1684,7 @@ mod tests {
                 &body,
                 "response-real",
                 false,
+                &Default::default(),
             )
             .unwrap_err();
             assert!(err.to_string().contains("not supported"));
@@ -1589,6 +1738,7 @@ mod tests {
             &body,
             "deepseek-real",
             true,
+            &Default::default(),
         )
         .unwrap();
 
@@ -1631,6 +1781,7 @@ mod tests {
             &body,
             "deepseek-real",
             false,
+            &Default::default(),
         )
         .unwrap();
 
@@ -1658,6 +1809,7 @@ mod tests {
             &body,
             "deepseek-real",
             false,
+            &Default::default(),
         )
         .unwrap();
 

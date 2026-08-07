@@ -56,6 +56,7 @@ fn populated_config() -> AppConfig {
             .collect(),
         status: "enabled".to_string(),
         priority: 7,
+        reasoning_effort_map: Default::default(),
     });
     config.keys.push(AuthKey {
         id: "fixture-key".to_string(),

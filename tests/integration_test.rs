@@ -648,6 +648,7 @@ fn provider_with_endpoints(
         headers: Default::default(),
         status: "enabled".to_string(),
         priority: 5,
+        reasoning_effort_map: Default::default(),
     }
 }
 

@@ -2031,12 +2031,20 @@ fn prepare_attempt(
                 upstream_protocol
             ))
         })?;
+    let reasoning_effort_map = snapshot
+        .raw_config
+        .providers
+        .iter()
+        .find(|provider| provider.name == provider_name)
+        .map(|provider| provider.reasoning_effort_map.clone())
+        .unwrap_or_default();
     let translated_body = translation::translate_request_body(
         req.operation,
         upstream_protocol,
         &req.body,
         &actual_model,
         req.stream,
+        &reasoning_effort_map,
     )?;
 
     let mut modified_req = req.clone();

@@ -258,6 +258,7 @@ mod tests {
             }],
             headers: Default::default(),
             priority: 1,
+            reasoning_effort_map: Default::default(),
             status: "enabled".to_string(),
         };
         let provider = AnthropicProvider::new(

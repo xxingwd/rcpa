@@ -1,6 +1,6 @@
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 pub const CONFIG_FILE_NAME: &str = "config.yaml";
@@ -50,6 +50,12 @@ pub struct ProviderConfig {
     #[serde(default = "default_status")]
     pub status: String,
     pub priority: i64,
+    /// Optional override for reasoning effort mapping when translating
+    /// Responses API requests to chat/completions. Keys are client effort
+    /// values (e.g. `minimal`, `ultra`), values are upstream effort values.
+    /// A value of `none` disables thinking mode for that key.
+    #[serde(default)]
+    pub reasoning_effort_map: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -555,6 +561,12 @@ impl AppConfig {
     }
 }
 
+/// Reasoning effort values accepted across Responses API and common
+/// chat/completions providers (OpenAI, DeepSeek). `none` disables thinking.
+const REASONING_EFFORT_VALUES: [&str; 8] = [
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+];
+
 fn validate_model_name(value: &str, field: &str) -> anyhow::Result<()> {
     if value.trim().is_empty() {
         anyhow::bail!("{} cannot be empty", field);
@@ -636,6 +648,30 @@ fn validate_provider_config(provider: &ProviderConfig) -> anyhow::Result<()> {
             "Provider '{}' must declare at least one endpoint",
             provider.name
         );
+    }
+    for (key, value) in &provider.reasoning_effort_map {
+        if key.trim().is_empty() {
+            anyhow::bail!(
+                "Provider '{}' reasoning_effort_map contains an empty key",
+                provider.name
+            );
+        }
+        if value.trim().is_empty() {
+            anyhow::bail!(
+                "Provider '{}' reasoning_effort_map['{}'] has an empty value",
+                provider.name,
+                key
+            );
+        }
+        if !REASONING_EFFORT_VALUES.contains(&value.as_str()) {
+            anyhow::bail!(
+                "Provider '{}' reasoning_effort_map['{}'] has invalid effort '{}' (expected one of {})",
+                provider.name,
+                key,
+                value,
+                REASONING_EFFORT_VALUES.join("/")
+            );
+        }
     }
 
     let mut seen_protocols = HashSet::new();
@@ -980,6 +1016,7 @@ keys: []
             headers: Default::default(),
             status: "enabled".into(),
             priority: 1,
+            reasoning_effort_map: Default::default(),
         }];
 
         let expanded = config.expanded().unwrap();
@@ -1183,6 +1220,7 @@ keys: []
             headers: Default::default(),
             status: "enabled".into(),
             priority: 0,
+            reasoning_effort_map: Default::default(),
         }
     }
 
@@ -1207,5 +1245,43 @@ keys: []
             },
             keys: vec![],
         }
+    }
+
+    #[test]
+    fn test_reasoning_effort_map_validation() {
+        // Valid override map passes validation.
+        let mut provider = test_provider();
+        provider
+            .reasoning_effort_map
+            .insert("medium".into(), "xhigh".into());
+        provider
+            .reasoning_effort_map
+            .insert("ultra".into(), "max".into());
+        assert!(validate_provider_config(&provider).is_ok());
+
+        // Invalid effort value is rejected.
+        let mut provider = test_provider();
+        provider
+            .reasoning_effort_map
+            .insert("medium".into(), "turbo".into());
+        let err = validate_provider_config(&provider).unwrap_err().to_string();
+        assert!(err.contains("invalid effort"));
+        assert!(err.contains("turbo"));
+
+        // Empty value is rejected.
+        let mut provider = test_provider();
+        provider
+            .reasoning_effort_map
+            .insert("medium".into(), "".into());
+        let err = validate_provider_config(&provider).unwrap_err().to_string();
+        assert!(err.contains("empty value"));
+
+        // Empty key is rejected.
+        let mut provider = test_provider();
+        provider
+            .reasoning_effort_map
+            .insert("".into(), "high".into());
+        let err = validate_provider_config(&provider).unwrap_err().to_string();
+        assert!(err.contains("empty key"));
     }
 }

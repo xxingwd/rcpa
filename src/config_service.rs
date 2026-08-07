@@ -569,6 +569,7 @@ mod tests {
                 headers: Default::default(),
                 status: "enabled".to_string(),
                 priority: 1,
+                reasoning_effort_map: Default::default(),
             }],
             upstream: UpstreamConfig { timeout_secs: 30 },
             routing: RoutingConfig {

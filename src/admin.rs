@@ -806,6 +806,10 @@ pub async fn create_provider(
                     .or(existing_status)
                     .unwrap_or_else(|| "enabled".to_string()),
                 priority,
+                reasoning_effort_map: existing_provider
+                    .as_ref()
+                    .map(|provider| provider.reasoning_effort_map.clone())
+                    .unwrap_or_default(),
             };
             if let Some(existing) = config
                 .providers
@@ -879,6 +883,7 @@ pub async fn update_provider(
         headers: payload.headers.unwrap_or_default(),
         status: payload.status.unwrap_or_else(|| existing.status.clone()),
         priority: payload.priority.unwrap_or(existing.priority),
+        reasoning_effort_map: existing.reasoning_effort_map.clone(),
     };
 
     let mut candidate = current.raw_config.clone();
