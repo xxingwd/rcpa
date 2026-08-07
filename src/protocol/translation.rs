@@ -241,6 +241,38 @@ fn responses_to_chat_completions_request(
     copy_field(body, &mut out, "metadata", "metadata");
     copy_field(body, &mut out, "user", "user");
     copy_field(body, &mut out, "parallel_tool_calls", "parallel_tool_calls");
+    // Reasoning effort passthrough. The OpenAI Responses API expresses
+    // thinking control via `reasoning.effort`; DeepSeek's chat completions
+    // accepts `reasoning_effort` (low/high/max) plus an explicit `thinking`
+    // toggle. `none` disables thinking mode, `medium` maps to `high`
+    // (DeepSeek has no medium tier). Unknown values are dropped.
+    if let Some(effort) = body
+        .get("reasoning")
+        .and_then(|reasoning| reasoning.get("effort"))
+        .and_then(|value| value.as_str())
+    {
+        match effort {
+            "none" => {
+                out.insert(
+                    "thinking".to_string(),
+                    serde_json::json!({ "type": "disabled" }),
+                );
+            }
+            "low" | "high" | "max" => {
+                out.insert(
+                    "reasoning_effort".to_string(),
+                    serde_json::Value::String(effort.to_string()),
+                );
+            }
+            "medium" => {
+                out.insert(
+                    "reasoning_effort".to_string(),
+                    serde_json::Value::String("high".to_string()),
+                );
+            }
+            _ => {}
+        }
+    }
     if let Some(max_output_tokens) = body.get("max_output_tokens") {
         out.insert("max_tokens".to_string(), max_output_tokens.clone());
     }
@@ -1392,6 +1424,102 @@ mod tests {
         .unwrap();
 
         assert_eq!(out["metadata"]["user_id"], "conversation-a");
+    }
+
+    #[test]
+    fn responses_request_maps_reasoning_effort_to_chat() {
+        let high = serde_json::json!({
+            "model": "public",
+            "input": "hello",
+            "reasoning": { "effort": "high" }
+        });
+        let out = translate_request_body(
+            Operation::Responses,
+            ProviderProtocol::Completions,
+            &high,
+            "deepseek-real",
+            false,
+        )
+        .unwrap();
+        assert_eq!(out["reasoning_effort"], "high");
+        assert!(out.get("thinking").is_none());
+
+        let max = serde_json::json!({
+            "model": "public",
+            "input": "hello",
+            "reasoning": { "effort": "max" }
+        });
+        let out = translate_request_body(
+            Operation::Responses,
+            ProviderProtocol::Completions,
+            &max,
+            "deepseek-real",
+            false,
+        )
+        .unwrap();
+        assert_eq!(out["reasoning_effort"], "max");
+
+        let none = serde_json::json!({
+            "model": "public",
+            "input": "hello",
+            "reasoning": { "effort": "none" }
+        });
+        let out = translate_request_body(
+            Operation::Responses,
+            ProviderProtocol::Completions,
+            &none,
+            "deepseek-real",
+            false,
+        )
+        .unwrap();
+        assert_eq!(out["thinking"]["type"], "disabled");
+        assert!(out.get("reasoning_effort").is_none());
+
+        let medium = serde_json::json!({
+            "model": "public",
+            "input": "hello",
+            "reasoning": { "effort": "medium" }
+        });
+        let out = translate_request_body(
+            Operation::Responses,
+            ProviderProtocol::Completions,
+            &medium,
+            "deepseek-real",
+            false,
+        )
+        .unwrap();
+        assert_eq!(out["reasoning_effort"], "high");
+
+        let no_reasoning = serde_json::json!({
+            "model": "public",
+            "input": "hello"
+        });
+        let out = translate_request_body(
+            Operation::Responses,
+            ProviderProtocol::Completions,
+            &no_reasoning,
+            "deepseek-real",
+            false,
+        )
+        .unwrap();
+        assert!(out.get("reasoning_effort").is_none());
+        assert!(out.get("thinking").is_none());
+
+        let unknown = serde_json::json!({
+            "model": "public",
+            "input": "hello",
+            "reasoning": { "effort": "turbo" }
+        });
+        let out = translate_request_body(
+            Operation::Responses,
+            ProviderProtocol::Completions,
+            &unknown,
+            "deepseek-real",
+            false,
+        )
+        .unwrap();
+        assert!(out.get("reasoning_effort").is_none());
+        assert!(out.get("thinking").is_none());
     }
 
     #[test]
