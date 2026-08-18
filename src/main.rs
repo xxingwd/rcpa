@@ -109,6 +109,8 @@ async fn main() -> anyhow::Result<()> {
         .await?,
     );
     let _request_log_body_gc = rcpa::store::spawn_request_log_body_gc(state.store.clone());
+    let _request_log_timeout_monitor =
+        rcpa::server::spawn_request_log_timeout_monitor(state.clone());
 
     // Build Topcoat app (serves admin UI + bridges API to axum router)
     let app = build_topcoat_app(state.clone());

@@ -2,6 +2,7 @@ pub mod router;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::config::AppConfig;
 use crate::config_service::ConfigService;
@@ -95,4 +96,34 @@ impl AppState {
         }
         Err(crate::error::AppError::ModelNotFound(requested.to_string()))
     }
+}
+
+/// Periodically closes stale running logs using the current total request timeout.
+pub fn spawn_request_log_timeout_monitor(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
+    let store = state.store.clone();
+    let config_service = state.config_service.clone();
+
+    tokio::spawn(async move {
+        loop {
+            let timeout =
+                Duration::from_secs(config_service.snapshot().config.upstream.timeout_secs);
+            match store.interrupt_timed_out_request_logs(timeout).await {
+                Ok(count) if count > 0 => tracing::warn!(
+                    request_count = count,
+                    timeout_secs = timeout.as_secs(),
+                    "Marked timed-out request logs as interrupted"
+                ),
+                Ok(_) => {}
+                Err(error) => tracing::error!(
+                    error = %error,
+                    "Failed to close timed-out request logs"
+                ),
+            }
+
+            let check_interval = timeout
+                .min(Duration::from_secs(30))
+                .max(Duration::from_secs(1));
+            tokio::time::sleep(check_interval).await;
+        }
+    })
 }

@@ -8,10 +8,11 @@ use bytes::Bytes;
 use futures::Stream;
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    future::Future,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use crate::config_service::ModelEndpoint;
@@ -47,11 +48,21 @@ pub async fn chat_completions(
 /// Build an SSE streaming response from a ProviderStreamResponse.
 /// When `alias` is Some, rewrite the `model` field in each SSE data event
 /// so the user never sees the real provider model name.
+#[derive(Debug, thiserror::Error)]
+enum RequestStreamError {
+    #[error("upstream stream request failed: {0}")]
+    Upstream(#[source] reqwest::Error),
+    #[error("request exceeded the total timeout of {0:?}")]
+    Timeout(Duration),
+}
+
 fn stream_response(
     stream_resp: crate::provider::ProviderStreamResponse,
     alias: Option<String>,
     audit: StreamAudit,
     transform: Option<SseTransform>,
+    deadline: tokio::time::Instant,
+    timeout: Duration,
 ) -> Response {
     let status =
         StatusCode::from_u16(stream_resp.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -64,6 +75,8 @@ fn stream_response(
         pending_output: VecDeque::new(),
         inner_finished: false,
         terminated: false,
+        deadline: Box::pin(tokio::time::sleep_until(deadline)),
+        timeout,
     });
 
     Response::builder()
@@ -1803,6 +1816,96 @@ enum AttemptExecution {
     Fail(AppError),
 }
 
+struct RunningRequestAuditGuard {
+    state: Arc<AppState>,
+    request_id: String,
+    log_id: Option<String>,
+}
+
+impl RunningRequestAuditGuard {
+    fn new(state: Arc<AppState>, request_id: String) -> Self {
+        Self {
+            state,
+            request_id,
+            log_id: None,
+        }
+    }
+
+    fn arm(&mut self, log_id: Option<String>) {
+        if log_id.is_some() {
+            self.log_id = log_id;
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.log_id = None;
+    }
+
+    async fn interrupt(&mut self, error_code: &str, error_message: &str) {
+        let Some(log_id) = self.log_id.take() else {
+            return;
+        };
+
+        match audit::interrupt_llm_request(&self.state, &log_id, error_code, error_message).await {
+            Ok(true) => tracing::debug!(
+                request_id = %self.request_id,
+                log_id = %log_id,
+                error_code,
+                "Marked request audit as interrupted"
+            ),
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                request_id = %self.request_id,
+                log_id = %log_id,
+                error = %error,
+                "Failed to mark request audit as interrupted"
+            ),
+        }
+    }
+}
+
+impl Drop for RunningRequestAuditGuard {
+    fn drop(&mut self) {
+        let Some(log_id) = self.log_id.take() else {
+            return;
+        };
+
+        let state = self.state.clone();
+        let request_id = self.request_id.clone();
+        let cleanup = async move {
+            match audit::interrupt_llm_request(
+                &state,
+                &log_id,
+                "request_cancelled",
+                "Request was cancelled before completion",
+            )
+            .await
+            {
+                Ok(true) => {
+                    tracing::debug!(
+                        request_id = %request_id,
+                        log_id = %log_id,
+                        "Marked cancelled request audit as interrupted"
+                    );
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        log_id = %log_id,
+                        error = %error,
+                        "Failed to mark cancelled request audit as interrupted"
+                    );
+                }
+            }
+        };
+
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(cleanup);
+        }
+    }
+}
+
 struct RetryAttemptInput<'a> {
     attempt: u32,
     provider_name: &'a str,
@@ -1874,6 +1977,8 @@ struct AttemptContext<'a> {
     retry_policy: &'a RetryPolicy,
     api_key_id: &'a str,
     start: Instant,
+    deadline: tokio::time::Instant,
+    timeout: Duration,
     max_attempts: u32,
     total_backoff_ms: u64,
 }
@@ -2314,6 +2419,8 @@ async fn execute_stream_attempt(
                 Some(input.ctx.model.clone()),
                 audit,
                 prepared.stream_transform.take(),
+                input.deadline,
+                input.timeout,
             ))
         }
         Err(error) => {
@@ -3078,6 +3185,36 @@ impl StreamAudit {
             cache_write_tokens,
         );
     }
+
+    fn interrupt(&mut self, error_code: &str, error_message: String) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        record_provider_failure(&self.state, &self.provider_name);
+        self.state
+            .stats
+            .record_error(&self.actual_model, &self.provider_name);
+
+        let Some(log_id) = self.request_log_id.take() else {
+            return;
+        };
+        let state = self.state.clone();
+        let request_id = self.request_id.clone();
+        let error_code = error_code.to_string();
+        tokio::spawn(async move {
+            if let Err(error) =
+                audit::interrupt_llm_request(&state, &log_id, &error_code, &error_message).await
+            {
+                tracing::warn!(
+                    request_id = %request_id,
+                    log_id = %log_id,
+                    error = %error,
+                    "Failed to persist interrupted streaming request audit"
+                );
+            }
+        });
+    }
 }
 
 struct AuditedSseStream {
@@ -3088,15 +3225,28 @@ struct AuditedSseStream {
     pending_output: VecDeque<Bytes>,
     inner_finished: bool,
     terminated: bool,
+    deadline: Pin<Box<tokio::time::Sleep>>,
+    timeout: Duration,
 }
 
 impl Stream for AuditedSseStream {
-    type Item = Result<Bytes, reqwest::Error>;
+    type Item = Result<Bytes, RequestStreamError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
             if self.terminated {
                 return Poll::Ready(None);
+            }
+
+            if self.deadline.as_mut().poll(cx).is_ready() {
+                let timeout = self.timeout;
+                let message = format!(
+                    "Request exceeded the total timeout of {} seconds",
+                    timeout.as_secs()
+                );
+                self.terminated = true;
+                self.audit.interrupt("request_timeout", message);
+                return Poll::Ready(Some(Err(RequestStreamError::Timeout(timeout))));
             }
 
             if let Some(chunk) = self.pending_output.pop_front() {
@@ -3154,7 +3304,7 @@ impl Stream for AuditedSseStream {
                     let message = err.to_string();
                     self.terminated = true;
                     self.audit.finish(Some(("stream_error", message)));
-                    return Poll::Ready(Some(Err(err)));
+                    return Poll::Ready(Some(Err(RequestStreamError::Upstream(err))));
                 }
                 Poll::Ready(None) => {
                     if self.inner_finished {
@@ -3198,7 +3348,49 @@ pub async fn proxy_to_provider(
     req: ProxyRequest,
     ctx: ProxyContext,
 ) -> AppResult<Response> {
+    let timeout = Duration::from_secs(ctx.config_snapshot.config.upstream.timeout_secs);
+    let deadline = tokio::time::Instant::now() + timeout;
     let start = std::time::Instant::now();
+    let mut request_audit_guard =
+        RunningRequestAuditGuard::new(state.clone(), ctx.request_id.to_string());
+
+    match tokio::time::timeout_at(
+        deadline,
+        proxy_to_provider_inner(
+            state,
+            req,
+            ctx,
+            start,
+            deadline,
+            timeout,
+            &mut request_audit_guard,
+        ),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            let message = format!(
+                "Request exceeded the total timeout of {} seconds",
+                timeout.as_secs()
+            );
+            request_audit_guard
+                .interrupt("request_timeout", &message)
+                .await;
+            Err(AppError::RequestTimeout(timeout))
+        }
+    }
+}
+
+async fn proxy_to_provider_inner(
+    state: Arc<AppState>,
+    req: ProxyRequest,
+    ctx: ProxyContext,
+    start: Instant,
+    deadline: tokio::time::Instant,
+    timeout: Duration,
+    request_audit_guard: &mut RunningRequestAuditGuard,
+) -> AppResult<Response> {
     let original_request_body_bytes = serde_json::to_vec(&req.body).ok();
     let api_key_id = auth::persisted_api_key_id(&ctx.auth_key);
     let retry_policy = RetryPolicy::from_config(&ctx.config_snapshot.config.retry);
@@ -3220,7 +3412,7 @@ pub async fn proxy_to_provider(
         let prepared = match prepare_attempt(&state, &req, &ctx, &mut exhausted_providers) {
             Ok(prepared) => prepared,
             Err(err) => {
-                return Err(finalize_proxy_failure(ProxyFailureInput {
+                let error = finalize_proxy_failure(ProxyFailureInput {
                     state: &state,
                     request_log_id: request_log_id.as_deref(),
                     ctx: &ctx,
@@ -3237,7 +3429,9 @@ pub async fn proxy_to_provider(
                     retry_attempts: &retry_attempts,
                     request_body: original_request_body_bytes.as_deref(),
                 })
-                .await);
+                .await;
+                request_audit_guard.disarm();
+                return Err(error);
             }
         };
 
@@ -3259,6 +3453,7 @@ pub async fn proxy_to_provider(
             first_byte_latency_ms: 0,
         })
         .await;
+        request_audit_guard.arm(request_log_id.clone());
 
         for provider_attempt in 0..max_attempts {
             if let Some(backoff) = pending_backoff.take() {
@@ -3291,6 +3486,8 @@ pub async fn proxy_to_provider(
                         retry_policy: &retry_policy,
                         api_key_id,
                         start,
+                        deadline,
+                        timeout,
                         max_attempts,
                         total_backoff_ms,
                     },
@@ -3309,6 +3506,8 @@ pub async fn proxy_to_provider(
                         retry_policy: &retry_policy,
                         api_key_id,
                         start,
+                        deadline,
+                        timeout,
                         max_attempts,
                         total_backoff_ms,
                     },
@@ -3321,7 +3520,10 @@ pub async fn proxy_to_provider(
             };
 
             match execution {
-                AttemptExecution::Response(response) => return Ok(response),
+                AttemptExecution::Response(response) => {
+                    request_audit_guard.disarm();
+                    return Ok(response);
+                }
                 AttemptExecution::Retry(err) => {
                     persist_running_request_log(RunningRequestLogInput {
                         state: &state,
@@ -3359,7 +3561,10 @@ pub async fn proxy_to_provider(
                     exhausted_providers.insert(provider_name.clone());
                     break;
                 }
-                AttemptExecution::Fail(err) => return Err(err),
+                AttemptExecution::Fail(err) => {
+                    request_audit_guard.disarm();
+                    return Err(err);
+                }
             }
         }
     }

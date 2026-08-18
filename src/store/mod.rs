@@ -71,15 +71,7 @@ impl Store {
 
         sqlx::migrate!("./migrations").run(&pool).await?;
 
-        let store = Self { pool };
-        let interrupted = store.interrupt_running_request_logs().await?;
-        if interrupted > 0 {
-            tracing::warn!(
-                request_count = interrupted,
-                "Marked unfinished request logs as interrupted after gateway restart"
-            );
-        }
-        Ok(store)
+        Ok(Self { pool })
     }
 
     /// Create an in-memory database — useful for unit and integration tests.
@@ -90,9 +82,7 @@ impl Store {
             .connect_with(options)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
-        let store = Self { pool };
-        store.interrupt_running_request_logs().await?;
-        Ok(store)
+        Ok(Self { pool })
     }
 }
 
@@ -339,6 +329,7 @@ mod tests {
                 20260723020000,
                 20260729000000,
                 20260804000000,
+                20260818000000,
             ]
         );
 

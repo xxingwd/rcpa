@@ -4,11 +4,29 @@ pub mod openai;
 
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::config::{AppConfig, ProviderProtocol};
 use crate::error::AppResult;
 use crate::protocol::common::ProxyRequest;
+
+struct InFlightGuard<'a> {
+    counter: &'a AtomicUsize,
+}
+
+impl<'a> InFlightGuard<'a> {
+    fn new(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self { counter }
+    }
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// A proxy response from a provider
 #[derive(Debug, Clone)]

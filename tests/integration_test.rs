@@ -525,6 +525,49 @@ async fn spawn_lingering_streaming_openai_mock_provider() -> String {
     format!("http://{}/v1/chat/completions", addr)
 }
 
+async fn spawn_idle_streaming_openai_mock_provider() -> String {
+    use axum::{body::Body, response::IntoResponse, routing::post, Json, Router};
+    use bytes::Bytes;
+    use std::convert::Infallible;
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |Json(body): Json<serde_json::Value>| async move {
+            let model = body
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let payload = Bytes::from(format!(
+                "data: {{\"id\":\"chatcmpl-idle\",\"object\":\"chat.completion.chunk\",\"model\":\"{model}\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"hello\"}},\"finish_reason\":null}}]}}\n\n"
+            ));
+            let stream = futures::stream::unfold(Some(payload), |state| async move {
+                match state {
+                    Some(payload) => Some((Ok::<Bytes, Infallible>(payload), None)),
+                    None => {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        None
+                    }
+                }
+            });
+            (
+                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                Body::from_stream(stream),
+            )
+                .into_response()
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{}/v1/chat/completions", addr)
+}
+
 async fn spawn_fragmented_newline_streaming_openai_mock_provider() -> String {
     use axum::{body::Body, response::IntoResponse, routing::post, Router};
     use bytes::Bytes;
@@ -2699,6 +2742,161 @@ async fn test_routed_request_log_is_visible_before_upstream_completion() {
 }
 
 #[tokio::test]
+async fn test_cancelled_request_before_upstream_response_is_marked_interrupted() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let (mock_base_url, upstream_started, release_upstream) =
+        spawn_blocking_openai_mock_provider().await;
+    let mut config = test_config();
+    config.providers = vec![provider(
+        "blocking-provider",
+        "completions",
+        &mock_base_url,
+        vec![enabled_model("gpt-4o")],
+    )];
+    config.keys.push(auth_key(
+        "cancelled-key",
+        "cancelled-secret-key",
+        vec![enabled_model("gpt-4o")],
+    ));
+
+    let state = state_from_config(config).await;
+    let app = rcpa::server::router::build(state.clone());
+    let request_task = tokio::spawn(async move {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("x-api-key", "cancelled-secret-key")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}"#,
+            ))
+            .unwrap();
+        app.oneshot(req).await.unwrap()
+    });
+
+    upstream_started.notified().await;
+    let running_logs = wait_for_request_logs(&state, 1).await;
+    assert_eq!(running_logs[0].status, "running");
+    let log_id = running_logs[0].id.clone();
+
+    request_task.abort();
+    let _ = request_task.await;
+    release_upstream.notify_one();
+
+    let completed = wait_for_completed_request_logs(&state, 1).await;
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].id, log_id);
+    assert_eq!(completed[0].status, "interrupted");
+    assert_eq!(
+        completed[0].error_code.as_deref(),
+        Some("request_cancelled")
+    );
+}
+
+#[tokio::test]
+async fn test_total_timeout_finishes_non_stream_request_log() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let (mock_base_url, upstream_started, release_upstream) =
+        spawn_blocking_openai_mock_provider().await;
+    let mut config = test_config();
+    config.providers = vec![provider(
+        "timeout-provider",
+        "completions",
+        &mock_base_url,
+        vec![enabled_model("gpt-4o")],
+    )];
+    config.upstream.timeout_secs = 1;
+    config.retry.max_attempts = 1;
+    config.keys.push(auth_key(
+        "timeout-key",
+        "timeout-secret-key",
+        vec![enabled_model("gpt-4o")],
+    ));
+
+    let state = state_from_config(config).await;
+    let app = rcpa::server::router::build(state.clone());
+    let request_task = tokio::spawn(async move {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("x-api-key", "timeout-secret-key")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}"#,
+            ))
+            .unwrap();
+        app.oneshot(req).await.unwrap()
+    });
+
+    upstream_started.notified().await;
+    let response = request_task.await.unwrap();
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    release_upstream.notify_one();
+    assert_eq!(
+        state
+            .config_service
+            .snapshot()
+            .registry
+            .connection_count("timeout-provider"),
+        0
+    );
+
+    let logs = wait_for_completed_request_logs(&state, 1).await;
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].status, "interrupted");
+    assert_eq!(logs[0].error_code.as_deref(), Some("request_timeout"));
+}
+
+#[tokio::test]
+async fn test_total_timeout_ends_stream_and_finishes_audit() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let mock_base_url = spawn_idle_streaming_openai_mock_provider().await;
+    let mut config = test_config();
+    config.providers = vec![provider(
+        "idle-timeout-provider",
+        "completions",
+        &mock_base_url,
+        vec![enabled_model("gpt-4o")],
+    )];
+    config.upstream.timeout_secs = 1;
+    config.keys.push(auth_key(
+        "idle-timeout-key",
+        "idle-timeout-secret",
+        vec![enabled_model("gpt-4o")],
+    ));
+
+    let state = state_from_config(config).await;
+    let app = rcpa::server::router::build(state.clone());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("x-api-key", "idle-timeout-secret")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hello"}]}"#,
+        ))
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.into_body().collect().await.is_err());
+
+    let logs = wait_for_completed_request_logs(&state, 1).await;
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].status, "interrupted");
+    assert_eq!(logs[0].error_code.as_deref(), Some("request_timeout"));
+}
+
+#[tokio::test]
 async fn test_retry_updates_the_running_request_log_before_next_attempt() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -2765,6 +2963,122 @@ async fn test_retry_updates_the_running_request_log_before_next_attempt() {
     assert_eq!(completed[0].id, retrying.id);
     assert_eq!(completed[0].status, "success");
     assert_eq!(completed[0].retry_count, 1);
+}
+
+#[tokio::test]
+async fn test_total_timeout_includes_retry_backoff() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let (mock_base_url, upstream_attempts) = spawn_retrying_openai_mock_provider().await;
+    let mut config = test_config();
+    config.providers = vec![provider(
+        "retry-timeout-provider",
+        "completions",
+        &mock_base_url,
+        vec![enabled_model("gpt-4o")],
+    )];
+    config.upstream.timeout_secs = 1;
+    config.retry.initial_backoff_ms = 5_000;
+    config.retry.max_backoff_ms = 5_000;
+    config.keys.push(auth_key(
+        "retry-timeout-key",
+        "retry-timeout-secret",
+        vec![enabled_model("gpt-4o")],
+    ));
+
+    let state = state_from_config(config).await;
+    let app = rcpa::server::router::build(state.clone());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("x-api-key", "retry-timeout-secret")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}"#,
+        ))
+        .unwrap();
+
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(upstream_attempts.load(Ordering::SeqCst), 1);
+
+    let completed = wait_for_completed_request_logs(&state, 1).await;
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].status, "interrupted");
+    assert_eq!(completed[0].error_code.as_deref(), Some("request_timeout"));
+}
+
+#[tokio::test]
+async fn test_cancelled_request_during_retry_backoff_is_marked_interrupted() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let (mock_base_url, upstream_attempts) = spawn_retrying_openai_mock_provider().await;
+    let mut config = test_config();
+    config.providers = vec![provider(
+        "retry-cancel-provider",
+        "completions",
+        &mock_base_url,
+        vec![enabled_model("gpt-4o")],
+    )];
+    config.retry.initial_backoff_ms = 5_000;
+    config.retry.max_backoff_ms = 5_000;
+    config.keys.push(auth_key(
+        "retry-cancel-key",
+        "retry-cancel-secret",
+        vec![enabled_model("gpt-4o")],
+    ));
+
+    let state = state_from_config(config).await;
+    let app = rcpa::server::router::build(state.clone());
+    let request_task = tokio::spawn(async move {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("x-api-key", "retry-cancel-secret")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}"#,
+            ))
+            .unwrap();
+        app.oneshot(req).await.unwrap()
+    });
+
+    let retrying = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if upstream_attempts.load(Ordering::SeqCst) == 1 {
+                let logs = state
+                    .store
+                    .query_request_logs(&Default::default())
+                    .await
+                    .unwrap();
+                if logs.first().is_some_and(|log| {
+                    log.status == "running" && log.retry_count == 1 && log.status_code == 429
+                }) {
+                    break logs[0].clone();
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    request_task.abort();
+    let _ = request_task.await;
+
+    let completed = wait_for_completed_request_logs(&state, 1).await;
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].id, retrying.id);
+    assert_eq!(completed[0].status, "interrupted");
+    assert_eq!(completed[0].status_code, 429);
+    assert_eq!(
+        completed[0].error_code.as_deref(),
+        Some("request_cancelled")
+    );
 }
 
 #[tokio::test]

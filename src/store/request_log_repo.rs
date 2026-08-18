@@ -69,6 +69,17 @@ const REQUEST_LOG_SELECT_FIELDS: &str = r#"l.id, l.request_id, l.run_id, l.api_k
                     l.first_byte_latency_ms, l.retry_count,
                     l.meta, json_extract(l.meta, '$.error.code') as error_code,
                     json_extract(l.meta, '$.error.message') as error, l.created_at, l.finished_at"#;
+const INTERRUPT_TIMED_OUT_REQUEST_LOGS_SQL: &str = r#"UPDATE request_logs
+    SET status = 'interrupted',
+        latency_ms = MAX(0, CAST((julianday(?) - julianday(created_at)) * 86400000 AS INTEGER)),
+        meta = json_set(meta, '$.error', json_object(
+            'code', 'request_timeout',
+            'message', ?,
+            'retryable', 0
+        )),
+        updated_at = ?, finished_at = ?
+    WHERE status = 'running'
+      AND created_at <= ?"#;
 
 impl Store {
     pub async fn insert_request_log_entry(
@@ -271,25 +282,66 @@ impl Store {
         Ok(result.rows_affected() == 1)
     }
 
-    pub async fn interrupt_running_request_logs(&self) -> StoreResult<u64> {
+    /// Mark one request as interrupted when its handler is cancelled before completion.
+    pub async fn interrupt_request_log(
+        &self,
+        id: &str,
+        error_code: &str,
+        error_message: &str,
+    ) -> StoreResult<bool> {
         let now = Utc::now().to_rfc3339();
         let result = sqlx::query(
             r#"UPDATE request_logs
                SET status = 'interrupted',
                    latency_ms = MAX(0, CAST((julianday(?) - julianday(created_at)) * 86400000 AS INTEGER)),
-                   meta = json_set(meta,
-                       '$.error.code', 'gateway_restarted',
-                       '$.error.message', 'Gateway restarted before the request completed',
-                       '$.error.retryable', 0
-                   ),
+                   meta = json_set(meta, '$.error', json_object(
+                       'code', ?,
+                       'message', ?,
+                       'retryable', 0
+                   )),
                    updated_at = ?, finished_at = ?
-               WHERE status = 'running'"#,
+               WHERE id = ? AND status = 'running'"#,
         )
         .bind(&now)
+        .bind(error_code)
+        .bind(error_message)
         .bind(&now)
         .bind(&now)
+        .bind(id)
         .execute(&self.pool)
         .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Mark running requests older than the configured total timeout as interrupted.
+    pub async fn interrupt_timed_out_request_logs(
+        &self,
+        timeout: std::time::Duration,
+    ) -> StoreResult<u64> {
+        if timeout.is_zero() {
+            return Err(super::StoreError::InvalidData(
+                "request timeout must be greater than zero".to_string(),
+            ));
+        }
+        let timeout = chrono::Duration::from_std(timeout).map_err(|_| {
+            super::StoreError::InvalidData("request timeout is too large".to_string())
+        })?;
+        let now = Utc::now();
+        let cutoff = (now - timeout).to_rfc3339();
+        let now = now.to_rfc3339();
+        let error_message = format!(
+            "Request exceeded the total timeout of {} seconds",
+            timeout.num_seconds()
+        );
+        let result = sqlx::query(INTERRUPT_TIMED_OUT_REQUEST_LOGS_SQL)
+            .bind(&now)
+            .bind(error_message)
+            .bind(&now)
+            .bind(&now)
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await?;
 
         Ok(result.rows_affected())
     }
@@ -457,6 +509,7 @@ mod tests {
     use super::super::{
         models::RequestLogFilter, NewRequestLog, NewRunningRequestLog, RequestLogProgress, Store,
     };
+    use chrono::Utc;
 
     fn metadata(error_code: Option<&str>, error: Option<&str>) -> String {
         serde_json::json!({
@@ -844,11 +897,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_recovery_marks_running_requests_interrupted() {
+    async fn cancelled_running_request_is_marked_interrupted_once() {
         let store = Store::open_in_memory().await.unwrap();
         let log_id = store
             .begin_request_log(NewRunningRequestLog {
-                request_id: "req-interrupted",
+                request_id: "req-cancelled",
+                api_key_id: "key-cancelled",
+                session_hash: None,
+                provider_name: "provider-a",
+                protocol: "completions",
+                model: "model-a",
+                operation: "completions",
+                status_code: 0,
+                retry_count: 0,
+                first_byte_latency_ms: 0,
+                metadata_json: "{}",
+                request_body: None,
+            })
+            .await
+            .unwrap();
+
+        assert!(store
+            .interrupt_request_log(
+                &log_id,
+                "request_cancelled",
+                "Request was cancelled before completion",
+            )
+            .await
+            .unwrap());
+        assert!(!store
+            .interrupt_request_log(
+                &log_id,
+                "request_cancelled",
+                "Request was cancelled before completion",
+            )
+            .await
+            .unwrap());
+
+        let interrupted = store
+            .get_request_log_detail(&log_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(interrupted.status, "interrupted");
+        assert_eq!(interrupted.error_code.as_deref(), Some("request_cancelled"));
+        assert!(interrupted.finished_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn timeout_monitor_only_interrupts_expired_running_requests() {
+        let store = Store::open_in_memory().await.unwrap();
+        let expired_log_id = store
+            .begin_request_log(NewRunningRequestLog {
+                request_id: "req-timeout",
+                api_key_id: "key",
+                session_hash: None,
+                provider_name: "provider",
+                protocol: "messages",
+                model: "model",
+                operation: "messages",
+                status_code: 0,
+                retry_count: 0,
+                first_byte_latency_ms: 0,
+                metadata_json: "{}",
+                request_body: None,
+            })
+            .await
+            .unwrap();
+        let active_log_id = store
+            .begin_request_log(NewRunningRequestLog {
+                request_id: "req-active",
                 api_key_id: "key",
                 session_hash: None,
                 provider_name: "provider",
@@ -864,14 +982,65 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(store.interrupt_running_request_logs().await.unwrap(), 1);
+        let expired_at = (Utc::now() - chrono::Duration::seconds(2)).to_rfc3339();
+        sqlx::query("UPDATE request_logs SET created_at = ? WHERE id = ?")
+            .bind(expired_at)
+            .bind(&expired_log_id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .interrupt_timed_out_request_logs(std::time::Duration::from_secs(1))
+                .await
+                .unwrap(),
+            1
+        );
         let interrupted = store
-            .get_request_log_detail(&log_id)
+            .get_request_log_detail(&expired_log_id)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(interrupted.status, "interrupted");
-        assert_eq!(interrupted.error_code.as_deref(), Some("gateway_restarted"));
+        assert_eq!(interrupted.error_code.as_deref(), Some("request_timeout"));
         assert!(interrupted.finished_at.is_some());
+
+        let active = store
+            .get_request_log_detail(&active_log_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.status, "running");
+        assert!(active.finished_at.is_none());
+
+        assert_eq!(
+            store
+                .interrupt_timed_out_request_logs(std::time::Duration::from_secs(1))
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_monitor_query_uses_running_request_index() {
+        let store = Store::open_in_memory().await.unwrap();
+        let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(&format!(
+            "EXPLAIN QUERY PLAN {}",
+            super::INTERRUPT_TIMED_OUT_REQUEST_LOGS_SQL
+        ))
+        .bind("2026-08-18T12:00:01+00:00")
+        .bind("Request exceeded the total timeout of 1 seconds")
+        .bind("2026-08-18T12:00:01+00:00")
+        .bind("2026-08-18T12:00:01+00:00")
+        .bind("2026-08-18T12:00:00+00:00")
+        .fetch_all(&store.pool)
+        .await
+        .unwrap();
+
+        assert!(plan
+            .iter()
+            .any(|(_, _, _, detail)| { detail.contains("idx_request_logs_running_timeout") }));
     }
 }

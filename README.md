@@ -33,7 +33,7 @@ Platform runtime settings are CLI-only:
 
 Gateway settings live in `config.yaml`:
 
-- `upstream.timeout_secs` is the global timeout applied to every upstream provider request.
+- `upstream.timeout_secs` is the maximum duration of a complete gateway request. It includes all upstream attempts, retry backoff, and the full streaming response.
 - `providers[]` is the provider-level object. `name`, `api_key`, `models[]`, `priority`, `status`, and `headers` are shared for that provider.
 - `providers[].endpoints[]` defines upstream operation endpoints. Each endpoint declares exactly one `protocol` and one `base_url`.
 - `providers[].endpoints[].base_url` is sent to the upstream as-is.
@@ -66,7 +66,7 @@ This is a breaking configuration and management API change in `v0.0.11`:
   `upstream` section is present and all provider-level timeout fields are removed.
 - `POST /v1/admin/providers` rejects `timeout_secs`, and provider responses no
   longer include that field.
-- All providers now share the same timeout; per-provider timeout overrides are
+- All providers now share the same total request timeout; per-provider timeout overrides are
   intentionally unsupported.
 
 There is no database migration and no change to the public LLM protocol routes.

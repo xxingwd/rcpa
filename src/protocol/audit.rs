@@ -111,6 +111,18 @@ pub async fn complete_llm_request(
     Ok(())
 }
 
+pub async fn interrupt_llm_request(
+    state: &AppState,
+    log_id: &str,
+    error_code: &str,
+    error_message: &str,
+) -> crate::store::StoreResult<bool> {
+    state
+        .store
+        .interrupt_request_log(log_id, error_code, error_message)
+        .await
+}
+
 pub fn extract_provider_error(body: &serde_json::Value) -> (Option<String>, Option<String>) {
     let error = body.get("error");
     let code = error

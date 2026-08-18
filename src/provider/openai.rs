@@ -110,15 +110,15 @@ impl ProviderAdapter for OpenAIProvider {
         let body = self.rewrite_model_in_body(&req);
         let start = std::time::Instant::now();
 
-        self.in_flight.fetch_add(1, Ordering::Relaxed);
-        let result = self
-            .client
-            .post(&url)
-            .headers(self.build_header_map())
-            .json(&body)
-            .send()
-            .await;
-        self.in_flight.fetch_sub(1, Ordering::Relaxed);
+        let result = {
+            let _in_flight = super::InFlightGuard::new(&self.in_flight);
+            self.client
+                .post(&url)
+                .headers(self.build_header_map())
+                .json(&body)
+                .send()
+                .await
+        };
 
         match result {
             Ok(resp) => {
@@ -166,15 +166,15 @@ impl ProviderAdapter for OpenAIProvider {
         let body = self.rewrite_model_in_body(&req);
         let start = std::time::Instant::now();
 
-        self.in_flight.fetch_add(1, Ordering::Relaxed);
-        let result = self
-            .client
-            .post(&url)
-            .headers(self.build_header_map())
-            .json(&body)
-            .send()
-            .await;
-        self.in_flight.fetch_sub(1, Ordering::Relaxed);
+        let result = {
+            let _in_flight = super::InFlightGuard::new(&self.in_flight);
+            self.client
+                .post(&url)
+                .headers(self.build_header_map())
+                .json(&body)
+                .send()
+                .await
+        };
 
         match result {
             Ok(resp) => {

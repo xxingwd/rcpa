@@ -33,6 +33,9 @@ pub enum AppError {
     #[error("Provider timeout after {0:?}")]
     ProviderTimeout(Duration),
 
+    #[error("Request exceeded the total timeout of {0:?}")]
+    RequestTimeout(Duration),
+
     #[error("Protocol error: {0}")]
     ProtocolError(String),
 
@@ -63,7 +66,9 @@ impl AppError {
             AppError::ProviderError { status_code, .. } => {
                 status_code.unwrap_or(StatusCode::BAD_GATEWAY)
             }
-            AppError::ProviderTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
+            AppError::ProviderTimeout(_) | AppError::RequestTimeout(_) => {
+                StatusCode::GATEWAY_TIMEOUT
+            }
             AppError::ProtocolError(_) => StatusCode::UNPROCESSABLE_ENTITY,
             AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
             AppError::ConfigError(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -85,6 +90,7 @@ impl AppError {
                 .map(|code| Cow::Owned(code.clone()))
                 .unwrap_or_else(|| Cow::Borrowed("provider_error")),
             AppError::ProviderTimeout(_) => Cow::Borrowed("provider_timeout"),
+            AppError::RequestTimeout(_) => Cow::Borrowed("request_timeout"),
             AppError::ProtocolError(_) => Cow::Borrowed("protocol_error"),
             AppError::BadRequest(_) => Cow::Borrowed("bad_request"),
             AppError::ConfigError(_) => Cow::Borrowed("config_error"),

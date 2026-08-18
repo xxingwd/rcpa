@@ -212,6 +212,7 @@ pub fn default_status() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpstreamConfig {
+    /// Maximum duration of one complete gateway request, including retries and streaming.
     pub timeout_secs: u64,
 }
 
