@@ -18,6 +18,62 @@ pub fn model_from_body(body: &str) -> Option<String> {
         })
 }
 
+pub fn body_bytes_for_storage(operation: Operation, body: &serde_json::Value) -> Option<Vec<u8>> {
+    let mut body = body.clone();
+    if is_image_operation(operation) {
+        redact_base64(&mut body);
+    }
+    serde_json::to_vec(&body).ok()
+}
+
+pub fn raw_body_bytes_for_storage(operation: Operation, body: &[u8]) -> Option<Vec<u8>> {
+    if !is_image_operation(operation) {
+        return Some(body.to_vec());
+    }
+
+    let body = serde_json::from_slice(body).ok()?;
+    body_bytes_for_storage(operation, &body)
+}
+
+fn is_image_operation(operation: Operation) -> bool {
+    matches!(
+        operation,
+        Operation::ImagesGenerations | Operation::ImagesEdits
+    )
+}
+
+fn redact_base64(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, value) in object {
+                if key == "b64_json" {
+                    *value = serde_json::Value::String("[omitted]".into());
+                } else {
+                    redact_base64(value);
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                redact_base64(value);
+            }
+        }
+        serde_json::Value::String(text) if is_base64_data_url(text) => {
+            *text = "[omitted]".into();
+        }
+        _ => {}
+    }
+}
+
+fn is_base64_data_url(value: &str) -> bool {
+    let Some(comma) = value.find(',') else {
+        return false;
+    };
+    comma <= 256
+        && value[..comma].starts_with("data:")
+        && value[..comma].to_ascii_lowercase().contains(";base64")
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn record_llm_error(
     state: &AppState,
@@ -143,5 +199,40 @@ fn value_to_string(value: &serde_json::Value) -> Option<String> {
         serde_json::Value::Number(n) => Some(n.to_string()),
         serde_json::Value::Bool(b) => Some(b.to_string()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{body_bytes_for_storage, raw_body_bytes_for_storage};
+    use crate::protocol::common::Operation;
+
+    #[test]
+    fn image_log_bodies_redact_base64_recursively() {
+        let body = serde_json::json!({
+            "data": [{"b64_json": "generated-image"}],
+            "images": [{"image_url": "data:image/png;base64,input-image"}],
+            "prompt": "keep me"
+        });
+
+        let stored = body_bytes_for_storage(Operation::ImagesGenerations, &body).unwrap();
+        let stored: serde_json::Value = serde_json::from_slice(&stored).unwrap();
+        assert_eq!(stored["data"][0]["b64_json"], "[omitted]");
+        assert_eq!(stored["images"][0]["image_url"], "[omitted]");
+        assert_eq!(stored["prompt"], "keep me");
+    }
+
+    #[test]
+    fn invalid_image_json_is_not_stored() {
+        assert!(raw_body_bytes_for_storage(Operation::ImagesEdits, b"not-json").is_none());
+    }
+
+    #[test]
+    fn non_image_log_bodies_are_unchanged() {
+        let body = br#"{"b64_json":"ordinary-field"}"#;
+        assert_eq!(
+            raw_body_bytes_for_storage(Operation::Completions, body),
+            Some(body.to_vec())
+        );
     }
 }

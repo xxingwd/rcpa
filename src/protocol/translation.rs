@@ -18,7 +18,10 @@ pub fn candidate_protocols(operation: Operation, _stream: bool) -> Vec<ProviderP
         Operation::Responses => {
             vec![ProviderProtocol::Responses, ProviderProtocol::Completions]
         }
-        Operation::Embeddings | Operation::ListModels => vec![native],
+        Operation::Embeddings
+        | Operation::ImagesGenerations
+        | Operation::ImagesEdits
+        | Operation::ListModels => vec![native],
     }
 }
 
@@ -1981,6 +1984,15 @@ mod tests {
                 vec![ProviderProtocol::Responses, ProviderProtocol::Completions]
             );
         }
+
+        assert_eq!(
+            candidate_protocols(Operation::ImagesGenerations, false),
+            vec![ProviderProtocol::ImagesGenerations]
+        );
+        assert_eq!(
+            candidate_protocols(Operation::ImagesEdits, false),
+            vec![ProviderProtocol::ImagesEdits]
+        );
     }
 
     #[test]

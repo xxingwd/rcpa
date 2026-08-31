@@ -25,6 +25,8 @@ pub enum ProviderProtocol {
     Responses,
     Messages,
     Embeddings,
+    ImagesGenerations,
+    ImagesEdits,
 }
 
 impl std::fmt::Display for ProviderProtocol {
@@ -34,6 +36,8 @@ impl std::fmt::Display for ProviderProtocol {
             ProviderProtocol::Responses => write!(f, "responses"),
             ProviderProtocol::Messages => write!(f, "messages"),
             ProviderProtocol::Embeddings => write!(f, "embeddings"),
+            ProviderProtocol::ImagesGenerations => write!(f, "images_generations"),
+            ProviderProtocol::ImagesEdits => write!(f, "images_edits"),
         }
     }
 }
@@ -56,6 +60,9 @@ pub struct ProviderConfig {
     /// A value of `none` disables thinking mode for that key.
     #[serde(default)]
     pub reasoning_effort_map: BTreeMap<String, String>,
+    /// Allow requests for model names that are not declared in `models`.
+    #[serde(default)]
+    pub model_passthrough: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -783,6 +790,20 @@ mod tests {
     }
 
     #[test]
+    fn test_image_provider_protocols_are_explicit() {
+        assert_eq!(
+            serde_yaml::from_str::<ProviderProtocol>("images_generations").unwrap(),
+            ProviderProtocol::ImagesGenerations
+        );
+        assert_eq!(
+            serde_yaml::from_str::<ProviderProtocol>("images_edits").unwrap(),
+            ProviderProtocol::ImagesEdits
+        );
+        assert!(serde_yaml::from_str::<ProviderProtocol>("images").is_err());
+        assert!(serde_yaml::from_str::<ProviderProtocol>("image_generations").is_err());
+    }
+
+    #[test]
     fn test_missing_config_is_bootstrapped() {
         let temp_dir =
             std::env::temp_dir().join(format!("rcpa-bootstrap-test-{}", uuid::Uuid::new_v4()));
@@ -1018,6 +1039,7 @@ keys: []
             status: "enabled".into(),
             priority: 1,
             reasoning_effort_map: Default::default(),
+            model_passthrough: false,
         }];
 
         let expanded = config.expanded().unwrap();
@@ -1222,6 +1244,7 @@ keys: []
             status: "enabled".into(),
             priority: 0,
             reasoning_effort_map: Default::default(),
+            model_passthrough: false,
         }
     }
 

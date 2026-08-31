@@ -665,6 +665,8 @@ pub struct CreateProviderPayload {
     pub headers: Option<IndexMap<String, String>>,
     pub status: Option<String>,
     pub priority: Option<i64>,
+    #[serde(default)]
+    pub model_passthrough: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -795,6 +797,12 @@ pub async fn create_provider(
                     .map(|provider| provider.priority)
                     .unwrap_or(0)
             });
+            let model_passthrough = payload.model_passthrough.unwrap_or_else(|| {
+                existing_provider
+                    .as_ref()
+                    .map(|provider| provider.model_passthrough)
+                    .unwrap_or(false)
+            });
             let provider = ProviderConfig {
                 name: provider_name.clone(),
                 api_key: api_key.clone(),
@@ -810,6 +818,7 @@ pub async fn create_provider(
                     .as_ref()
                     .map(|provider| provider.reasoning_effort_map.clone())
                     .unwrap_or_default(),
+                model_passthrough,
             };
             if let Some(existing) = config
                 .providers
@@ -884,6 +893,9 @@ pub async fn update_provider(
         status: payload.status.unwrap_or_else(|| existing.status.clone()),
         priority: payload.priority.unwrap_or(existing.priority),
         reasoning_effort_map: existing.reasoning_effort_map.clone(),
+        model_passthrough: payload
+            .model_passthrough
+            .unwrap_or(existing.model_passthrough),
     };
 
     let mut candidate = current.raw_config.clone();

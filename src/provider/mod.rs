@@ -77,7 +77,9 @@ impl ProviderRegistry {
                 let provider: Arc<dyn ProviderAdapter> = match endpoint.protocol {
                     ProviderProtocol::Completions
                     | ProviderProtocol::Responses
-                    | ProviderProtocol::Embeddings => Arc::new(openai::OpenAIProvider::new(
+                    | ProviderProtocol::Embeddings
+                    | ProviderProtocol::ImagesGenerations
+                    | ProviderProtocol::ImagesEdits => Arc::new(openai::OpenAIProvider::new(
                         provider_config,
                         &endpoint.base_url,
                         &config.upstream,

@@ -9,6 +9,8 @@ Supported request protocols are:
 - `completions`
 - `responses`
 - `messages`
+- `images/generations`
+- `images/edits` (JSON and multipart)
 
 ## Quick Start
 
@@ -37,10 +39,15 @@ Gateway settings live in `config.yaml`:
 - `providers[]` is the provider-level object. `name`, `api_key`, `models[]`, `priority`, `status`, and `headers` are shared for that provider.
 - `providers[].endpoints[]` defines upstream operation endpoints. Each endpoint declares exactly one `protocol` and one `base_url`.
 - `providers[].endpoints[].base_url` is sent to the upstream as-is.
-- `providers[].endpoints[].protocol` is operation-level: use `completions` for `/v1/chat/completions`; the other values are `responses`, `messages`, and `embeddings`.
+- `providers[].endpoints[].protocol` is operation-level: use `completions` for `/v1/chat/completions`; the other values are `responses`, `messages`, `embeddings`, `images_generations`, and `images_edits`.
 - `providers[].endpoints[].protocol` values must be unique within a provider.
 - `providers[].models[].name` is the real upstream model name.
 - `providers[].models[].aliases` are the public model names exposed by RCPA.
+- `providers[].model_passthrough` enables provider-level model passthrough. When
+  true, requests for names not declared in `models` are forwarded unchanged to
+  that provider; declared models, aliases, and their pricing remain unchanged
+  and take precedence. API key model restrictions still apply to the requested
+  model name.
 - Config-backed lists preserve their YAML order. The admin UI can reorder providers,
   provider models, endpoints, headers, API keys, and key model rules; saving writes
   the new order back to `config.yaml`.
@@ -76,6 +83,8 @@ There is no database migration and no change to the public LLM protocol routes.
 SQLite is the default storage backend. Schema changes are versioned through migrations. If the schema is out of date or migration order is invalid, startup fails until the database is migrated explicitly.
 
 Request and response bodies use a fixed retention policy: successful request bodies are cleared after 24 hours and failed request bodies after 7 days. Cleanup runs daily at 03:00 Asia/Shanghai in batches of 500; request log rows, metadata, token usage, cost, latency, and analytics metrics are retained. After cleanup, storage maintenance truncates the WAL and runs `VACUUM` when bodies were cleared or freelist pages are available, then truncates the WAL again so reclaimed space is returned to the filesystem.
+
+Image request and response logs never persist base64 payloads from `b64_json` or data URLs, multipart file bytes, or streaming response bodies. Redacted fields use `[omitted]`; file metadata and image usage metrics are retained.
 
 ## Docker
 

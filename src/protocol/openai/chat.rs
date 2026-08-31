@@ -107,7 +107,7 @@ fn rewrite_sse_model(chunk: &[u8], alias: &str) -> Vec<u8> {
             if json_str == "[DONE]" {
                 output.push_str(line);
             } else if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(json_str) {
-                if let Some(obj) = v.as_object_mut() {
+                if let Some(obj) = v.as_object_mut().filter(|obj| obj.contains_key("model")) {
                     obj.insert(
                         "model".to_string(),
                         serde_json::Value::String(alias.to_string()),
@@ -158,7 +158,12 @@ fn trim_ascii_whitespace(mut value: &[u8]) -> &[u8] {
 fn is_terminal_stream_event(value: &serde_json::Value) -> bool {
     matches!(
         value.get("type").and_then(|event_type| event_type.as_str()),
-        Some("message_stop" | "response.completed")
+        Some(
+            "message_stop"
+                | "response.completed"
+                | "image_generation.completed"
+                | "image_edit.completed"
+        )
     )
 }
 
@@ -2159,11 +2164,13 @@ fn prepare_attempt(
         | crate::config::ProviderProtocol::Embeddings => Protocol::Completions,
         crate::config::ProviderProtocol::Responses => Protocol::Responses,
         crate::config::ProviderProtocol::Messages => Protocol::Messages,
+        crate::config::ProviderProtocol::ImagesGenerations
+        | crate::config::ProviderProtocol::ImagesEdits => Protocol::Images,
     };
     modified_req.model = actual_model.clone();
     modified_req.body = translated_body;
     let outbound_request_body = provider.serialize_request_body(&modified_req);
-    let request_body_bytes = serde_json::to_vec(&outbound_request_body).ok();
+    let request_body_bytes = audit::body_bytes_for_storage(req.operation, &outbound_request_body);
     let stream_transform = SseTransform::for_route(upstream_protocol, req.operation, &ctx.model);
 
     Ok(PreparedAttempt {
@@ -2501,7 +2508,8 @@ async fn execute_non_stream_attempt(
             let latency = input.start.elapsed();
             let latency_ms = latency.as_millis() as i64;
             let first_byte_latency_ms = response.first_byte_latency_ms as i64;
-            let response_body_bytes = serde_json::to_vec(&response.body).ok();
+            let response_body_bytes =
+                audit::body_bytes_for_storage(input.ctx.operation, &response.body);
             let downstream_body = if response.status < 400 {
                 match translation::translate_response_body(
                     prepared.upstream_protocol,
@@ -2701,7 +2709,12 @@ async fn execute_non_stream_attempt(
             let status =
                 StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             let mut body = downstream_body;
-            if let Some(obj) = body.as_object_mut() {
+            if let Some(obj) = body.as_object_mut().filter(|_| {
+                !matches!(
+                    input.ctx.operation,
+                    Operation::ImagesGenerations | Operation::ImagesEdits
+                )
+            }) {
                 obj.insert(
                     "model".to_string(),
                     serde_json::Value::String(input.ctx.model.clone()),
@@ -3391,7 +3404,7 @@ async fn proxy_to_provider_inner(
     timeout: Duration,
     request_audit_guard: &mut RunningRequestAuditGuard,
 ) -> AppResult<Response> {
-    let original_request_body_bytes = serde_json::to_vec(&req.body).ok();
+    let original_request_body_bytes = audit::body_bytes_for_storage(req.operation, &req.body);
     let api_key_id = auth::persisted_api_key_id(&ctx.auth_key);
     let retry_policy = RetryPolicy::from_config(&ctx.config_snapshot.config.retry);
     let max_attempts = retry_policy.max_attempts();
@@ -3576,7 +3589,12 @@ mod tests {
 
     #[test]
     fn recognizes_json_stream_terminal_events() {
-        for event_type in ["message_stop", "response.completed"] {
+        for event_type in [
+            "message_stop",
+            "response.completed",
+            "image_generation.completed",
+            "image_edit.completed",
+        ] {
             assert!(is_terminal_stream_event(&serde_json::json!({
                 "type": event_type
             })));
@@ -3603,6 +3621,15 @@ mod tests {
         let chunk = "data: [DONE]\n\n";
         let result = rewrite_sse_model(chunk.as_bytes(), "my-gpt");
         assert_eq!(String::from_utf8(result).unwrap(), "data: [DONE]\n\n");
+    }
+
+    #[test]
+    fn rewrite_sse_model_does_not_add_a_missing_model_field() {
+        let chunk = "data: {\"type\":\"image_generation.completed\",\"b64_json\":\"image\"}\n\n";
+        let result = rewrite_sse_model(chunk.as_bytes(), "image-alias");
+        let value = String::from_utf8(result).unwrap();
+        assert!(!value.contains("\"model\""));
+        assert!(value.contains("\"b64_json\":\"image\""));
     }
 
     #[test]

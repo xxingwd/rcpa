@@ -36,6 +36,11 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
         .route("/chat/completions", post(openai::chat::chat_completions))
         .route("/responses", post(openai::responses::responses))
         .route("/embeddings", post(openai::embeddings::embeddings))
+        .route(
+            "/images/generations",
+            post(openai::images::images_generations),
+        )
+        .route("/images/edits", post(openai::images::images_edits))
         .route("/messages", post(anthropic::messages::messages))
         .route(
             "/admin/providers",

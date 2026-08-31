@@ -24,6 +24,7 @@ pub struct ModelEndpoint {
     pub protocol: ProviderProtocol,
     pub base_url: String,
     pub adapter_kind: &'static str,
+    pub is_passthrough: bool,
 }
 
 #[derive(Clone)]
@@ -66,6 +67,7 @@ pub struct ProviderView {
     pub headers: IndexMap<String, String>,
     pub status: String,
     pub priority: i64,
+    pub model_passthrough: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -314,8 +316,21 @@ impl ConfigSnapshot {
                             protocol: endpoint.protocol,
                             base_url: endpoint.base_url.clone(),
                             adapter_kind,
+                            is_passthrough: false,
                         });
                     }
+                }
+                if provider.model_passthrough {
+                    global.push(ModelEndpoint {
+                        alias_name: "*".to_string(),
+                        name: String::new(),
+                        provider_name: provider.name.clone(),
+                        priority: provider.priority,
+                        protocol: endpoint.protocol,
+                        base_url: endpoint.base_url.clone(),
+                        adapter_kind,
+                        is_passthrough: true,
+                    });
                 }
             }
         }
@@ -337,6 +352,7 @@ impl ConfigSnapshot {
                             protocol: source.protocol,
                             base_url: source.base_url.clone(),
                             adapter_kind: source.adapter_kind,
+                            is_passthrough: source.is_passthrough,
                         });
                     }
                 }
@@ -405,6 +421,7 @@ impl ConfigSnapshot {
 
     pub fn endpoints_for_alias(&self, alias: &str, key: Option<&AuthKey>) -> Vec<ModelEndpoint> {
         let mut results = Vec::new();
+        let mut passthrough = Vec::new();
         let provider_allowed = |provider_name: &str| {
             key.map(|key| {
                 key.allowed_providers.is_empty()
@@ -423,7 +440,11 @@ impl ConfigSnapshot {
                             || (ep.alias_name.contains('*')
                                 && wildcard_match(&ep.alias_name, alias)))
                     {
-                        results.push(ep.clone());
+                        if ep.is_passthrough {
+                            passthrough.push(ep.clone());
+                        } else {
+                            results.push(ep.clone());
+                        }
                     }
                 }
             }
@@ -433,10 +454,44 @@ impl ConfigSnapshot {
                 && (ep.alias_name == alias
                     || (ep.alias_name.contains('*') && wildcard_match(&ep.alias_name, alias)))
             {
-                results.push(ep.clone());
+                if ep.is_passthrough {
+                    passthrough.push(ep.clone());
+                } else {
+                    results.push(ep.clone());
+                }
+            }
+        }
+
+        for ep in passthrough {
+            if self.provider_declares_model_name(&ep.provider_name, alias) {
+                continue;
+            }
+            let has_explicit_match = results
+                .iter()
+                .any(|explicit| explicit.protocol == ep.protocol);
+            if !has_explicit_match {
+                results.push(ModelEndpoint {
+                    alias_name: alias.to_string(),
+                    name: alias.to_string(),
+                    ..ep
+                });
             }
         }
         results
+    }
+
+    fn provider_declares_model_name(&self, provider_name: &str, requested: &str) -> bool {
+        self.find_provider(provider_name)
+            .map(|provider| {
+                provider.models.iter().any(|rule| {
+                    rule.name == requested
+                        || rule.aliases.iter().any(|alias| alias == requested)
+                        || (rule.aliases.is_empty()
+                            && rule.name.contains('*')
+                            && wildcard_match(&rule.name, requested))
+                })
+            })
+            .unwrap_or(false)
     }
 
     pub fn has_endpoint(&self, alias: &str, key: Option<&AuthKey>) -> bool {
@@ -518,7 +573,9 @@ fn provider_adapter_kind(provider: &ProviderConfig) -> &'static str {
             ProviderProtocol::Messages => "anthropic",
             ProviderProtocol::Completions
             | ProviderProtocol::Responses
-            | ProviderProtocol::Embeddings => "openai",
+            | ProviderProtocol::Embeddings
+            | ProviderProtocol::ImagesGenerations
+            | ProviderProtocol::ImagesEdits => "openai",
         })
         .unwrap_or("openai")
 }
@@ -532,6 +589,7 @@ fn provider_view(provider: &ProviderConfig) -> ProviderView {
         headers: provider.headers.clone(),
         status: provider.status.clone(),
         priority: provider.priority,
+        model_passthrough: provider.model_passthrough,
     }
 }
 
@@ -570,6 +628,7 @@ mod tests {
                 status: "enabled".to_string(),
                 priority: 1,
                 reasoning_effort_map: Default::default(),
+                model_passthrough: false,
             }],
             upstream: UpstreamConfig { timeout_secs: 30 },
             routing: RoutingConfig {
@@ -618,5 +677,28 @@ mod tests {
         assert!(snapshot.find_provider("provider-bb").is_some());
 
         std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn model_passthrough_coexists_with_explicit_models() {
+        let mut config = test_config("provider");
+        config.providers[0].model_passthrough = true;
+
+        let snapshot = ConfigSnapshot::build(config.clone()).unwrap();
+        let explicit = snapshot.endpoints_for_alias("gpt-4o", None);
+        assert_eq!(explicit.len(), 1);
+        assert_eq!(explicit[0].name, "gpt-4o");
+        assert!(!explicit[0].is_passthrough);
+
+        let passthrough = snapshot.endpoints_for_alias("vendor-model", None);
+        assert_eq!(passthrough.len(), 1);
+        assert_eq!(passthrough[0].alias_name, "vendor-model");
+        assert_eq!(passthrough[0].name, "vendor-model");
+        assert!(passthrough[0].is_passthrough);
+
+        config.providers[0].models[0].aliases = vec!["public-gpt".to_string()];
+        let snapshot = ConfigSnapshot::build(config).unwrap();
+        assert!(snapshot.endpoints_for_alias("gpt-4o", None).is_empty());
+        assert_eq!(snapshot.endpoints_for_alias("public-gpt", None).len(), 1);
     }
 }

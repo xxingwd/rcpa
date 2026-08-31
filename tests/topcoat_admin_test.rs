@@ -57,6 +57,7 @@ fn populated_config() -> AppConfig {
         status: "enabled".to_string(),
         priority: 7,
         reasoning_effort_map: Default::default(),
+        model_passthrough: false,
     });
     config.keys.push(AuthKey {
         id: "fixture-key".to_string(),
@@ -508,6 +509,7 @@ async fn admin_pages_require_cookie_and_render_the_shared_rust_shell() {
             html.contains("name=\"priority\" value=\"7\""),
             "path: {path}"
         );
+        assert!(html.contains("name=\"model_passthrough\""), "path: {path}");
         assert!(
             html.contains("<option value=\"enabled\" selected>"),
             "path: {path}"

@@ -259,6 +259,7 @@ mod tests {
             headers: Default::default(),
             priority: 1,
             reasoning_effort_map: Default::default(),
+            model_passthrough: false,
             status: "enabled".to_string(),
         };
         let provider = AnthropicProvider::new(

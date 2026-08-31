@@ -28,9 +28,15 @@ providers:
     base_url: https://api.openai.com/v1/chat/completions
   - protocol: responses
     base_url: https://api.openai.com/v1/responses
+  # - protocol: images_generations
+  #   base_url: https://api.openai.com/v1/images/generations
+  # - protocol: images_edits
+  #   base_url: https://api.openai.com/v1/images/edits
   headers: {}
   status: enabled
   priority: 0
+  # Set true to forward undeclared model names to this provider.
+  model_passthrough: false
 
 - name: anthropic
   api_key: replace-with-anthropic-api-key

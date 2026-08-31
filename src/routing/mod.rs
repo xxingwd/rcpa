@@ -413,6 +413,7 @@ mod tests {
             status: "enabled".to_string(),
             priority: 0,
             reasoning_effort_map: Default::default(),
+            model_passthrough: false,
         }
     }
 
@@ -456,6 +457,7 @@ mod tests {
             protocol: ProviderProtocol::Completions,
             base_url: "https://a.example.com/v1/chat/completions".into(),
             adapter_kind: "openai",
+            is_passthrough: false,
         };
         let ep_b = ep_a.clone();
         let ep_b = ModelEndpoint {
@@ -772,6 +774,7 @@ mod tests {
             status: "enabled".to_string(),
             priority: 0,
             reasoning_effort_map: Default::default(),
+            model_passthrough: false,
         }];
 
         let snapshot = ConfigSnapshot::build(config).unwrap();

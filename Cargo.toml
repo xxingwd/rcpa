@@ -1,6 +1,6 @@
 [package]
 name = "rcpa"
-version = "0.0.15"
+version = "0.0.16"
 edition = "2021"
 description = "Rust Cloud Proxy API - LLM gateway"
 readme = "README.md"
@@ -20,7 +20,7 @@ topcoat = { git = "https://github.com/tokio-rs/topcoat.git", features = ["view",
 topcoat-router = { git = "https://github.com/tokio-rs/topcoat.git", features = ["tower", "discover"] }
 
 # HTTP client
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "gzip", "brotli", "http2"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream", "gzip", "brotli", "http2"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

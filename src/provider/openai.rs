@@ -4,7 +4,7 @@ use reqwest::Client;
 
 use crate::config::{ProviderConfig, UpstreamConfig};
 use crate::error::{AppError, AppResult};
-use crate::protocol::common::{ProxyRequest, TokenUsage};
+use crate::protocol::common::{MultipartPartValue, ProxyRequest, TokenUsage};
 
 use super::client::build_client;
 use super::{ProviderAdapter, ProviderResponse, ProviderStreamResponse};
@@ -69,7 +69,9 @@ impl OpenAIProvider {
         match operation {
             crate::protocol::common::Operation::Completions
             | crate::protocol::common::Operation::Responses
-            | crate::protocol::common::Operation::Embeddings => Ok(self.endpoint_url.clone()),
+            | crate::protocol::common::Operation::Embeddings
+            | crate::protocol::common::Operation::ImagesGenerations
+            | crate::protocol::common::Operation::ImagesEdits => Ok(self.endpoint_url.clone()),
             _ => Err(AppError::ProtocolError(format!(
                 "Unsupported operation {:?} for OpenAI provider",
                 operation
@@ -97,6 +99,55 @@ impl OpenAIProvider {
         }
         body
     }
+
+    fn request_builder(&self, req: &ProxyRequest) -> AppResult<reqwest::RequestBuilder> {
+        let mut headers = self.build_header_map();
+        let request = self.client.post(self.resolve_url(&req.operation)?);
+
+        let Some(multipart) = &req.multipart else {
+            return Ok(request
+                .headers(headers)
+                .json(&self.rewrite_model_in_body(req)));
+        };
+
+        headers.remove(reqwest::header::CONTENT_TYPE);
+        let mut form = reqwest::multipart::Form::new();
+        for part in &multipart.parts {
+            match &part.value {
+                MultipartPartValue::Text(value) => {
+                    let value = if part.name == "model" {
+                        req.model.clone()
+                    } else {
+                        value.clone()
+                    };
+                    form = form.text(part.name.clone(), value);
+                }
+                MultipartPartValue::File {
+                    filename,
+                    content_type,
+                    data,
+                } => {
+                    let mut file = reqwest::multipart::Part::stream_with_length(
+                        data.clone(),
+                        data.len() as u64,
+                    );
+                    if let Some(filename) = filename {
+                        file = file.file_name(filename.clone());
+                    }
+                    if let Some(content_type) = content_type {
+                        file = file.mime_str(content_type).map_err(|error| {
+                            AppError::BadRequest(format!(
+                                "invalid multipart content type '{content_type}': {error}"
+                            ))
+                        })?;
+                    }
+                    form = form.part(part.name.clone(), file);
+                }
+            }
+        }
+
+        Ok(request.headers(headers).multipart(form))
+    }
 }
 
 #[async_trait::async_trait]
@@ -106,18 +157,11 @@ impl ProviderAdapter for OpenAIProvider {
     }
 
     async fn proxy(&self, req: ProxyRequest) -> AppResult<ProviderResponse> {
-        let url = self.resolve_url(&req.operation)?;
-        let body = self.rewrite_model_in_body(&req);
         let start = std::time::Instant::now();
 
         let result = {
             let _in_flight = super::InFlightGuard::new(&self.in_flight);
-            self.client
-                .post(&url)
-                .headers(self.build_header_map())
-                .json(&body)
-                .send()
-                .await
+            self.request_builder(&req)?.send().await
         };
 
         match result {
@@ -162,18 +206,11 @@ impl ProviderAdapter for OpenAIProvider {
     }
 
     async fn proxy_stream(&self, req: ProxyRequest) -> AppResult<ProviderStreamResponse> {
-        let url = self.resolve_url(&req.operation)?;
-        let body = self.rewrite_model_in_body(&req);
         let start = std::time::Instant::now();
 
         let result = {
             let _in_flight = super::InFlightGuard::new(&self.in_flight);
-            self.client
-                .post(&url)
-                .headers(self.build_header_map())
-                .json(&body)
-                .send()
-                .await
+            self.request_builder(&req)?.send().await
         };
 
         match result {
@@ -311,6 +348,7 @@ mod tests {
             headers: Default::default(),
             priority: 1,
             reasoning_effort_map: Default::default(),
+            model_passthrough: false,
             status: "enabled".to_string(),
         };
         let provider = OpenAIProvider::new(
@@ -330,6 +368,7 @@ mod tests {
                 "stream": true,
                 "messages": [{ "role": "user", "content": "hi" }]
             }),
+            multipart: None,
             stream: true,
         };
 
@@ -350,6 +389,7 @@ mod tests {
             headers: Default::default(),
             priority: 1,
             reasoning_effort_map: Default::default(),
+            model_passthrough: false,
             status: "enabled".to_string(),
         };
         let provider = OpenAIProvider::new(

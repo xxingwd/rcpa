@@ -460,6 +460,15 @@ pub async fn providers_table(cx: &Cx) -> Result {
         } else {
             "启用"
         };
+        let model_badges = render_model_badges(name, &provider.models);
+        let model_badges = if provider.model_passthrough {
+            format!(
+                r#"{}<span class="inline-flex rounded-full bg-sky-100 px-2 py-0.5 font-mono text-[10px] text-sky-700">透传开启</span>"#,
+                model_badges
+            )
+        } else {
+            model_badges
+        };
         let _endpoints_json = serde_json::to_string(&provider.endpoints).unwrap_or_default();
         let _models_json = serde_json::to_string(&provider.models).unwrap_or_default();
         let _headers_json = serde_json::to_string(&provider.headers).unwrap_or_default();
@@ -514,7 +523,7 @@ pub async fn providers_table(cx: &Cx) -> Result {
             render_protocol_badges(&provider.endpoints),
             priority,
             status_class, status_text,
-            render_model_badges(name, &provider.models),
+            model_badges,
             name_js, name_js, name_js, escape_inline_js_string(&provider.status), toggle_text, name_js
         ));
     }
@@ -574,6 +583,7 @@ pub async fn providers_new(cx: &Cx) -> Result {
         api_key: "",
         status: "enabled",
         priority: 0,
+        model_passthrough: false,
         endpoints: &[],
         models: &[],
         headers: &empty_headers,
@@ -656,6 +666,7 @@ struct ProviderForm<'a> {
     api_key: &'a str,
     status: &'a str,
     priority: i64,
+    model_passthrough: bool,
     endpoints: &'a [EndpointConfig],
     models: &'a [ModelRule],
     headers: &'a IndexMap<String, String>,
@@ -677,6 +688,7 @@ impl<'a> ProviderForm<'a> {
             api_key: &provider.api_key,
             status: &provider.status,
             priority: provider.priority,
+            model_passthrough: provider.model_passthrough,
             endpoints: &provider.endpoints,
             models: &provider.models,
             headers: &provider.headers,
@@ -711,6 +723,7 @@ fn render_provider_form(form: ProviderForm<'_>) -> String {
         api_key,
         status,
         priority,
+        model_passthrough,
         endpoints,
         models,
         headers,
@@ -736,6 +749,8 @@ fn render_provider_form(form: ProviderForm<'_>) -> String {
                             <option value="responses" {}>responses</option>
                             <option value="messages" {}>messages</option>
                             <option value="embeddings" {}>embeddings</option>
+                            <option value="images_generations" {}>images_generations</option>
+                            <option value="images_edits" {}>images_edits</option>
                         </select>
                     </div>
                     <div class="col-span-8">
@@ -751,6 +766,8 @@ fn render_provider_form(form: ProviderForm<'_>) -> String {
                 if protocol == "responses" { "selected" } else { "" },
                 if protocol == "messages" { "selected" } else { "" },
                 if protocol == "embeddings" { "selected" } else { "" },
+                if protocol == "images_generations" { "selected" } else { "" },
+                if protocol == "images_edits" { "selected" } else { "" },
                 i, escape_html(&ep.base_url)
             )
         }).collect::<Vec<_>>().join("")
@@ -869,6 +886,17 @@ fn render_provider_form(form: ProviderForm<'_>) -> String {
         </div>
 
         <div class="border-t border-zinc-200 pt-4">
+            <input type="hidden" name="model_passthrough" value="false">
+            <label class="flex min-h-[44px] cursor-pointer items-start gap-3">
+                <input type="checkbox" name="model_passthrough" value="true" {model_passthrough_checked} class="mt-0.5 h-4 w-4 rounded border-zinc-300 text-sky-600 focus:ring-sky-500">
+                <span>
+                    <span class="block text-sm font-medium text-zinc-800">允许模型透传</span>
+                    <span class="mt-1 block text-xs text-zinc-500">开启后，未配置在模型目录中的模型名也会原样转发给此供应商；已配置模型仍优先使用现有别名和费率。</span>
+                </span>
+            </label>
+        </div>
+
+        <div class="border-t border-zinc-200 pt-4">
             <div class="mb-3 flex items-center justify-between">
                 <div>
                     <h4 class="text-sm font-semibold">自定义 Headers</h4>
@@ -927,6 +955,8 @@ fn render_provider_form(form: ProviderForm<'_>) -> String {
                             <option value="responses">responses</option>
                             <option value="messages">messages</option>
                             <option value="embeddings">embeddings</option>
+                            <option value="images_generations">images_generations</option>
+                            <option value="images_edits">images_edits</option>
                         </select>
                     </div>
                     <div class="col-span-8">
@@ -1023,6 +1053,7 @@ fn render_provider_form(form: ProviderForm<'_>) -> String {
         api_key_html = escape_html(api_key),
         endpoints_html = endpoints_html,
         priority = priority,
+        model_passthrough_checked = if model_passthrough { "checked" } else { "" },
         enabled_selected = if status == "enabled" { "selected" } else { "" },
         disabled_selected = if status == "enabled" { "" } else { "selected" },
         headers_html = headers_html,

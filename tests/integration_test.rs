@@ -95,6 +95,118 @@ async fn spawn_openai_mock_provider(
     format!("http://{}/v1/chat/completions", addr)
 }
 
+async fn spawn_openai_image_json_mock_provider(
+    path: &'static str,
+) -> (String, Arc<std::sync::Mutex<Vec<serde_json::Value>>>) {
+    use axum::{routing::post, Json, Router};
+    use tokio::net::TcpListener;
+
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let app = Router::new().route(
+        path,
+        post({
+            let requests = requests.clone();
+            move |Json(body): Json<serde_json::Value>| {
+                let requests = requests.clone();
+                async move {
+                    requests.lock().unwrap().push(body.clone());
+                    (
+                        axum::http::StatusCode::OK,
+                        Json(serde_json::json!({
+                            "created": 1,
+                            "data": [{"b64_json": "aW1hZ2U=", "revised_prompt": body["prompt"]}],
+                            "usage": {"total_tokens": 1}
+                        })),
+                    )
+                }
+            }
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}{path}"), requests)
+}
+
+type MultipartField = (String, Option<String>, Option<String>, Vec<u8>);
+
+async fn spawn_openai_image_multipart_mock_provider(
+) -> (String, Arc<std::sync::Mutex<Vec<MultipartField>>>) {
+    use axum::{extract::Multipart, routing::post, Json, Router};
+    use tokio::net::TcpListener;
+
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let app = Router::new().route(
+        "/v1/images/edits",
+        post({
+            let requests = requests.clone();
+            move |mut multipart: Multipart| {
+                let requests = requests.clone();
+                async move {
+                    let mut fields = Vec::new();
+                    while let Some(field) = multipart.next_field().await.unwrap() {
+                        let name = field.name().unwrap().to_string();
+                        let filename = field.file_name().map(ToString::to_string);
+                        let content_type = field.content_type().map(ToString::to_string);
+                        let data = field.bytes().await.unwrap().to_vec();
+                        fields.push((name, filename, content_type, data));
+                    }
+                    requests.lock().unwrap().extend(fields);
+                    (
+                        axum::http::StatusCode::OK,
+                        Json(serde_json::json!({
+                            "created": 1,
+                            "data": [{"b64_json": "ZWRpdGVk"}]
+                        })),
+                    )
+                }
+            }
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}/v1/images/edits"), requests)
+}
+
+async fn spawn_openai_image_streaming_mock_provider() -> String {
+    use axum::{response::IntoResponse, routing::post, Router};
+    use tokio::net::TcpListener;
+
+    fn stream_response(event_type: &'static str) -> axum::response::Response {
+        (
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            format!(
+                "event: {event_type}\ndata: {{\"type\":\"{event_type}\",\"b64_json\":\"stream-image\",\"usage\":{{\"input_tokens\":2,\"output_tokens\":3,\"total_tokens\":5}}}}\n\n"
+            ),
+        )
+            .into_response()
+    }
+
+    let app = Router::new()
+        .route(
+            "/v1/images/generations",
+            post(|| async { stream_response("image_generation.completed") }),
+        )
+        .route(
+            "/v1/images/edits",
+            post(|| async { stream_response("image_edit.completed") }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}/v1/images")
+}
+
 async fn spawn_blocking_openai_mock_provider(
 ) -> (String, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
     use axum::{routing::post, Json, Router};
@@ -692,6 +804,7 @@ fn provider_with_endpoints(
         status: "enabled".to_string(),
         priority: 5,
         reasoning_effort_map: Default::default(),
+        model_passthrough: false,
     }
 }
 
@@ -701,6 +814,8 @@ fn provider_protocol(value: &str) -> ProviderProtocol {
         "responses" => ProviderProtocol::Responses,
         "messages" => ProviderProtocol::Messages,
         "embeddings" => ProviderProtocol::Embeddings,
+        "images_generations" => ProviderProtocol::ImagesGenerations,
+        "images_edits" => ProviderProtocol::ImagesEdits,
         other => panic!("unknown provider protocol {other}"),
     }
 }
@@ -910,7 +1025,7 @@ async fn test_admin_provider_update_changes_status() {
         .header("x-admin-token", "admin-token")
         .header("content-type", "application/json")
         .body(Body::from(
-            r#"{"name":"openai-test-provider","api_key":"sk-updated","models":[{"name":"gpt-4o","status":"enabled","aliases":[]}],"endpoints":[{"protocol":"completions","base_url":"https://api.example.com/v1/chat/completions"}],"status":"disabled","priority":5}"#,
+            r#"{"name":"openai-test-provider","api_key":"sk-updated","models":[{"name":"gpt-4o","status":"enabled","aliases":[]}],"endpoints":[{"protocol":"completions","base_url":"https://api.example.com/v1/chat/completions"}],"status":"disabled","priority":5,"model_passthrough":true}"#,
         ))
         .unwrap();
     let response = app.oneshot(request).await.unwrap();
@@ -920,6 +1035,7 @@ async fn test_admin_provider_update_changes_status() {
     let provider = snapshot.find_provider("openai-test-provider").unwrap();
     assert_eq!(provider.status, "disabled");
     assert_eq!(provider.api_key, "sk-updated");
+    assert!(provider.model_passthrough);
 }
 
 #[tokio::test]
@@ -1265,6 +1381,288 @@ async fn test_multi_protocol_provider_routes_responses_requests() {
     assert_eq!(logs[0].provider_name, "openai-multi");
     assert_eq!(logs[0].protocol, "responses");
     assert_eq!(logs[0].operation, "responses");
+}
+
+#[tokio::test]
+async fn test_images_generations_uses_explicit_endpoint() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let (provider_base_url, requests) =
+        spawn_openai_image_json_mock_provider("/v1/images/generations").await;
+    let mut config = test_config();
+    let mut provider_model = enabled_model("gpt-image-1.5");
+    provider_model.aliases = vec!["image-model".into()];
+    config.providers = vec![provider(
+        "openai-images",
+        "images_generations",
+        &provider_base_url,
+        vec![provider_model],
+    )];
+    config.keys.push(auth_key(
+        "user-key",
+        "user-secret-key",
+        vec![enabled_model("image-model")],
+    ));
+
+    let state = state_from_config(config).await;
+    let app = rcpa::server::router::build(state.clone());
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/images/generations")
+        .header("x-api-key", "user-secret-key")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"model":"image-model","prompt":"draw a lighthouse","size":"1024x1024"}"#,
+        ))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let response_json: serde_json::Value = serde_json::from_slice(&response_body).unwrap();
+    assert_eq!(response_json["data"][0]["b64_json"], "aW1hZ2U=");
+    assert!(response_json.get("model").is_none());
+
+    {
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["model"], "gpt-image-1.5");
+        assert_eq!(requests[0]["prompt"], "draw a lighthouse");
+    }
+
+    let logs = wait_for_request_logs(&state, 1).await;
+    assert_eq!(logs[0].operation, "images_generations");
+    let detail = state
+        .store
+        .get_request_log_detail(&logs[0].id)
+        .await
+        .unwrap()
+        .unwrap();
+    let stored_response: serde_json::Value =
+        serde_json::from_slice(detail.response_body.as_deref().unwrap()).unwrap();
+    assert_eq!(stored_response["data"][0]["b64_json"], "[omitted]");
+}
+
+#[tokio::test]
+async fn test_images_edits_accepts_json_requests() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let (provider_base_url, requests) =
+        spawn_openai_image_json_mock_provider("/v1/images/edits").await;
+    let mut config = test_config();
+    config.providers = vec![provider(
+        "openai-images-edits",
+        "images_edits",
+        &provider_base_url,
+        vec![enabled_model("image-model")],
+    )];
+    config.keys.push(auth_key(
+        "user-key",
+        "user-secret-key",
+        vec![enabled_model("image-model")],
+    ));
+
+    let state = state_from_config(config).await;
+    let app = rcpa::server::router::build(state.clone());
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/images/edits")
+        .header("x-api-key", "user-secret-key")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"model":"image-model","prompt":"add snow","images":[{"image_url":"data:image/png;base64,input-image"}]}"#,
+        ))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    {
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["prompt"], "add snow");
+        assert_eq!(
+            requests[0]["images"][0]["image_url"],
+            "data:image/png;base64,input-image"
+        );
+    }
+
+    let logs = wait_for_request_logs(&state, 1).await;
+    let detail = state
+        .store
+        .get_request_log_detail(&logs[0].id)
+        .await
+        .unwrap()
+        .unwrap();
+    let stored_request: serde_json::Value =
+        serde_json::from_slice(detail.request_body.as_deref().unwrap()).unwrap();
+    let stored_response: serde_json::Value =
+        serde_json::from_slice(detail.response_body.as_deref().unwrap()).unwrap();
+    assert_eq!(stored_request["images"][0]["image_url"], "[omitted]");
+    assert_eq!(stored_response["data"][0]["b64_json"], "[omitted]");
+}
+
+#[tokio::test]
+async fn test_images_generations_and_edits_support_streaming() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let upstream = spawn_openai_image_streaming_mock_provider().await;
+    let mut config = test_config();
+    config.providers = vec![provider_with_endpoints(
+        "openai-images-streaming",
+        vec![
+            EndpointConfig {
+                protocol: ProviderProtocol::ImagesGenerations,
+                base_url: format!("{upstream}/generations"),
+            },
+            EndpointConfig {
+                protocol: ProviderProtocol::ImagesEdits,
+                base_url: format!("{upstream}/edits"),
+            },
+        ],
+        vec![enabled_model("image-model")],
+    )];
+    config.keys.push(auth_key(
+        "user-key",
+        "user-secret-key",
+        vec![enabled_model("image-model")],
+    ));
+
+    let state = state_from_config(config).await;
+    let app = rcpa::server::router::build(state.clone());
+    for (path, completed_event) in [
+        ("generations", "image_generation.completed"),
+        ("edits", "image_edit.completed"),
+    ] {
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/images/{path}"))
+            .header("x-api-key", "user-secret-key")
+            .header("content-type", "application/json")
+            .body(Body::from(format!(
+                "{{\"model\":\"image-model\",\"prompt\":\"draw\",\"stream\":true{} }}",
+                if path == "edits" {
+                    ",\"images\":[{\"image_url\":\"https://example.com/image.png\"}]"
+                } else {
+                    ""
+                }
+            )))
+            .unwrap();
+
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+        let response_body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let response_body = String::from_utf8(response_body.to_vec()).unwrap();
+        assert!(response_body.contains(completed_event));
+        assert!(response_body.contains("stream-image"));
+        assert!(!response_body.contains("\"model\""));
+    }
+
+    let logs = wait_for_completed_request_logs(&state, 2).await;
+    assert_eq!(logs.len(), 2);
+    assert!(logs.iter().all(|log| log.status == "success"));
+    assert!(logs.iter().all(|log| log.total_tokens == 5));
+    for log in logs {
+        let detail = state
+            .store
+            .get_request_log_detail(&log.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(detail.response_body.is_none());
+        assert!(
+            !String::from_utf8_lossy(detail.request_body.as_deref().unwrap())
+                .contains("stream-image")
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_images_edits_forwards_multipart_and_rewrites_model_alias() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let (provider_base_url, fields) = spawn_openai_image_multipart_mock_provider().await;
+    let mut config = test_config();
+    let mut provider_model = enabled_model("gpt-image-1.5");
+    provider_model.aliases = vec!["image-model".into()];
+    config.providers = vec![provider(
+        "openai-images-edits",
+        "images_edits",
+        &provider_base_url,
+        vec![provider_model],
+    )];
+    config.keys.push(auth_key(
+        "user-key",
+        "user-secret-key",
+        vec![enabled_model("image-model")],
+    ));
+
+    let state = state_from_config(config).await;
+    let app = rcpa::server::router::build(state.clone());
+    let boundary = "rcpa-image-edit-boundary";
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nimage-model\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nadd snow\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"image[]\"; filename=\"source.png\"\r\nContent-Type: image/png\r\n\r\nfake-png\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"image[]\"; filename=\"source.webp\"\r\nContent-Type: image/webp\r\n\r\nfake-webp\r\n--{boundary}--\r\n"
+    );
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/images/edits")
+        .header("x-api-key", "user-secret-key")
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(Body::from(body))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    {
+        let fields = fields.lock().unwrap();
+        assert_eq!(fields.len(), 4);
+        assert_eq!(
+            fields[0],
+            ("model".into(), None, None, b"gpt-image-1.5".to_vec())
+        );
+        assert_eq!(
+            fields[1],
+            ("prompt".into(), None, None, b"add snow".to_vec())
+        );
+        assert_eq!(
+            fields[2],
+            (
+                "image[]".into(),
+                Some("source.png".into()),
+                Some("image/png".into()),
+                b"fake-png".to_vec()
+            )
+        );
+        assert_eq!(
+            fields[3],
+            (
+                "image[]".into(),
+                Some("source.webp".into()),
+                Some("image/webp".into()),
+                b"fake-webp".to_vec()
+            )
+        );
+    }
+
+    let logs = wait_for_request_logs(&state, 1).await;
+    assert_eq!(logs[0].protocol, "images_edits");
+    assert_eq!(logs[0].operation, "images_edits");
 }
 
 #[tokio::test]
@@ -2172,6 +2570,63 @@ async fn test_chat_completions_uses_completions_provider_protocol() {
     assert_eq!(logs[0].provider_name, "plain-completions-only");
     assert_eq!(logs[0].protocol, "completions");
     assert_eq!(logs[0].operation, "completions");
+}
+
+#[tokio::test]
+async fn test_provider_model_passthrough_forwards_unknown_model_and_records_stats() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let mock_base_url = spawn_openai_mock_provider(StatusCode::OK, serde_json::json!({})).await;
+    let mut config = test_config();
+    config.providers = vec![provider(
+        "passthrough-provider",
+        "completions",
+        &mock_base_url,
+        vec![enabled_model("configured-model")],
+    )];
+    config.providers[0].model_passthrough = true;
+    config.keys.push(auth_key(
+        "passthrough-key",
+        "passthrough-secret",
+        Vec::new(),
+    ));
+
+    let state = state_from_config(config).await;
+    let app = rcpa::server::router::build(state.clone());
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("x-api-key", "passthrough-secret")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"model":"vendor-model-without-config","messages":[{"role":"user","content":"hello"}]}"#,
+        ))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["model"], "vendor-model-without-config");
+
+    let logs = wait_for_request_logs(&state, 1).await;
+    assert_eq!(logs[0].provider_name, "passthrough-provider");
+    assert_eq!(logs[0].model, "vendor-model-without-config");
+    assert_eq!(logs[0].input_tokens, 5);
+    assert_eq!(logs[0].output_tokens, 7);
+
+    let model_stats = state
+        .store
+        .aggregate_by_model("2000-01-01T00:00:00Z", "2099-12-31T23:59:59Z")
+        .await
+        .unwrap();
+    assert_eq!(model_stats.len(), 1);
+    assert_eq!(model_stats[0].group_key, "vendor-model-without-config");
+    assert_eq!(model_stats[0].request_count, 1);
 }
 
 #[tokio::test]

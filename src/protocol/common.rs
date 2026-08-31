@@ -16,6 +16,7 @@ pub enum Protocol {
     Completions,
     Responses,
     Messages,
+    Images,
 }
 
 impl std::fmt::Display for Protocol {
@@ -24,6 +25,7 @@ impl std::fmt::Display for Protocol {
             Protocol::Completions => write!(f, "completions"),
             Protocol::Responses => write!(f, "responses"),
             Protocol::Messages => write!(f, "messages"),
+            Protocol::Images => write!(f, "images"),
         }
     }
 }
@@ -34,6 +36,8 @@ pub enum Operation {
     Completions,
     Responses,
     Embeddings,
+    ImagesGenerations,
+    ImagesEdits,
     Messages,
     ListModels,
 }
@@ -44,6 +48,8 @@ impl std::fmt::Display for Operation {
             Operation::Completions => write!(f, "completions"),
             Operation::Responses => write!(f, "responses"),
             Operation::Embeddings => write!(f, "embeddings"),
+            Operation::ImagesGenerations => write!(f, "images_generations"),
+            Operation::ImagesEdits => write!(f, "images_edits"),
             Operation::Messages => write!(f, "messages"),
             Operation::ListModels => write!(f, "list_models"),
         }
@@ -57,6 +63,8 @@ impl Operation {
             Operation::Responses => ProviderProtocol::Responses,
             Operation::Messages => ProviderProtocol::Messages,
             Operation::Embeddings => ProviderProtocol::Embeddings,
+            Operation::ImagesGenerations => ProviderProtocol::ImagesGenerations,
+            Operation::ImagesEdits => ProviderProtocol::ImagesEdits,
             Operation::ListModels => ProviderProtocol::Completions,
         }
     }
@@ -70,7 +78,29 @@ pub struct ProxyRequest {
     pub operation: Operation,
     pub model: String,
     pub body: serde_json::Value,
+    pub multipart: Option<MultipartFormData>,
     pub stream: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct MultipartFormData {
+    pub parts: Vec<MultipartPart>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MultipartPart {
+    pub name: String,
+    pub value: MultipartPartValue,
+}
+
+#[derive(Debug, Clone)]
+pub enum MultipartPartValue {
+    Text(String),
+    File {
+        filename: Option<String>,
+        content_type: Option<String>,
+        data: bytes::Bytes,
+    },
 }
 
 /// Context carried through the proxy pipeline
@@ -478,9 +508,7 @@ fn nested_u64(value: &serde_json::Value, fields: &[(&str, &str)]) -> Option<u64>
 /// Shared pre-proxy logic for LLM API handlers.
 ///
 /// Performs authentication, body parsing, model validation, and context
-/// construction, then delegates to `proxy_to_provider`. This eliminates
-/// the boilerplate that was previously duplicated across all five
-/// protocol handler functions.
+/// construction, then delegates to `proxy_to_provider`.
 pub async fn handle_llm_request(
     state: Arc<AppState>,
     headers: &axum::http::HeaderMap,
@@ -489,12 +517,57 @@ pub async fn handle_llm_request(
     operation: Operation,
     session_affinity: SessionAffinityMode,
 ) -> crate::error::AppResult<axum::response::Response> {
+    handle_llm_request_inner(
+        state,
+        headers,
+        body,
+        protocol,
+        operation,
+        session_affinity,
+        None,
+    )
+    .await
+}
+
+pub async fn handle_llm_multipart_request(
+    state: Arc<AppState>,
+    headers: &axum::http::HeaderMap,
+    audit_body: serde_json::Value,
+    protocol: Protocol,
+    operation: Operation,
+    session_affinity: SessionAffinityMode,
+    multipart: MultipartFormData,
+) -> crate::error::AppResult<axum::response::Response> {
+    let body = serde_json::to_string(&audit_body)
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    handle_llm_request_inner(
+        state,
+        headers,
+        body,
+        protocol,
+        operation,
+        session_affinity,
+        Some(multipart),
+    )
+    .await
+}
+
+async fn handle_llm_request_inner(
+    state: Arc<AppState>,
+    headers: &axum::http::HeaderMap,
+    body: String,
+    protocol: Protocol,
+    operation: Operation,
+    session_affinity: SessionAffinityMode,
+    multipart: Option<MultipartFormData>,
+) -> crate::error::AppResult<axum::response::Response> {
     use crate::protocol::audit;
     use crate::protocol::openai::chat::proxy_to_provider;
 
     let start = std::time::Instant::now();
     let request_id = Uuid::new_v4();
     let request_body = body.as_bytes();
+    let stored_request_body = audit::raw_body_bytes_for_storage(operation, request_body);
     let config_snapshot = state.config_service.snapshot();
     let requested_model = audit::model_from_body(&body);
 
@@ -514,7 +587,7 @@ pub async fn handle_llm_request(
                 requested_model.as_deref().unwrap_or(""),
                 &err,
                 start,
-                Some(request_body),
+                stored_request_body.as_deref(),
             )
             .await;
             return Err(err);
@@ -550,7 +623,7 @@ pub async fn handle_llm_request(
             &model,
             &err,
             start,
-            Some(request_body),
+            stored_request_body.as_deref(),
         )
         .await;
         return Err(err);
@@ -579,7 +652,7 @@ pub async fn handle_llm_request(
             &resolved_model,
             &err,
             start,
-            Some(request_body),
+            stored_request_body.as_deref(),
         )
         .await;
         return Err(err);
@@ -619,6 +692,7 @@ pub async fn handle_llm_request(
         operation,
         model: resolved_model,
         body: body_value,
+        multipart,
         stream,
     };
 
