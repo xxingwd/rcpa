@@ -289,6 +289,7 @@ pub async fn providers(cx: &Cx) -> Result {
             data.endpoints = endpoints.filter(Boolean);
             const priority = Number.parseInt(data.priority, 10);
             data.priority = Number.isFinite(priority) ? priority : 0;
+            data.model_passthrough = data.model_passthrough === 'true';
             data.models = models.filter(Boolean).map(m => {{
                 const hasPricing = m.input_price !== '' || m.output_price !== '';
                 return {{
@@ -317,7 +318,13 @@ pub async fn providers(cx: &Cx) -> Result {
                     window.location.href = '/login';
                     return;
                 }}
-                return response.json();
+                return response.text().then(text => {{
+                    try {{
+                        return JSON.parse(text);
+                    }} catch (_) {{
+                        throw new Error(text || ('HTTP ' + response.status));
+                    }}
+                }});
             }})
             .then(result => {{
                 if (!result) return;

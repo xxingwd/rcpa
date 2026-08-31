@@ -435,6 +435,18 @@ async fn admin_pages_require_cookie_and_render_the_shared_rust_shell() {
     assert!(providers_table_html.contains("class=\"drag-handle\" data-persist-order"));
     assert!(!providers_table_html.contains("data-model-provider"));
     assert!(!providers_table_html.contains("拖动调整模型"));
+    let providers_page = client
+        .get(format!("{base}/providers"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert!(providers_page.status().is_success());
+    let providers_page_html = providers_page.text().await.unwrap();
+    assert!(
+        providers_page_html.contains("data.model_passthrough = data.model_passthrough === 'true';")
+    );
+    assert!(providers_page_html.contains("throw new Error(text || ('HTTP ' + response.status));"));
 
     let keys_table = client
         .get(format!("{base}/keys/table"))
