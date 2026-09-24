@@ -113,9 +113,10 @@ mod tests {
     fn admin_workspace_uses_shared_full_width_layout_tokens() {
         let styles = render_shared_styles();
 
-        assert!(styles.contains("--workspace-gutter: .5rem"));
-        assert!(styles
-            .contains(".admin-content { width: 100%; height: 100%; min-width: 0; margin: 0; }"));
+        assert!(styles.contains("--workspace-gutter:"));
+        assert!(styles.contains("padding: var(--workspace-gutter)"));
+        assert!(styles.contains(".admin-content { width: 100%;"));
+        assert!(styles.contains("height: 100%; min-width: 0; margin: 0 auto;"));
         assert!(styles.contains(".page-header {"));
         assert!(styles.contains(".data-list {"));
         assert!(styles.contains(".dialog-header {"));

@@ -146,6 +146,7 @@ async fn admin_pages_require_cookie_and_render_the_shared_rust_shell() {
 
     for (path, content_type) in [
         ("/_topcoat/tailwind.css", "text/css; charset=utf-8"),
+        ("/_topcoat/fonts/noto-sans-cjk-sc.otf", "font/otf"),
         (
             "/_topcoat/htmx.min.js",
             "application/javascript; charset=utf-8",
@@ -393,9 +394,8 @@ async fn admin_pages_require_cookie_and_render_the_shared_rust_shell() {
             assert!(!html.contains("requestChart.destroy()"));
             assert_eq!(html.matches("class=\"dashboard-table-card ").count(), 2);
             assert_eq!(html.matches("class=\"dashboard-table-scroll\"").count(), 2);
-            assert!(html.contains(
-                ".dashboard-table-scroll { min-height: 0; flex: 1 1 auto; overflow: auto;"
-            ));
+            assert!(html.contains(".dashboard-table-scroll {"));
+            assert!(html.contains("overflow: auto; overscroll-behavior: contain;"));
             assert!(html.contains(".dashboard-table-scroll thead th { position: sticky; top: 0;"));
             assert_eq!(html.matches("aria-sort=\"descending\"").count(), 2);
         }

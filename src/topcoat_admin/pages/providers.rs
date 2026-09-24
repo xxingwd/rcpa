@@ -75,10 +75,10 @@ pub async fn providers(cx: &Cx) -> Result {
     {}
     <style>
         .model-badge {{ display: inline-flex; align-items: center; height: 1.5rem; padding: 0 0.375rem; border-radius: 9999px; border: 1px solid; font-family: ui-monospace, monospace; font-size: 0.75rem; transition: all 0.15s; }}
-        .model-badge.enabled {{ background: rgba(16, 185, 129, 0.06); border-color: rgba(16, 185, 129, 0.4); color: #059669; }}
+        .model-badge.enabled {{ background: color-mix(in srgb, var(--success) 8%, var(--card)); border-color: color-mix(in srgb, var(--success) 35%, var(--border)); color: var(--success); }}
         .model-badge.disabled {{ background: var(--muted); border-color: var(--border); color: var(--muted-foreground); }}
         .model-badge-dot {{ width: 0.375rem; height: 0.375rem; border-radius: 50%; margin-right: 0.25rem; }}
-        .model-badge.enabled .model-badge-dot {{ background: #10b981; }}
+        .model-badge.enabled .model-badge-dot {{ background: var(--success); }}
         .model-badge.disabled .model-badge-dot {{ background: rgba(113, 113, 122, 0.5); }}
         .modal-content:has(.provider-dialog) {{ width: min(63.75rem, calc(100vw - 2rem)); }}
         .drag-handle {{ display: inline-flex; width: 44px; min-width: 44px; height: 44px; align-items: center; justify-content: center; border: 0; border-radius: 0.375rem; color: var(--muted-foreground); cursor: grab; touch-action: none; transition: background-color 150ms, color 150ms, opacity 150ms; }}
@@ -87,6 +87,8 @@ pub async fn providers(cx: &Cx) -> Result {
         .drag-handle:disabled {{ cursor: not-allowed; opacity: 0.32; }}
         [data-sortable-row].is-dragging {{ border-color: var(--ring); box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1); opacity: 0.72; }}
         [data-sortable-row].is-dragging .drag-handle {{ cursor: grabbing; }}
+        .provider-dialog button[onclick^="add"] {{ flex-shrink: 0; min-height: 2.375rem; white-space: nowrap; }}
+        @media (max-width: 639px) {{ .provider-dialog .mb-3.flex.items-center.justify-between {{ flex-wrap: wrap; gap: .5rem; }} }}
         @media (prefers-reduced-motion: reduce) {{ .drag-handle {{ transition: none; }} }}
     </style>
 </head>

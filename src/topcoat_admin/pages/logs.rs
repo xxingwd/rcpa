@@ -131,7 +131,7 @@ fn logs_list_body() -> String {
                     </tr>
                 </thead>
                 <tbody id="logs-tbody">
-                    <tr><td colspan="18" class="px-4 py-8 text-center text-sm text-zinc-500">加载中...</td></tr>
+                    <tr><td colspan="18" class="px-4 py-8 text-sm text-zinc-500"><span class="logs-empty-message">加载中...</span></td></tr>
                 </tbody>
             </table>
         </div>
@@ -194,14 +194,15 @@ pub async fn logs(cx: &Cx) -> Result {
     {}
     <style>
         .log-row:hover {{ background-color: color-mix(in oklch, var(--muted) 50%, transparent); }}
-        .filter-select {{ height: 2rem; padding: 0 0.5rem; font-size: 0.75rem; border: 1px solid var(--border); border-radius: 0.375rem; background: var(--card); }}
-        .pagination-btn {{ height: 2rem; width: 2rem; display: inline-flex; align-items: center; justify-content: center; border: 1px solid var(--border); border-radius: 0.375rem; background: var(--card); color: var(--foreground); font-size: 0.75rem; }}
+        .filter-select {{ height: 2.375rem; padding: 0 0.5rem; font-size: 0.8125rem; border: 1px solid var(--border); border-radius: 0.375rem; background: var(--card); }}
+        .pagination-btn {{ height: 2.375rem; width: 2.375rem; display: inline-flex; align-items: center; justify-content: center; border: 1px solid var(--border); border-radius: 0.375rem; background: var(--card); color: var(--foreground); font-size: 0.75rem; }}
         .pagination-btn:hover {{ background: var(--accent); }}
         .pagination-btn.active {{ background: var(--primary); color: var(--primary-foreground); border-color: var(--primary); }}
         .pagination-btn:disabled {{ opacity: 0.5; cursor: not-allowed; }}
-        .badge-success {{ background: color-mix(in oklch, #10b981 15%, transparent); color: #10b981; padding: 0.125rem 0.5rem; border-radius: 6px; font-size: 0.75rem; }}
-        .badge-error {{ background: var(--destructive); color: white; padding: 0.125rem 0.5rem; border-radius: 6px; font-size: 0.75rem; }}
-        .badge-running {{ background: color-mix(in oklch, #d97706 15%, transparent); color: #b45309; padding: 0.125rem 0.5rem; border-radius: 6px; font-size: 0.75rem; }}
+        .badge-success {{ background: color-mix(in srgb, var(--success) 12%, var(--card)); color: var(--success); padding: 0.125rem 0.5rem; border-radius: 6px; font-size: 0.75rem; }}
+        .badge-error {{ background: color-mix(in srgb, var(--destructive) 12%, var(--card)); color: var(--destructive); padding: 0.125rem 0.5rem; border-radius: 6px; font-size: 0.75rem; }}
+        .badge-running {{ background: color-mix(in srgb, #b66d16 12%, var(--card)); color: #a46212; padding: 0.125rem 0.5rem; border-radius: 6px; font-size: 0.75rem; }}
+        html[data-theme="dark"] .badge-running {{ color: #f0be79; }}
         .badge-outline {{ border: 1px solid var(--border); padding: 0.125rem 0.5rem; border-radius: 6px; font-size: 0.75rem; }}
         .badge-secondary {{ background: var(--muted); color: var(--foreground); padding: 0.125rem 0.5rem; border-radius: 6px; font-size: 0.75rem; }}
         .logs-page .page-header {{ align-items: flex-start; }}
@@ -211,8 +212,11 @@ pub async fn logs(cx: &Cx) -> Result {
         .logs-list-content {{ width: 100%; max-width: 100%; overflow: hidden; }}
         .logs-table-wrap {{ width: 100%; max-width: 100%; min-height: 0; overflow: auto; overscroll-behavior: contain; }}
         .logs-table-wrap thead {{ position: sticky; top: 0; z-index: 1; }}
+        .logs-empty-message {{ position: sticky; left: 0; display: grid; width: calc(100vw - 19rem); min-height: 3.5rem; place-items: center; }}
+        @media (max-width: 1023px) {{ .logs-empty-message {{ width: calc(100vw - 4rem); }} }}
         @media (max-width: 639px) {{
             .filter-select {{ width: calc(50% - .25rem) !important; min-width: 0; }}
+            .pagination-btn {{ width: 2.75rem; height: 2.75rem; }}
             .logs-pagination-row {{ align-items: flex-start; flex-direction: column; gap: .75rem; }}
         }}
     </style>
@@ -640,7 +644,7 @@ pub async fn logs_table(cx: &Cx) -> Result {
 
     if log_entries.is_empty() {
         html.push_str(
-            r##"<tr><td colspan="18" class="px-4 py-8 text-center text-sm text-zinc-500">暂无接口请求记录</td></tr>"##,
+            r##"<tr><td colspan="18" class="px-4 py-8 text-sm text-zinc-500"><span class="logs-empty-message">暂无接口请求记录</span></td></tr>"##,
         );
     } else {
         for log in &log_entries {

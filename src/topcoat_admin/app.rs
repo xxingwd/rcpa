@@ -10,6 +10,10 @@ use topcoat_router::tower::TowerRoute;
 use crate::server::AppState;
 
 const TAILWIND_CSS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tailwind.css"));
+const NOTO_SANS_CJK_SC: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/static/fonts/NotoSansCJKsc-Regular.otf"
+));
 const HTMX_JS: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/static/htmx/htmx.min.js"
@@ -65,6 +69,16 @@ pub fn build_topcoat_app(state: Arc<AppState>) -> Router {
                 "/_topcoat/tailwind.css",
                 axum::routing::get(|| async {
                     static_asset_response(TAILWIND_CSS, "text/css; charset=utf-8")
+                }),
+            ),
+        ))
+        .route(TowerRoute::new(
+            Methods::Only(&[topcoat::router::Method::GET]),
+            Path::new("/_topcoat/fonts/noto-sans-cjk-sc.otf"),
+            axum::Router::new().route(
+                "/_topcoat/fonts/noto-sans-cjk-sc.otf",
+                axum::routing::get(|| async {
+                    static_asset_response(NOTO_SANS_CJK_SC, "font/otf")
                 }),
             ),
         ))

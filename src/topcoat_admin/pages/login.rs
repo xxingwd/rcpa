@@ -46,21 +46,22 @@ pub async fn login_page(cx: &Cx) -> Result {
     {}
     <style>
         .login-page {{ position: fixed; inset: 0; z-index: 50; display: flex; align-items: center; justify-content: center; padding: 1rem; background: var(--background); }}
-        .login-theme {{ position: absolute; top: 1.5rem; right: 1.5rem; width: auto; min-width: 7.5rem; }}
-        .auth-panel {{ width: 100%; max-width: 25rem; padding: 1.5rem; border: 1px solid var(--border); border-radius: var(--radius); background: var(--card); color: var(--card-foreground); animation: login-in 300ms ease-out; }}
-        .login-header {{ padding-bottom: .5rem; text-align: center; }}
-        .login-mark {{ display: flex; width: 2.75rem; height: 2.75rem; align-items: center; justify-content: center; margin: 0 auto 1rem; border: 1px solid var(--border); border-radius: var(--radius); background: var(--muted); color: var(--primary); }}
+        .login-theme {{ position: absolute; top: 1.5rem; right: 1.5rem; width: auto; min-width: 7.5rem; height: 2.5rem; justify-content: center; border: 1px solid var(--border); background: var(--card); color: var(--foreground); }}
+        .login-theme:hover {{ color: var(--foreground); background: var(--accent); }}
+        .auth-panel {{ width: 100%; max-width: 25rem; padding: 2rem; border: 1px solid var(--border); border-top: 3px solid var(--primary); border-radius: var(--radius); background: var(--card); color: var(--card-foreground); box-shadow: 0 18px 50px rgb(14 35 28 / .1); animation: login-in 250ms ease-out; }}
+        .login-header {{ padding-bottom: .5rem; text-align: left; }}
+        .login-mark {{ display: flex; width: 2.625rem; height: 2.625rem; align-items: center; justify-content: center; margin: 0 0 1.25rem; border: 0; border-radius: var(--radius); background: var(--primary); color: var(--primary-foreground); }}
         .login-mark .icon {{ width: 1.3125rem; height: 1.3125rem; }}
-        .login-title {{ margin: 0; font-size: 1.25rem; line-height: 1.5; font-weight: 600; letter-spacing: 0; }}
-        .login-subtitle {{ margin: .125rem 0 0; color: var(--muted-foreground); font-size: .875rem; }}
-        .login-content {{ padding-top: 1.5rem; }}
-        .login-form {{ display: flex; flex-direction: column; gap: 1rem; }}
+        .login-title {{ margin: 0; font-size: 1.375rem; line-height: 1.5; font-weight: 650; letter-spacing: 0; }}
+        .login-subtitle {{ margin: .25rem 0 0; color: var(--muted-foreground); font-size: .875rem; }}
+        .login-content {{ padding-top: 1.75rem; }}
+        .login-form {{ display: flex; flex-direction: column; gap: 1.125rem; }}
         .field-group {{ display: flex; flex-direction: column; gap: .5rem; }}
-        .field-label {{ color: var(--muted-foreground); font-size: .75rem; font-weight: 500; text-transform: uppercase; letter-spacing: 0; }}
-        .login-input {{ display: flex; width: 100%; height: 2.25rem; padding: .25rem .75rem; border: 1px solid var(--border); border-radius: 6px; background: var(--card); color: var(--foreground); font-size: .875rem; }}
+        .field-label {{ color: var(--foreground); font-size: .8125rem; font-weight: 600; letter-spacing: 0; }}
+        .login-input {{ display: flex; width: 100%; height: 2.75rem; padding: .5rem .75rem; border: 1px solid var(--border); border-radius: 6px; background: var(--card); color: var(--foreground); font-size: .875rem; }}
         .login-input::placeholder {{ color: var(--muted-foreground); }}
         .login-error {{ padding: .5rem .75rem; border: 1px solid color-mix(in oklch, var(--destructive) 22%, transparent); border-radius: 6px; background: color-mix(in oklch, var(--destructive) 10%, transparent); color: var(--destructive); font-size: .75rem; font-weight: 500; }}
-        .login-submit {{ width: 100%; height: 2.5rem; }}
+        .login-submit {{ width: 100%; height: 2.75rem; }}
         @keyframes login-in {{ from {{ opacity: 0; }} to {{ opacity: 1; }} }}
         @media (max-width: 480px) {{ .login-theme {{ top: 1rem; right: 1rem; }} }}
     </style>

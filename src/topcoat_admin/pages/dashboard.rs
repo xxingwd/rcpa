@@ -101,33 +101,33 @@ async fn render_dashboard(cx: &Cx) -> Result {
     <script src="/_topcoat/chart.umd.min.js"></script>
     {}
     <style>
-        .stat-card {{ padding: .75rem !important; transition: border-color 0.2s; }}
-        .stat-card:hover {{ border-color: color-mix(in oklch, var(--foreground) 24%, var(--border)); }}
+        .stat-card {{ padding: 1rem !important; border-top: 2px solid var(--primary) !important; transition: border-color 150ms ease; }}
+        .stat-card:nth-child(2) {{ border-top-color: #c28b39 !important; }}
+        .stat-card:hover {{ border-color: color-mix(in srgb, var(--primary) 35%, var(--border)); }}
         .stat-card > .mb-3 {{ margin-bottom: .5rem; }}
-        .stat-card .pt-3 {{ padding-top: .5rem; }}
-        .chart-container {{ position: relative; height: 224px; width: 100%; }}
+        .stat-card .pt-3 {{ padding-top: .75rem; }}
+        .stat-card [id^="metric-total-"] {{ font-size: 1.625rem; line-height: 2rem; font-variant-numeric: tabular-nums; }}
+        .chart-container {{ position: relative; height: 208px; width: 100%; }}
         .dimension-switch {{ display: inline-flex; align-items: center; border: 1px solid var(--border); background: color-mix(in oklch, var(--muted) 40%, transparent); padding: 2px; border-radius: 6px; }}
         .dimension-btn {{ height: 24px; padding: 0 8px; font-size: 11px; font-weight: 500; border-radius: 4px; transition: all 0.15s; }}
         .dimension-btn.active {{ background: var(--background); color: var(--foreground); box-shadow: 0 1px 2px rgb(0 0 0 / 0.1); }}
         .dimension-btn:not(.active) {{ color: var(--muted-foreground); }}
         .dimension-btn:not(.active):hover {{ color: var(--foreground); }}
-        .status-badge {{ display: flex; align-items: center; gap: 8px; padding: 4px 12px; border-radius: 6px; font-size: 12px; font-weight: 500; border: 1px solid var(--border); background: color-mix(in oklch, var(--muted) 50%, transparent); color: var(--muted-foreground); }}
-        .pulse-dot {{ width: 8px; height: 8px; border-radius: 50%; background: rgb(16 185 129); animation: pulse 2s infinite; }}
+        .status-badge {{ display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: 6px; font-size: 12px; font-weight: 600; border: 1px solid color-mix(in srgb, var(--success) 24%, var(--border)); background: color-mix(in srgb, var(--success) 8%, var(--card)); color: var(--success); }}
+        .pulse-dot {{ width: 7px; height: 7px; border-radius: 50%; background: var(--success); animation: pulse 2s infinite; }}
         @keyframes pulse {{ 0%, 100% {{ opacity: 1; }} 50% {{ opacity: 0.5; }} }}
-        .dashboard-page .page-body {{ min-height: 0; overflow: hidden; }}
-        .dashboard-content {{ display: grid; height: 100%; min-height: 0; gap: .75rem; }}
+        .dashboard-page .page-body {{ min-height: 0; overflow: visible; }}
+        .dashboard-content {{ display: grid; height: auto; min-height: 0; gap: 1rem; }}
         .dashboard-content > .mt-4 {{ margin-top: 0; }}
         .dashboard-chart-card {{ display: flex; flex-direction: column; }}
-        .dashboard-chart-card .chart-container {{ min-height: 14rem; flex: 1 1 auto; }}
-        .dashboard-table-card {{ display: flex; min-height: 0; flex-direction: column; }}
-        .dashboard-table-scroll {{ min-height: 0; flex: 1 1 auto; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }}
+        .dashboard-chart-card .chart-container {{ min-height: 13rem; flex: 1 1 auto; }}
+        .dashboard-table-card {{ display: flex; min-height: 14rem; flex-direction: column; }}
+        .dashboard-table-scroll {{ min-height: 0; max-height: 18rem; flex: 1 1 auto; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }}
         .dashboard-table-scroll thead th {{ position: sticky; top: 0; z-index: 1; background: var(--card); }}
         .dashboard-table-scroll:focus-visible {{ outline: 2px solid var(--ring); outline-offset: 2px; }}
         @media (min-width: 1024px) {{
-            .dashboard-content {{ grid-template-rows: minmax(0, 1fr) minmax(0, 2fr) minmax(0, 2fr); overflow: hidden; }}
-            .dashboard-content > .grid {{ min-height: 0; gap: .75rem; }}
-            .dashboard-content > .grid > div {{ min-height: 0; overflow: hidden; }}
-            .dashboard-chart-card .chart-container {{ height: auto; min-height: 0; }}
+            .dashboard-content > .grid {{ min-height: 0; gap: 1rem; }}
+            .dashboard-chart-card .chart-container {{ height: 13rem; }}
         }}
         @media (max-width: 639px) {{
             .dashboard-toolbar {{ align-items: stretch; }}
