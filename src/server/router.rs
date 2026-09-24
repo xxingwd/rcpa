@@ -63,6 +63,10 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
             put(crate::admin::update_provider_model_status),
         )
         .route(
+            "/admin/providers/upstream-models",
+            post(crate::admin::list_upstream_models),
+        )
+        .route(
             "/admin/keys",
             get(crate::admin::list_all_keys).post(crate::admin::create_key),
         )

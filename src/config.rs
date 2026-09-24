@@ -29,6 +29,28 @@ pub enum ProviderProtocol {
     ImagesEdits,
 }
 
+impl ProviderProtocol {
+    pub const ALL: [ProviderProtocol; 6] = [
+        ProviderProtocol::Completions,
+        ProviderProtocol::Responses,
+        ProviderProtocol::Messages,
+        ProviderProtocol::Embeddings,
+        ProviderProtocol::ImagesGenerations,
+        ProviderProtocol::ImagesEdits,
+    ];
+
+    pub fn default_path(self) -> &'static str {
+        match self {
+            ProviderProtocol::Completions => "/v1/chat/completions",
+            ProviderProtocol::Responses => "/v1/responses",
+            ProviderProtocol::Messages => "/v1/messages",
+            ProviderProtocol::Embeddings => "/v1/embeddings",
+            ProviderProtocol::ImagesGenerations => "/v1/images/generations",
+            ProviderProtocol::ImagesEdits => "/v1/images/edits",
+        }
+    }
+}
+
 impl std::fmt::Display for ProviderProtocol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -39,6 +61,24 @@ impl std::fmt::Display for ProviderProtocol {
             ProviderProtocol::ImagesGenerations => write!(f, "images_generations"),
             ProviderProtocol::ImagesEdits => write!(f, "images_edits"),
         }
+    }
+}
+
+/// Joins a provider origin with a protocol path.
+///
+/// An origin that already ends in `/v1` keeps that prefix. An origin that
+/// already ends in the protocol path is returned unchanged.
+pub fn join_provider_endpoint(origin: &str, protocol: ProviderProtocol) -> String {
+    let origin = origin.trim().trim_end_matches('/');
+    let path = protocol.default_path();
+    if origin.ends_with(path) {
+        return origin.to_string();
+    }
+    let suffix = path.strip_prefix("/v1").unwrap_or(path);
+    if origin.ends_with("/v1") || origin.ends_with("/v1/") {
+        format!("{origin}{suffix}")
+    } else {
+        format!("{origin}{path}")
     }
 }
 
@@ -691,9 +731,17 @@ fn validate_provider_config(provider: &ProviderConfig) -> anyhow::Result<()> {
                 endpoint.protocol
             );
         }
-        if endpoint.base_url.trim().is_empty() {
+        let base_url = endpoint.base_url.trim();
+        if base_url.is_empty() {
             anyhow::bail!(
                 "Provider '{}' endpoint '{}' base_url cannot be empty",
+                provider.name,
+                endpoint.protocol
+            );
+        }
+        if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
+            anyhow::bail!(
+                "Provider '{}' endpoint '{}' base_url must start with http:// or https://",
                 provider.name,
                 endpoint.protocol
             );
@@ -1051,6 +1099,28 @@ keys: []
         assert_eq!(
             provider.base_url_for_protocol(ProviderProtocol::Responses),
             Some("https://api.example.com/v1/responses")
+        );
+    }
+
+    #[test]
+    fn test_join_provider_endpoint_preserves_prefix_and_full_paths() {
+        assert_eq!(
+            join_provider_endpoint("https://api.example.com/v1", ProviderProtocol::Completions),
+            "https://api.example.com/v1/chat/completions"
+        );
+        assert_eq!(
+            join_provider_endpoint(
+                "https://gateway.example.com/openai/v1/",
+                ProviderProtocol::Messages
+            ),
+            "https://gateway.example.com/openai/v1/messages"
+        );
+        assert_eq!(
+            join_provider_endpoint(
+                "https://api.example.com/v1/chat/completions",
+                ProviderProtocol::Completions
+            ),
+            "https://api.example.com/v1/chat/completions"
         );
     }
 

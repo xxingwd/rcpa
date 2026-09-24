@@ -1,0 +1,25 @@
+version: "3"
+
+# The admin UI is compiled into the Rust binary. There is no separate frontend process.
+
+vars:
+  PORT: '{{.PORT | default "15000"}}'
+  TOKEN: '{{.TOKEN | default "local-admin-token"}}'
+  DATA_DIR: '{{.DATA_DIR | default "data"}}'
+  LOG_LEVEL: '{{.LOG_LEVEL | default "info"}}'
+
+tasks:
+  default:
+    desc: Start the gateway and admin UI on 0.0.0.0
+    cmds:
+      - task: dev
+
+  dev:
+    desc: Start the gateway and admin UI on 0.0.0.0
+    cmds:
+      - >-
+        cargo run --
+        --token {{.TOKEN}}
+        --data-dir {{.DATA_DIR}}
+        --port {{.PORT}}
+        --log-level {{.LOG_LEVEL}}

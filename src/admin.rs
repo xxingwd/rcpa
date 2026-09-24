@@ -671,6 +671,154 @@ pub struct CreateProviderPayload {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct UpstreamModelsPayload {
+    pub api_key: String,
+    pub origin: String,
+    #[serde(default)]
+    pub headers: IndexMap<String, String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UpstreamModelsResponse {
+    pub models: Vec<String>,
+    pub source: String,
+}
+
+/// Lists model ids from an OpenAI-compatible `/v1/models` endpoint.
+///
+/// Credentials stay on the server. The browser only sends the origin, key,
+/// and optional headers already present in the provider form.
+pub async fn list_upstream_models(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<UpstreamModelsPayload>,
+) -> Result<impl IntoResponse, AppError> {
+    check_admin(&state, &headers)?;
+    let (models, source) = fetch_upstream_model_ids(
+        &payload.origin,
+        &payload.api_key,
+        &payload.headers,
+        state
+            .config_service
+            .snapshot()
+            .raw_config
+            .upstream
+            .timeout_secs,
+    )
+    .await?;
+    Ok(Json(UpstreamModelsResponse { models, source }))
+}
+
+async fn fetch_upstream_model_ids(
+    origin: &str,
+    api_key: &str,
+    headers: &IndexMap<String, String>,
+    timeout_secs: u64,
+) -> Result<(Vec<String>, String), AppError> {
+    let origin = origin.trim().trim_end_matches('/');
+    if origin.is_empty() {
+        return Err(AppError::BadRequest("Endpoint address is required".into()));
+    }
+    if !(origin.starts_with("http://") || origin.starts_with("https://")) {
+        return Err(AppError::BadRequest(
+            "Endpoint address must start with http:// or https://".into(),
+        ));
+    }
+    if api_key.trim().is_empty() {
+        return Err(AppError::BadRequest("API key is required".into()));
+    }
+
+    let url = if origin.ends_with("/models") {
+        origin.to_string()
+    } else {
+        format!("{origin}/models")
+    };
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs.clamp(1, 20)))
+        .build()
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    let mut request = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", api_key.trim()))
+        .header("Accept", "application/json");
+    for (name, value) in headers {
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        request = request.header(name, value);
+    }
+
+    let response = request.send().await.map_err(|error| {
+        AppError::BadRequest(format!("Failed to reach upstream models endpoint: {error}"))
+    })?;
+    let status = response.status();
+    let body = response.text().await.map_err(|error| {
+        AppError::BadRequest(format!("Failed to read upstream models response: {error}"))
+    })?;
+    if !status.is_success() {
+        let detail = body.chars().take(240).collect::<String>();
+        return Err(AppError::BadRequest(format!(
+            "Upstream models request failed with HTTP {}: {}",
+            status.as_u16(),
+            if detail.is_empty() {
+                "empty response"
+            } else {
+                detail.as_str()
+            }
+        )));
+    }
+
+    Ok((parse_upstream_model_ids(&body)?, url))
+}
+
+fn parse_upstream_model_ids(body: &str) -> Result<Vec<String>, AppError> {
+    let parsed: serde_json::Value = serde_json::from_str(body)
+        .map_err(|_| AppError::BadRequest("Upstream models response is not JSON".into()))?;
+    let entries = parsed
+        .get("data")
+        .and_then(|value| value.as_array())
+        .or_else(|| parsed.as_array())
+        .ok_or_else(|| AppError::BadRequest("Upstream models response has no model list".into()))?;
+    let mut models = Vec::new();
+    let mut seen = HashSet::new();
+    for entry in entries {
+        let id = entry
+            .get("id")
+            .and_then(|value| value.as_str())
+            .or_else(|| entry.as_str())
+            .map(str::trim)
+            .filter(|id| !id.is_empty());
+        if let Some(id) = id {
+            if seen.insert(id.to_string()) {
+                models.push(id.to_string());
+            }
+        }
+    }
+    if models.is_empty() {
+        return Err(AppError::BadRequest(
+            "Upstream models response did not contain any model ids".into(),
+        ));
+    }
+    Ok(models)
+}
+
+#[cfg(test)]
+mod upstream_model_tests {
+    use super::parse_upstream_model_ids;
+
+    #[test]
+    fn parses_openai_model_list_and_deduplicates_ids() {
+        let models = parse_upstream_model_ids(
+            r#"{"object":"list","data":[{"id":"gpt-4o"},{"id":" gpt-4o "},{"id":"claude"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(models, vec!["gpt-4o", "claude"]);
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReorderPayload {
     pub ids: Vec<String>,
 }
