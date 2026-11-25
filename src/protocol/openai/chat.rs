@@ -1474,13 +1474,15 @@ fn calculate_cost_cents(
     snapshot: &crate::config_service::ConfigSnapshot,
     resolved_model: &str,
     provider_name: &str,
+    public_model: &str,
     tokens: Option<&TokenUsage>,
 ) -> u64 {
     let Some(tokens) = tokens else {
         return 0;
     };
 
-    let provider_pricing = snapshot.provider_model_pricing(provider_name, resolved_model);
+    let provider_pricing =
+        snapshot.provider_model_pricing(provider_name, resolved_model, public_model);
 
     if let Some(rule) = provider_pricing {
         let input_cost = (tokens.prompt_tokens as f64 / 1000.0) * rule.input_per_1k;
@@ -2567,6 +2569,7 @@ async fn execute_non_stream_attempt(
                 &input.ctx.config_snapshot,
                 &prepared.actual_model,
                 &prepared.provider_name,
+                &input.ctx.resolved_model,
                 response.tokens.as_ref(),
             );
             let (provider_error_code, provider_error_message) = if response.status >= 400 {
@@ -3042,6 +3045,7 @@ impl StreamAudit {
                 &self.config_snapshot,
                 &self.actual_model,
                 &self.provider_name,
+                &self.resolved_model,
                 self.tokens.as_ref(),
             )
         } else {

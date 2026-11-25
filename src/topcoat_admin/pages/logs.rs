@@ -17,47 +17,9 @@ const PAGE_SIZE: i64 = 20;
 
 /// Helper to parse query parameters from URI.
 fn parse_query_params(uri_str: &str) -> Vec<(String, String)> {
-    uri_str
-        .split('?')
-        .nth(1)
-        .unwrap_or("")
-        .split('&')
-        .filter_map(|pair| {
-            let mut parts = pair.splitn(2, '=');
-            match (parts.next(), parts.next()) {
-                (Some(k), Some(v)) => Some((url_decode(k), url_decode(v))),
-                _ => None,
-            }
-        })
-        .collect()
-}
-
-/// Simple URL decoder.
-fn url_decode(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.bytes().peekable();
-    while let Some(b) = chars.next() {
-        match b {
-            b'+' => result.push(' '),
-            b'%' => {
-                let h = chars.next().unwrap_or(0);
-                let l = chars.next().unwrap_or(0);
-                let byte = (hex_val(h) << 4) | hex_val(l);
-                result.push(byte as char);
-            }
-            _ => result.push(b as char),
-        }
-    }
-    result
-}
-
-fn hex_val(b: u8) -> u8 {
-    match b {
-        b'0'..=b'9' => b - b'0',
-        b'a'..=b'f' => b - b'a' + 10,
-        b'A'..=b'F' => b - b'A' + 10,
-        _ => 0,
-    }
+    reqwest::Url::parse(&format!("http://localhost{uri_str}"))
+        .map(|url| url.query_pairs().into_owned().collect())
+        .unwrap_or_default()
 }
 
 /// Get query parameter value.
@@ -70,18 +32,7 @@ fn get_param(params: &[(String, String)], key: &str) -> Option<String> {
 }
 
 fn logs_actions() -> String {
-    r##"<select id="filter-key" class="filter-select w-40">
-        <option value="all">全部 Key</option>
-    </select>
-    <select id="filter-model" class="filter-select w-44">
-        <option value="all">全部上游模型</option>
-    </select>
-    <select id="filter-provider" class="filter-select w-36">
-        <option value="all">全部供应商</option>
-    </select>
-    <select id="filter-protocol" class="filter-select w-28">
-        <option value="all">全部协议</option>
-    </select>
+    r##"<div id="filter-key"></div><div id="filter-model"></div><div id="filter-provider"></div><div id="filter-protocol"></div>
     <select id="filter-status" class="filter-select w-28">
         <option value="all">全部状态</option>
         <option value="success">成功</option>
@@ -193,9 +144,10 @@ pub async fn logs(cx: &Cx) -> Result {
     <script src="/_topcoat/htmx.min.js"></script>
     {}
     <style>
+        {log_detail_css}
         .log-row:hover {{ background-color: color-mix(in oklch, var(--muted) 50%, transparent); }}
-        .filter-select {{ height: 2.375rem; padding: 0 0.5rem; font-size: 0.8125rem; border: 1px solid var(--border); border-radius: 0.375rem; background: var(--card); }}
-        .pagination-btn {{ height: 2.375rem; width: 2.375rem; display: inline-flex; align-items: center; justify-content: center; border: 1px solid var(--border); border-radius: 0.375rem; background: var(--card); color: var(--foreground); font-size: 0.75rem; }}
+        .filter-select {{ height: var(--control-height); padding: 0 0.5rem; font-size: 0.8125rem; border: 1px solid var(--border); border-radius: 0.375rem; background: var(--card); }}
+        .pagination-btn {{ height: var(--control-height); width: 2.375rem; display: inline-flex; align-items: center; justify-content: center; border: 1px solid var(--border); border-radius: 0.375rem; background: var(--card); color: var(--foreground); font-size: 0.75rem; }}
         .pagination-btn:hover {{ background: var(--accent); }}
         .pagination-btn.active {{ background: var(--primary); color: var(--primary-foreground); border-color: var(--primary); }}
         .pagination-btn:disabled {{ opacity: 0.5; cursor: not-allowed; }}
@@ -207,7 +159,7 @@ pub async fn logs(cx: &Cx) -> Result {
         .badge-secondary {{ background: var(--muted); color: var(--foreground); padding: 0.125rem 0.5rem; border-radius: 6px; font-size: 0.75rem; }}
         .logs-page .page-header {{ align-items: flex-start; }}
         .logs-page .page-actions {{ flex: 1 1 auto; }}
-        .logs-page {{ min-width: 0; overflow: hidden; }}
+        .logs-page {{ min-width: 0; }}
         .logs-page .page-body, .logs-page .data-list {{ display: flex; width: 100%; min-width: 0; min-height: 0; flex: 1 1 auto; overflow: hidden; }}
         .logs-list-content {{ width: 100%; max-width: 100%; overflow: hidden; }}
         .logs-table-wrap {{ width: 100%; max-width: 100%; min-height: 0; overflow: auto; overscroll-behavior: contain; }}
@@ -230,23 +182,10 @@ pub async fn logs(cx: &Cx) -> Result {
         </main>
     </div>
 
-    <!-- Detail Dialog -->
-    <div id="detail-dialog" class="modal-overlay hidden" onclick="if(event.target===this) closeDetailDialog()">
-        <section class="modal-content" role="dialog" aria-modal="true" aria-labelledby="log-dialog-title" style="width: min(60rem, calc(100vw - 2rem)); max-width: 60rem;">
-            <article class="dialog-shell log-dialog">
-                <header class="dialog-header">
-                    <div class="dialog-heading">
-                        <h2 id="log-dialog-title" class="dialog-title">调用日志详情</h2>
-                        <p class="dialog-description">请求、响应、Token、延迟与重试信息</p>
-                    </div>
-                    <button type="button" onclick="closeDetailDialog()" class="icon-button dialog-close" aria-label="关闭" title="关闭">
-                        <svg class="icon" aria-hidden="true" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg>
-                    </button>
-                </header>
-                <div id="detail-body" class="dialog-body space-y-4">
-                <div class="text-center text-zinc-500 py-8">加载中...</div>
-                </div>
-            </article>
+    <div id="detail-dialog" class="modal-overlay log-detail-overlay hidden" onclick="if(event.target===this) closeDetailDialog()">
+        <section class="modal-content log-detail-panel" role="dialog" aria-modal="true" aria-labelledby="log-dialog-title">
+            <header class="log-detail-header"><div><h2 id="log-dialog-title">调用详情</h2><p id="log-dialog-subtitle">请求与响应</p></div><div class="log-header-actions"><button type="button" onclick="refreshLogDetail()" class="icon-button" aria-label="刷新详情" title="刷新详情"><svg class="icon" aria-hidden="true" viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5M6 7a7 7 0 0 1 12-1l2 3M4 15l2 3a7 7 0 0 0 12-1"/></svg></button><button type="button" onclick="closeDetailDialog()" class="icon-button dialog-close" aria-label="关闭详情" title="关闭"><svg class="icon" aria-hidden="true" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div></header>
+            <div id="detail-body" class="log-detail-body" aria-busy="false"></div>
         </section>
     </div>
 
@@ -281,7 +220,7 @@ pub async fn logs(cx: &Cx) -> Result {
         }}
 
         function formatCost(cents) {{
-            return '¥' + (parseInt(cents) / 100).toFixed(4);
+            return new Intl.NumberFormat('zh-CN', {{style:'currency',currency:AdminFilters.currency||'USD',maximumFractionDigits:4}}).format((Number(cents)||0)/100);
         }}
 
         function formatTps(outputTokens, latencyMs, firstByteMs) {{
@@ -314,6 +253,7 @@ pub async fn logs(cx: &Cx) -> Result {
         }}
 
         function loadPage(page) {{
+            if (!document.getElementById('detail-dialog').classList.contains('hidden')) return Promise.resolve();
             currentPage = page;
             if (refreshTimer) {{
                 clearTimeout(refreshTimer);
@@ -322,27 +262,17 @@ pub async fn logs(cx: &Cx) -> Result {
             if (logsRequest) logsRequest.abort();
             const request = new AbortController();
             logsRequest = request;
-            const key = document.getElementById('filter-key').value;
-            const model = document.getElementById('filter-model').value;
-            const provider = document.getElementById('filter-provider').value;
-            const protocol = document.getElementById('filter-protocol').value;
             const status = document.getElementById('filter-status').value;
-            const params = new URLSearchParams({{
-                page: page.toString(),
-                limit: '20',
-                api_key_id: key === 'all' ? '' : key,
-                model: model === 'all' ? '' : model,
-                provider_name: provider === 'all' ? '' : provider,
-                protocol: protocol === 'all' ? '' : protocol,
-                status: status === 'all' ? '' : status,
-            }});
+            const params = AdminFilters.append(new URLSearchParams({{
+                page: page.toString(), limit: '20', status: status === 'all' ? '' : status
+            }}));
             return fetch('/logs/table?' + params.toString(), {{ signal: request.signal }})
                 .then(r => {{
                     if (r.status === 401) return redirectToLogin();
                     return r.text();
                 }})
                 .then(html => {{
-                    if (!html) return;
+                    if (!html || logsRequest !== request || !document.getElementById('detail-dialog').classList.contains('hidden')) return;
                     const pagination = html.match(/<!-- pagination-data data-total="(\d+)" data-limit="(\d+)" data-offset="(\d+)" -->/);
                     const limit = pagination ? parseInt(pagination[2]) : 20;
                     const offset = pagination ? parseInt(pagination[3]) : (page - 1) * limit;
@@ -365,177 +295,11 @@ pub async fn logs(cx: &Cx) -> Result {
                 }});
         }}
 
-        function addFilterOption(selectId, value, label) {{
-            const option = document.createElement('option');
-            option.value = value;
-            option.textContent = label;
-            document.getElementById(selectId).appendChild(option);
-        }}
-
         async function loadFilterOptions() {{
-            const responses = await Promise.allSettled([
-                fetch('/v1/admin/keys', {{ credentials: 'include' }}),
-                fetch('/v1/admin/providers', {{ credentials: 'include' }}),
-                fetch('/v1/admin/analytics/model', {{ credentials: 'include' }})
-            ]);
-            const readJson = async (result) => result.status === 'fulfilled' && result.value.ok ? result.value.json() : [];
-            const [keys, providers, models] = await Promise.all(responses.map(readJson));
-            (Array.isArray(keys) ? keys : []).forEach((key) => addFilterOption('filter-key', key.id, key.name || key.id));
-            (Array.isArray(providers) ? providers : []).forEach((provider) => addFilterOption('filter-provider', provider.name, provider.name));
-            const protocols = new Set();
-            (Array.isArray(providers) ? providers : []).forEach((provider) => (provider.endpoints || []).forEach((endpoint) => {{
-                if (endpoint.protocol) protocols.add(endpoint.protocol);
-            }}));
-            Array.from(protocols).sort().forEach((protocol) => addFilterOption('filter-protocol', protocol, protocol));
-            (Array.isArray(models) ? models : []).forEach((model) => {{
-                if (model.group_key) addFilterOption('filter-model', model.group_key, model.group_key);
-            }});
-        }}
-
-        function openDetail(logId) {{
-            document.getElementById('detail-dialog').classList.remove('hidden');
-            document.getElementById('detail-body').innerHTML = '<div class="text-center text-zinc-500 py-8">加载中...</div>';
-            fetch('/v1/admin/logs/' + encodeURIComponent(logId), {{ credentials: 'include' }})
-                .then(response => {{
-                    if (response.status === 401) {{
-                        window.location.href = '/login';
-                        return;
-                    }}
-                    return response.json();
-                }})
-                .then(data => {{ if (data) renderDetail(data); }})
-                .catch(() => {{ document.getElementById('detail-body').innerHTML = '<div class="text-center text-red-500 py-8">加载失败</div>'; }});
-        }}
-
-        function closeDetailDialog() {{
-            document.getElementById('detail-dialog').classList.add('hidden');
-            document.getElementById('detail-body').innerHTML = '';
-        }}
-
-        function renderDetail(d) {{
-            const log = d.log || d;
-            const isRunning = log.status === 'running';
-            const isErr = !isRunning && log.status !== 'success';
-            let statusDisplay;
-            if (isRunning) {{
-                statusDisplay = log.retry_count > 0 ? '重试中' : '处理中';
-            }} else if (isErr && log.status_code < 400) {{
-                statusDisplay = (log.status === 'interrupted' ? '中断' : '失败') + ' (' + log.status_code + ')';
-            }} else {{
-                statusDisplay = log.status_code;
-            }}
-            const firstByte = log.first_byte_latency_ms || 0;
-            const inputTokens = log.input_tokens || 0;
-            const outputTokens = log.output_tokens || 0;
-            const cachedTokens = log.cached_tokens || 0;
-            const hitRate = cacheRate(inputTokens, cachedTokens);
-
-            let meta = {{}};
-            try {{ meta = JSON.parse(log.meta || '{{}}'); }} catch(e) {{}}
-
-            let requestBody = d.request_body;
-            let responseBody = d.response_body;
-            if (typeof requestBody === 'string') {{ try {{ requestBody = JSON.stringify(JSON.parse(requestBody), null, 2); }} catch(e) {{}} }}
-            if (typeof responseBody === 'string') {{ try {{ responseBody = JSON.stringify(JSON.parse(responseBody), null, 2); }} catch(e) {{}} }}
-
-            const html = `
-                <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
-                    <div class="rounded-lg border bg-zinc-50 p-3">
-                        <div class="text-[0.65rem] uppercase tracking-wider text-zinc-500 mb-1">状态码</div>
-                        <div class="font-mono text-sm ${{isRunning ? 'text-amber-700' : (isErr ? 'text-red-600' : 'text-emerald-600')}}">${{statusDisplay}}</div>
-                    </div>
-                    <div class="rounded-lg border bg-zinc-50 p-3">
-                        <div class="text-[0.65rem] uppercase tracking-wider text-zinc-500 mb-1">耗时</div>
-                        <div class="font-mono text-sm">${{formatDuration(log.latency_ms)}}</div>
-                    </div>
-                    <div class="rounded-lg border bg-zinc-50 p-3">
-                        <div class="text-[0.65rem] uppercase tracking-wider text-zinc-500 mb-1">TTFT</div>
-                        <div class="font-mono text-sm">${{isRunning ? '—' : formatDuration(firstByte)}}</div>
-                    </div>
-                    <div class="rounded-lg border bg-zinc-50 p-3">
-                        <div class="text-[0.65rem] uppercase tracking-wider text-zinc-500 mb-1">输入 / 输出</div>
-                        <div class="font-mono text-sm">${{isRunning ? '—' : formatTokens(inputTokens) + ' / ' + formatTokens(outputTokens)}}</div>
-                    </div>
-                    <div class="rounded-lg border bg-zinc-50 p-3">
-                        <div class="text-[0.65rem] uppercase tracking-wider text-zinc-500 mb-1">缓存命中 / 写入</div>
-                        <div class="font-mono text-sm">${{isRunning ? '—' : formatTokens(cachedTokens) + ' / ' + formatTokens(log.cache_write_tokens || 0)}}</div>
-                    </div>
-                    <div class="rounded-lg border bg-zinc-50 p-3">
-                        <div class="text-[0.65rem] uppercase tracking-wider text-zinc-500 mb-1">总 Tokens</div>
-                        <div class="font-mono text-sm">${{isRunning ? '—' : formatTokens(log.total_tokens || 0)}}</div>
-                    </div>
-                    <div class="rounded-lg border bg-zinc-50 p-3">
-                        <div class="text-[0.65rem] uppercase tracking-wider text-zinc-500 mb-1">CHR</div>
-                        <div class="font-mono text-sm">${{isRunning ? '—' : formatPercent(hitRate)}}</div>
-                    </div>
-                    <div class="rounded-lg border bg-zinc-50 p-3">
-                        <div class="text-[0.65rem] uppercase tracking-wider text-zinc-500 mb-1">TPS</div>
-                        <div class="font-mono text-sm">${{isRunning ? '—' : formatTps(outputTokens, log.latency_ms, firstByte)}}</div>
-                    </div>
-                    <div class="rounded-lg border bg-zinc-50 p-3">
-                        <div class="text-[0.65rem] uppercase tracking-wider text-zinc-500 mb-1">TPOT</div>
-                        <div class="font-mono text-sm">${{isRunning ? '—' : formatTpot(outputTokens, log.latency_ms, firstByte)}}</div>
-                    </div>
-                    <div class="rounded-lg border bg-zinc-50 p-3">
-                        <div class="text-[0.65rem] uppercase tracking-wider text-zinc-500 mb-1">价格</div>
-                        <div class="font-mono text-sm">${{isRunning ? '—' : formatCost(log.cost_cents)}}</div>
-                    </div>
-                </div>
-                <div class="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
-                    <div><span class="text-zinc-500">请求 ID：</span><span class="font-mono break-all">${{escapeHtml(log.request_id)}}</span></div>
-                    <div><span class="text-zinc-500">日志 ID：</span><span class="font-mono break-all">${{escapeHtml(log.id)}}</span></div>
-                    <div><span class="text-zinc-500">上游模型：</span><span class="font-mono">${{escapeHtml(log.model)}}</span></div>
-                    <div><span class="text-zinc-500">Key：</span><span class="font-mono">${{escapeHtml(log.key_display_name || log.api_key_id)}}</span></div>
-                    <div><span class="text-zinc-500">供应商：</span><span class="font-mono">${{escapeHtml(log.provider_name)}}</span></div>
-                    <div><span class="text-zinc-500">接口：</span><span class="font-mono">${{escapeHtml(log.operation)}} / ${{escapeHtml(log.protocol)}}</span></div>
-                    <div><span class="text-zinc-500">时间：</span><span class="font-mono">${{formatTime(log.created_at)}}</span></div>
-                </div>
-                ${{meta.retry ? `
-                <div class="rounded-lg border bg-zinc-50 p-3">
-                    <div class="text-[0.65rem] uppercase tracking-wider text-zinc-500 font-semibold mb-2">重试</div>
-                    <div class="flex flex-wrap gap-2 text-xs">
-                        <span class="badge-secondary font-mono">retry=${{meta.retry.retry_count || 0}}</span>
-                        <span class="badge-outline font-mono">attempts=${{meta.retry.attempt_count || 0}}</span>
-                        <span class="badge-outline font-mono">backoff=${{formatDuration(meta.retry.total_backoff_ms || 0)}}</span>
-                    </div>
-                    ${{Array.isArray(meta.retry.attempts) && meta.retry.attempts.length > 0 ? `
-                    <div class="mt-2 space-y-2">
-                        ${{meta.retry.attempts.map(a => `
-                        <div class="rounded-md border bg-white p-2">
-                            <div class="flex flex-wrap items-center gap-2 text-xs">
-                                <span class="badge-outline font-mono">#${{a.attempt}}</span>
-                                <span class="${{a.retryable ? 'badge-error' : 'badge-success'}} font-mono">${{a.status_code}}</span>
-                                <span class="font-mono">${{escapeHtml(a.provider_name)}}</span>
-                                <span class="text-zinc-500">${{escapeHtml(a.protocol)}}</span>
-                                <span class="text-zinc-500">backoff=${{formatDuration(a.backoff_ms_before_next || 0)}}</span>
-                            </div>
-                            ${{a.error_code ? `<div class="mt-1 text-xs text-zinc-500 break-all">${{escapeHtml(a.error_code)}}${{a.error_message ? ': ' + escapeHtml(a.error_message) : ''}}</div>` : ''}}
-                        </div>
-                        `).join('')}}
-                    </div>` : '<div class="text-xs text-zinc-500 mt-2">无重试</div>'}}
-                </div>` : ''}}
-                ${{log.error_code || log.error ? `
-                <div class="rounded-lg border border-red-200 bg-red-50 p-3">
-                    <div class="text-[0.65rem] uppercase tracking-wider text-red-600 font-semibold mb-2">错误</div>
-                    <div class="font-mono text-xs break-all">${{escapeHtml(log.error_code || 'unknown')}}</div>
-                    <div class="text-xs text-zinc-500 mt-1 break-all">${{escapeHtml(log.error || '')}}</div>
-                </div>` : ''}}
-                <div>
-                    <div class="text-[0.65rem] uppercase tracking-wider text-zinc-500 font-semibold mb-2">元数据 JSON</div>
-                    <pre class="rounded-lg border bg-zinc-50 p-3 text-xs overflow-x-auto max-h-64 overflow-y-auto"><code>${{escapeHtml(JSON.stringify(meta, null, 2))}}</code></pre>
-                </div>
-                ${{requestBody ? `
-                <div>
-                    <div class="text-[0.65rem] uppercase tracking-wider text-zinc-500 font-semibold mb-2">请求体</div>
-                    <pre class="rounded-lg border bg-zinc-50 p-3 text-xs overflow-x-auto max-h-64 overflow-y-auto"><code>${{escapeHtml(typeof requestBody === 'string' ? requestBody : JSON.stringify(requestBody, null, 2))}}</code></pre>
-                </div>` : ''}}
-                ${{responseBody ? `
-                <div>
-                    <div class="text-[0.65rem] uppercase tracking-wider text-zinc-500 font-semibold mb-2">响应体</div>
-                    <pre class="rounded-lg border bg-zinc-50 p-3 text-xs overflow-x-auto max-h-64 overflow-y-auto"><code>${{escapeHtml(typeof responseBody === 'string' ? responseBody : JSON.stringify(responseBody, null, 2))}}</code></pre>
-                </div>` : ''}}
-            `;
-            document.getElementById('detail-body').innerHTML = html;
+            await AdminFilters.mount([
+                ['filter-key', 'keys', 'Key'], ['filter-model', 'models', '模型'],
+                ['filter-provider', 'providers', '供应商'], ['filter-protocol', 'protocols', '协议']
+            ], () => loadPage(1));
         }}
 
         function updatePagination(page, total) {{
@@ -558,7 +322,7 @@ pub async fn logs(cx: &Cx) -> Result {
             refreshTimer = null;
             const refreshSelect = document.getElementById('filter-refresh');
             const ms = parseInt(refreshSelect.value);
-            if (ms > 0 && !document.hidden) {{
+            if (ms > 0 && !document.hidden && document.getElementById('detail-dialog').classList.contains('hidden')) {{
                 refreshTimer = setTimeout(() => loadPage(currentPage), Math.max(1000, ms));
             }}
         }}
@@ -580,23 +344,30 @@ pub async fn logs(cx: &Cx) -> Result {
                     loadPage(currentPage);
                 }}
             }});
-            ['filter-key', 'filter-model', 'filter-provider', 'filter-protocol', 'filter-status'].forEach((id) => {{
+            ['filter-status'].forEach((id) => {{
                 document.getElementById(id).addEventListener('change', () => loadPage(1));
             }});
             loadFilterOptions().finally(() => {{
-                document.getElementById('filter-key').value = query.get('key') || 'all';
-                document.getElementById('filter-model').value = query.get('model') || 'all';
-                document.getElementById('filter-provider').value = query.get('provider_name') || 'all';
-                document.getElementById('filter-protocol').value = query.get('protocol') || 'all';
+                AdminFilters.restore('filter-key', query.has('key') ? [query.get('key')] : []);
+                AdminFilters.restore('filter-model', query.has('model') ? [query.get('model')] : []);
+                AdminFilters.restore('filter-provider', query.has('provider_name') ? [query.get('provider_name')] : []);
+                AdminFilters.restore('filter-protocol', query.has('protocol') ? [query.get('protocol')] : []);
                 document.getElementById('filter-status').value = query.get('status') || 'all';
                 loadPage(Math.max(1, parseInt(query.get('page')) || 1));
             }});
         }});
     </script>
     {}
+    <script>{log_detail_js}</script>
 </body>
 </html>"##,
-        shared_styles, toast_container, sidebar, page_html, shared_scripts
+        shared_styles,
+        toast_container,
+        sidebar,
+        page_html,
+        shared_scripts,
+        log_detail_css = include_str!("../../../static/admin/log-detail.css"),
+        log_detail_js = include_str!("../../../static/admin/log-detail.js")
     );
 
     Ok(trusted_html(html))
@@ -617,7 +388,16 @@ pub async fn logs_table(cx: &Cx) -> Result {
     let offset = (page - 1) * limit;
 
     let state = app_state(cx);
+    let selection = crate::admin::SelectionQuery {
+        models: get_param(&params, "models"),
+        providers: get_param(&params, "providers"),
+        keys: get_param(&params, "keys"),
+        protocols: get_param(&params, "protocols"),
+    }
+    .resolve(&state.config_service.snapshot())
+    .map_err(|error| topcoat::Error::from(std::io::Error::other(error.to_string())))?;
     let filter = RequestLogFilter {
+        selection,
         from: None,
         to: None,
         api_key_id: get_param(&params, "api_key_id"),
@@ -750,15 +530,17 @@ pub async fn logs_table(cx: &Cx) -> Result {
             let operation = escape_html(&log.operation);
             let model = escape_html(&log.model);
             let log_id_js = escape_inline_js_string(&log.id);
+            let log_id_html = escape_html(&log.id);
+            let logo = snapshot.model_logo_url(&log.provider_name, &log.model).map(|url| format!(r#"<img src="{}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()">"#, escape_html(url))).unwrap_or_default();
 
             html.push_str(&format!(
-                r##"<tr class="log-row border-b border-zinc-100">
+                r##"<tr class="log-row border-b border-zinc-100" data-row-action="openDetail" data-row-value="{log_id_html}" tabindex="0" aria-label="查看调用 {request_id_short}">
                     <td class="px-3 py-2.5 whitespace-nowrap font-mono text-xs text-zinc-500" title="{}">{}</td>
                     <td class="px-3 py-2.5 font-mono text-xs text-zinc-500 whitespace-nowrap">{}</td>
                     <td class="px-3 py-2.5"><span class="badge-secondary font-mono truncate block max-w-24" title="{}">{}</span></td>
                     <td class="px-3 py-2.5"><span class="badge-outline font-mono truncate block max-w-28">{}</span></td>
                     <td class="px-3 py-2.5"><div class="flex flex-col gap-0.5"><span class="badge-outline font-mono truncate block max-w-24">{}</span><span class="truncate font-mono text-[10px] text-zinc-400">{}</span></div></td>
-                    <td class="px-3 py-2.5"><span class="badge-outline font-mono truncate block max-w-32" title="{}">{}</span></td>
+                    <td class="px-3 py-2.5"><span class="model-mark">{logo}<span class="badge-outline font-mono truncate block max-w-32" title="{}">{}</span></span></td>
                     <td class="px-3 py-2.5 font-mono text-xs whitespace-nowrap">{}</td>
                     <td class="px-3 py-2.5 font-mono text-xs whitespace-nowrap">{}</td>
                     <td class="px-3 py-2.5 font-mono text-xs whitespace-nowrap">{}</td>
@@ -770,7 +552,7 @@ pub async fn logs_table(cx: &Cx) -> Result {
                     <td class="px-3 py-2.5 font-mono text-xs whitespace-nowrap">{}</td>
                     <td class="px-3 py-2.5 font-mono text-xs whitespace-nowrap">{}</td>
                     <td class="px-3 py-2.5"><span class="{} font-mono px-2 py-0.5 text-xs">{}</span></td>
-                    <td class="px-3 py-2.5"><button class="inline-flex h-7 w-7 items-center justify-center rounded border border-zinc-200 hover:bg-zinc-50" onclick="openDetail({})"><svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg></button></td>
+                    <td class="px-3 py-2.5"><button class="inline-flex h-7 w-7 items-center justify-center rounded border border-zinc-200 hover:bg-zinc-50" onclick="openDetail({})" aria-label="查看调用详情" title="查看调用详情"><svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg></button></td>
                 </tr>"##,
                 time_full,
                 time_short,

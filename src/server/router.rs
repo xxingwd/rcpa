@@ -86,8 +86,24 @@ pub fn build_api_router(state: Arc<AppState>) -> Router {
             get(crate::admin::list_aliases).post(crate::admin::create_alias),
         )
         .route(
+            "/admin/filter-options",
+            get(crate::admin::list_filter_options),
+        )
+        .route(
             "/admin/model-catalog",
             get(crate::admin::list_model_catalog),
+        )
+        .route(
+            "/admin/platform-models",
+            get(crate::admin::list_platform_models).put(crate::admin::replace_platform_models),
+        )
+        .route(
+            "/admin/platform-models/source",
+            get(crate::admin::list_model_source),
+        )
+        .route(
+            "/admin/platform-models/source/logos/{provider}",
+            get(crate::admin::get_model_source_logo),
         )
         .route(
             "/admin/config-file",

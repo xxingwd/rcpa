@@ -48,7 +48,8 @@ pub fn render_theme_bootstrap() -> &'static str {
 }
 
 pub fn render_theme_scripts() -> &'static str {
-    r#"<script>
+    concat!(
+        r#"<script>
     const ThemeManager = {
         key: 'rcpa-theme',
         mode: 'system',
@@ -99,5 +100,8 @@ pub fn render_theme_scripts() -> &'static str {
     };
     function cycleThemeMode() { ThemeManager.cycle(); }
     document.addEventListener('DOMContentLoaded', () => ThemeManager.init());
-    </script>"#
+    "#,
+        include_str!("../../../static/admin/tooltips.js"),
+        "</script>"
+    )
 }

@@ -1,6 +1,7 @@
 //! SQLite-backed persistence layer for the RCPA gateway.
 
 mod analytics;
+mod dashboard_performance;
 pub mod models;
 mod request_log_gc;
 mod request_log_repo;
@@ -330,6 +331,7 @@ mod tests {
                 20260729000000,
                 20260804000000,
                 20260818000000,
+                20261115000000,
             ]
         );
 

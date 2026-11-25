@@ -79,6 +79,7 @@ pub struct ProxyRequest {
     pub model: String,
     pub body: serde_json::Value,
     pub multipart: Option<MultipartFormData>,
+    pub headers: axum::http::HeaderMap,
     pub stream: bool,
 }
 
@@ -693,6 +694,7 @@ async fn handle_llm_request_inner(
         model: resolved_model,
         body: body_value,
         multipart,
+        headers: crate::provider::headers::forwardable_headers(headers),
         stream,
     };
 

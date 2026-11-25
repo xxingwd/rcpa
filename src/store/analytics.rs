@@ -6,6 +6,17 @@ use super::{models::AggregateRow, models::TotalStats, Store, StoreResult};
 const SUCCESS_CONDITION: &str = "status = 'success'";
 const SHANGHAI_UTC_OFFSET_SECONDS: i32 = 8 * 60 * 60;
 
+// Keep JSON expressions identical to the analytics index so SQLite reads their
+// indexed values without fetching the large request log rows.
+const DASHBOARD_METRICS_SELECT: &str =
+    "SELECT created_at, api_key_id, provider_name, protocol, model, status,
+            status_code, input_tokens, output_tokens, cached_tokens,
+            cache_write_tokens, cost_cents, latency_ms, first_byte_latency_ms, retry_count,
+            CAST(json_extract(meta, '$.request.stream') AS INTEGER) as is_stream,
+            (json_extract(meta, '$.error.code') IS NOT NULL OR
+             json_extract(meta, '$.error.message') IS NOT NULL) as has_error
+     FROM request_logs l WHERE l.status <> 'running' AND l.created_at >= ";
+
 /// Dashboard-oriented LLM API metrics derived from persisted request logs.
 #[derive(Debug, Clone, Serialize)]
 pub struct DashboardStats {
@@ -24,10 +35,24 @@ pub struct DashboardAnalytics {
     pub by_protocol: Vec<AggregateRow>,
     pub by_status_code: Vec<AggregateRow>,
     pub timeline: Vec<AggregateRow>,
+    pub performance: PerformanceStats,
+    pub observed: super::dashboard_performance::ObservedPerformance,
+    pub model_channels: Vec<super::dashboard_performance::DashboardChannel>,
+}
+
+/// Distribution and retry metrics computed from the same filtered completed requests.
+#[derive(Debug, Clone, Serialize)]
+pub struct PerformanceStats {
+    pub latency_p50_ms: i64,
+    pub latency_p95_ms: i64,
+    pub latency_p99_ms: i64,
+    pub retried_requests: i64,
+    pub retry_attempts: i64,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum AnalyticsTimeBucket {
+    Minute,
     Hour,
     Day,
 }
@@ -170,18 +195,49 @@ impl Store {
         to: &str,
         time_bucket: AnalyticsTimeBucket,
     ) -> StoreResult<DashboardAnalytics> {
-        let rows = sqlx::query_as::<_, DashboardMetricRow>(
-            "SELECT created_at, api_key_id, provider_name, protocol, model, status,
-                    status_code, input_tokens, output_tokens, cached_tokens,
-                    cache_write_tokens, cost_cents, latency_ms, first_byte_latency_ms
-             FROM request_logs
-             WHERE created_at >= ?1 AND created_at <= ?2
-               AND status <> 'running'",
+        self.dashboard_analytics_filtered(
+            from,
+            to,
+            time_bucket,
+            &super::models::LogSelection::default(),
         )
-        .bind(from)
-        .bind(to)
-        .fetch_all(&self.pool)
-        .await?;
+        .await
+    }
+
+    pub async fn dashboard_analytics_filtered(
+        &self,
+        from: &str,
+        to: &str,
+        time_bucket: AnalyticsTimeBucket,
+        selection: &super::models::LogSelection,
+    ) -> StoreResult<DashboardAnalytics> {
+        let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(DASHBOARD_METRICS_SELECT);
+        query
+            .push_bind(from)
+            .push(" AND l.created_at <= ")
+            .push_bind(to);
+        super::request_log_repo::append_log_selection(&mut query, selection);
+        let rows = query
+            .build_query_as::<DashboardMetricRow>()
+            .fetch_all(&self.pool)
+            .await?;
+        let observed = super::dashboard_performance::ObservedPerformance::from_rows(&rows);
+        let model_channels = super::dashboard_performance::channels(&rows);
+        let mut latencies: Vec<_> = rows.iter().map(|row| row.latency_ms).collect();
+        latencies.sort_unstable();
+        let percentile = |percent: usize| {
+            latencies
+                .get((latencies.len() * percent).div_ceil(100).saturating_sub(1))
+                .copied()
+                .unwrap_or(0)
+        };
+        let performance = PerformanceStats {
+            latency_p50_ms: percentile(50),
+            latency_p95_ms: percentile(95),
+            latency_p99_ms: percentile(99),
+            retried_requests: rows.iter().filter(|row| row.retry_count > 0).count() as i64,
+            retry_attempts: rows.iter().map(|row| row.retry_count).sum(),
+        };
 
         let mut total = MetricsAccumulator::default();
         let mut by_model = HashMap::<String, MetricsAccumulator>::new();
@@ -217,6 +273,9 @@ impl Store {
         }
 
         Ok(DashboardAnalytics {
+            performance,
+            observed,
+            model_channels,
             total: total.into_total_stats(),
             by_model: sorted_aggregate_rows(by_model),
             by_key: sorted_aggregate_rows(by_key),
@@ -317,30 +376,35 @@ impl AnalyticsTimeBucket {
             });
 
         match (self, local_time) {
+            (Self::Minute, Some(time)) => time.format("%Y-%m-%d %H:%M").to_string(),
             (Self::Hour, Some(time)) => time.format("%Y-%m-%d %H:00").to_string(),
             (Self::Day, Some(time)) => time.format("%Y-%m-%d").to_string(),
             (Self::Hour, None) => created_at.get(..13).unwrap_or(created_at).to_string(),
+            (Self::Minute, None) => created_at.get(..16).unwrap_or(created_at).to_string(),
             (Self::Day, None) => created_at.get(..10).unwrap_or(created_at).to_string(),
         }
     }
 }
 
 #[derive(sqlx::FromRow)]
-struct DashboardMetricRow {
-    created_at: String,
-    api_key_id: String,
-    provider_name: String,
-    protocol: String,
-    model: String,
-    status: String,
-    status_code: i64,
-    input_tokens: i64,
-    output_tokens: i64,
-    cached_tokens: i64,
-    cache_write_tokens: i64,
-    cost_cents: i64,
-    latency_ms: i64,
-    first_byte_latency_ms: i64,
+pub(super) struct DashboardMetricRow {
+    pub(super) is_stream: Option<bool>,
+    pub(super) has_error: bool,
+    pub(super) retry_count: i64,
+    pub(super) created_at: String,
+    pub(super) api_key_id: String,
+    pub(super) provider_name: String,
+    pub(super) protocol: String,
+    pub(super) model: String,
+    pub(super) status: String,
+    pub(super) status_code: i64,
+    pub(super) input_tokens: i64,
+    pub(super) output_tokens: i64,
+    pub(super) cached_tokens: i64,
+    pub(super) cache_write_tokens: i64,
+    pub(super) cost_cents: i64,
+    pub(super) latency_ms: i64,
+    pub(super) first_byte_latency_ms: i64,
 }
 
 #[derive(Default)]
@@ -809,27 +873,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dashboard_analytics_query_uses_the_time_metrics_index() {
+    async fn dashboard_analytics_query_is_covered_including_performance_metrics() {
         let store = Store::open_in_memory().await.unwrap();
         seed_logs(&store).await;
 
-        let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(
-            "EXPLAIN QUERY PLAN
-             SELECT created_at, api_key_id, provider_name, protocol, model, status,
-                    status_code, input_tokens, output_tokens, cached_tokens,
-                    cache_write_tokens, cost_cents, latency_ms, first_byte_latency_ms
-             FROM request_logs
-             WHERE created_at >= '2000-01-01T00:00:00Z'
-               AND created_at <= '2099-12-31T23:59:59Z'
-               AND status <> 'running'",
+        let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new("EXPLAIN QUERY PLAN ");
+        query
+            .push(super::DASHBOARD_METRICS_SELECT)
+            .push_bind("2000-01-01T00:00:00Z")
+            .push(" AND l.created_at <= ")
+            .push_bind("2099-12-31T23:59:59Z");
+        let plan: Vec<(i64, i64, i64, String)> =
+            query.build_query_as().fetch_all(&store.pool).await.unwrap();
+
+        assert!(
+            plan.iter().any(|(_, _, _, detail)| {
+                detail.contains("idx_request_logs_analytics_created_at")
+            }),
+            "Dashboard query must avoid fetching request log bodies: {plan:?}"
+        );
+
+        // Older SQLite versions do not label expression indexes as COVERING in
+        // QUERY PLAN. Verify the bytecode never reads a column from the table.
+        use sqlx::Row;
+        let table_root: i64 = sqlx::query_scalar(
+            "SELECT rootpage FROM sqlite_master WHERE type = 'table' AND name = 'request_logs'",
         )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        let instructions = sqlx::query(&format!(
+            "EXPLAIN {} ? AND l.created_at <= ?",
+            super::DASHBOARD_METRICS_SELECT
+        ))
+        .bind("2000-01-01T00:00:00Z")
+        .bind("2099-12-31T23:59:59Z")
         .fetch_all(&store.pool)
         .await
         .unwrap();
-
-        assert!(plan
+        let table_cursors: Vec<i64> = instructions
             .iter()
-            .any(|(_, _, _, detail)| { detail.contains("idx_request_logs_analytics_created_at") }));
+            .filter(|row| {
+                row.get::<String, _>("opcode") == "OpenRead"
+                    && row.get::<i64, _>("p2") == table_root
+            })
+            .map(|row| row.get("p1"))
+            .collect();
+        assert!(
+            !instructions.iter().any(|row| {
+                row.get::<String, _>("opcode") == "Column" && table_cursors.contains(&row.get("p1"))
+            }),
+            "Dashboard query must read metrics from the index, not request_logs"
+        );
     }
 
     #[tokio::test]

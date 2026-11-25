@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use rcpa::config::{
-    AppConfig, AuthKey, CostConfig, EndpointConfig, ModelRule, ProviderConfig, ProviderProtocol,
-    RetryConfig, RoutingConfig, StickyConfig, UpstreamConfig,
+    AppConfig, AuthKey, CostConfig, EndpointConfig, ModelRule, PlatformModel, ProviderConfig,
+    ProviderProtocol, RetryConfig, RoutingConfig, StickyConfig, UpstreamConfig,
 };
 use rcpa::config_service::ConfigService;
 use rcpa::server::RuntimeConfig;
@@ -841,6 +841,8 @@ fn test_config() -> AppConfig {
             "https://api.openai.com/v1/chat/completions",
             vec![enabled_model("gpt-4o")],
         )],
+        model_catalog: vec![],
+        model_catalog_enabled: false,
         upstream: UpstreamConfig { timeout_secs: 60 },
         routing: RoutingConfig {
             sticky: StickyConfig::default(),
@@ -967,7 +969,7 @@ async fn test_config_service_updates_provider_snapshot() {
 }
 
 #[tokio::test]
-async fn test_admin_provider_rename_updates_key_references_and_sticky_sessions() {
+async fn test_admin_unicode_provider_rename_updates_key_references_and_sticky_sessions() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
@@ -994,21 +996,81 @@ async fn test_admin_provider_rename_updates_key_references_and_sticky_sessions()
         .header("x-admin-token", "admin-token")
         .header("content-type", "application/json")
         .body(Body::from(
-            r#"{"name":"renamed-provider","api_key":"sk-renamed","models":[{"name":"gpt-4o","status":"enabled","aliases":[]}],"endpoints":[{"protocol":"completions","base_url":"https://api.example.com/v1/chat/completions"}],"status":"enabled","priority":3}"#,
+            r#"{"name":"供应商-临时分组","api_key":"sk-renamed","models":[{"name":"gpt-4o","status":"enabled","aliases":[]}],"endpoints":[{"protocol":"completions","base_url":"https://api.example.com/v1/chat/completions"}],"status":"enabled","priority":3}"#,
         ))
         .unwrap();
-    let response = app.oneshot(request).await.unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
     let snapshot = state.config_service.snapshot();
     assert!(snapshot.find_provider("openai-test-provider").is_none());
-    let renamed = snapshot.find_provider("renamed-provider").unwrap();
+    let renamed = snapshot.find_provider("供应商-临时分组").unwrap();
     assert_eq!(renamed.status, "enabled");
     assert_eq!(renamed.priority, 3);
     let restricted_key = snapshot.auth_key_for_secret("restricted-secret").unwrap();
-    assert_eq!(restricted_key.allowed_providers, vec!["renamed-provider"]);
+    assert_eq!(restricted_key.allowed_providers, vec!["供应商-临时分组"]);
     assert!(snapshot.has_endpoint("gpt-4o", Some(&restricted_key)));
     assert!(state.sticky_sessions.is_empty());
+
+    let url =
+        reqwest::Url::parse("http://localhost/v1/admin/providers/供应商-临时分组/status").unwrap();
+    let request = Request::builder()
+        .method("PUT")
+        .uri(url.path())
+        .header("x-admin-token", "admin-token")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"status":"enabled"}"#))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        state
+            .config_service
+            .snapshot()
+            .find_provider("供应商-临时分组")
+            .unwrap()
+            .status,
+        "enabled"
+    );
+}
+
+#[tokio::test]
+async fn test_admin_rejects_provider_names_that_cannot_be_url_path_segments() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let state = state_from_config(test_config()).await;
+    let app = rcpa::server::router::build(state.clone());
+    for (method, path) in [
+        ("POST", "/v1/admin/providers"),
+        ("PUT", "/v1/admin/providers/openai-test-provider"),
+    ] {
+        let request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("x-admin-token", "admin-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"name":"https://ai.midcode.cc/v1","api_key":"sk-test","models":[],"endpoints":[{"protocol":"completions","base_url":"https://ai.midcode.cc/v1/chat/completions"}]}"#,
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{method}");
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("provider name"));
+    }
+    assert!(state
+        .config_service
+        .snapshot()
+        .find_provider("https://ai.midcode.cc/v1")
+        .is_none());
 }
 
 #[tokio::test]
@@ -1054,6 +1116,7 @@ async fn test_admin_reorders_config_lists_and_persists_yaml_order() {
                 status: "enabled".to_string(),
                 pricing: None,
                 aliases: vec!["z-public".to_string(), "a-public".to_string()],
+                platform_model: None,
             },
             enabled_model("model-b"),
         ],
@@ -2896,6 +2959,83 @@ async fn test_models_endpoint_lists_platform_global_and_key_alias_names() {
 }
 
 #[tokio::test]
+async fn test_catalog_only_exposes_public_names_and_routes_manual_binding() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let mut config = test_config();
+    config.providers[0].models[0] = ModelRule {
+        platform_model: Some("gpt-4o".into()),
+        ..enabled_model("vendor-deployment")
+    };
+    config.model_catalog = vec![
+        PlatformModel {
+            name: "gpt-4o".into(),
+            display_name: "GPT-4o".into(),
+            description: String::new(),
+            aliases: vec!["smart".into()],
+            route_to: None,
+            context_window: None,
+            logo_url: None,
+            pricing: None,
+            source: None,
+            source_updated_at: None,
+            status: "enabled".into(),
+        },
+        PlatformModel {
+            name: "legacy".into(),
+            display_name: String::new(),
+            description: String::new(),
+            aliases: Vec::new(),
+            route_to: Some("gpt-4o".into()),
+            context_window: None,
+            logo_url: None,
+            pricing: None,
+            source: None,
+            source_updated_at: None,
+            status: "enabled".into(),
+        },
+    ];
+    config.model_catalog_enabled = true;
+    config.keys.push(auth_key("user", "secret", Vec::new()));
+    let state = state_from_config(config).await;
+    let snapshot = state.config_service.snapshot();
+    assert_eq!(
+        snapshot.endpoints_for_alias("smart", None)[0].name,
+        "vendor-deployment"
+    );
+    assert_eq!(
+        snapshot.endpoints_for_alias("legacy", None)[0].name,
+        "vendor-deployment"
+    );
+    assert!(snapshot.endpoints_for_alias("gpt-4o", None).is_empty());
+
+    let response = rcpa::server::router::build(state)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .header("x-api-key", "secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let list: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let names: std::collections::HashSet<&str> = list["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["id"].as_str())
+        .collect();
+    assert_eq!(names, ["smart", "legacy"].into());
+}
+
+#[tokio::test]
 async fn test_models_endpoint_filters_allowed_providers_owner() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -2978,6 +3118,7 @@ async fn test_key_alias_global_alias_and_log_detail_json_are_persisted() {
             status: "enabled".into(),
             pricing: None,
             aliases: vec!["global-fast".into()],
+            platform_model: None,
         }],
     )];
     let mut key = auth_key("user-key", "user-secret-key", vec![enabled_model("quick")]);
@@ -3097,6 +3238,7 @@ async fn test_routed_provider_failure_logs_actual_provider_model() {
             status: "enabled".into(),
             pricing: None,
             aliases: vec!["public-gpt".into()],
+            platform_model: None,
         }],
     )];
     config.retry.max_attempts = 1;
@@ -3274,7 +3416,21 @@ async fn test_total_timeout_finishes_non_stream_request_log() {
         vec![enabled_model("gpt-4o")],
     ));
 
-    let state = state_from_config(config).await;
+    // Timeout cancellation can discard a pool connection. A private in-memory
+    // database loses its schema when that last connection closes; exercise the
+    // persisted deployment behavior with an isolated file-backed fixture.
+    let directory = std::env::temp_dir().join(format!("rcpa-timeout-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&directory).unwrap();
+    let config_path = directory.join("config.yaml");
+    std::fs::write(&config_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    let state = Arc::new(
+        rcpa::server::AppState::new(
+            Arc::new(ConfigService::new(&config_path).unwrap()),
+            rcpa::server::RuntimeConfig::new("admin-token", directory.join("rcpa.db")),
+        )
+        .await
+        .unwrap(),
+    );
     let app = rcpa::server::router::build(state.clone());
     let request_task = tokio::spawn(async move {
         let req = Request::builder()
@@ -3306,6 +3462,8 @@ async fn test_total_timeout_finishes_non_stream_request_log() {
     assert_eq!(logs.len(), 1);
     assert_eq!(logs[0].status, "interrupted");
     assert_eq!(logs[0].error_code.as_deref(), Some("request_timeout"));
+    drop(state);
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[tokio::test]
@@ -3770,6 +3928,7 @@ async fn test_retry_switches_to_different_provider_within_same_request() {
                 status: "enabled".into(),
                 pricing: None,
                 aliases: vec!["public-gpt".into()],
+                platform_model: None,
             }],
         ),
         provider(
@@ -3781,6 +3940,7 @@ async fn test_retry_switches_to_different_provider_within_same_request() {
                 status: "enabled".into(),
                 pricing: None,
                 aliases: vec!["public-gpt".into()],
+                platform_model: None,
             }],
         ),
     ];
@@ -3971,6 +4131,7 @@ async fn test_streaming_chat_completions_falls_back_to_messages_conversion() {
             status: "enabled".into(),
             pricing: None,
             aliases: vec!["claude-sonnet".into()],
+            platform_model: None,
         }],
     )];
     config.keys.push(auth_key(
@@ -4195,4 +4356,145 @@ async fn test_disabled_provider_model_disables_alias() {
         Err(err) => err.to_string(),
     };
     assert!(err.contains("targets unknown platform model"));
+}
+
+#[tokio::test]
+async fn test_forwards_client_headers_for_every_json_protocol_and_stream_mode() {
+    use axum::{
+        body::Body,
+        http::{HeaderMap, Request, StatusCode},
+        routing::post,
+        Json, Router,
+    };
+    use tower::ServiceExt;
+
+    for (protocol, path, body) in [
+        (
+            "completions",
+            "/v1/chat/completions",
+            serde_json::json!({"model":"header-test","messages":[{"role":"user","content":"hello"}]}),
+        ),
+        (
+            "responses",
+            "/v1/responses",
+            serde_json::json!({"model":"header-test","input":"hello"}),
+        ),
+        (
+            "messages",
+            "/v1/messages",
+            serde_json::json!({"model":"header-test","messages":[{"role":"user","content":"hello"}],"max_tokens":32}),
+        ),
+        (
+            "embeddings",
+            "/v1/embeddings",
+            serde_json::json!({"model":"header-test","input":"hello"}),
+        ),
+        (
+            "images_generations",
+            "/v1/images/generations",
+            serde_json::json!({"model":"header-test","prompt":"hello"}),
+        ),
+        (
+            "images_edits",
+            "/v1/images/edits",
+            serde_json::json!({"model":"header-test","prompt":"hello"}),
+        ),
+    ] {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<HeaderMap>::new()));
+        let upstream = Router::new().route(path, post({
+            let captured = captured.clone();
+            move |headers: HeaderMap, Json(_): Json<serde_json::Value>| {
+                captured.lock().unwrap().push(headers);
+                async { (StatusCode::FORBIDDEN, Json(serde_json::json!({"error":{"message":"captured","type":"forbidden_error"}}))) }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let mut config = test_config();
+        let mut backend = provider(
+            "header-provider",
+            protocol,
+            &format!("http://{address}{path}"),
+            vec![enabled_model("header-test")],
+        );
+        backend
+            .headers
+            .insert("User-Agent".into(), "configured-default/1".into());
+        backend
+            .headers
+            .insert("x-provider-default".into(), "configured".into());
+        config.providers = vec![backend];
+        config.keys.push(auth_key(
+            "header-key",
+            "gateway-secret",
+            vec![enabled_model("header-test")],
+        ));
+        let app = rcpa::server::router::build(state_from_config(config).await);
+        for stream in [false, true] {
+            let mut body = body.clone();
+            body["stream"] = stream.into();
+            let request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("authorization", "Bearer gateway-secret")
+                .header("x-api-key", "gateway-secret")
+                .header("host", "gateway.invalid")
+                .header("connection", "keep-alive, x-private-hop")
+                .header("x-private-hop", "must-not-leak")
+                .header("user-agent", "codex_cli_rs/9.9 (Linux; x86_64)")
+                .header("originator", "codex_cli_rs")
+                .header("session_id", "original-session")
+                .header("x-codex-turn-metadata", r#"{"turn_id":"original"}"#)
+                .header("x-client-request-id", "original-request")
+                .header("anthropic-version", "2023-01-01")
+                .header("anthropic-beta", "original-feature")
+                .header("x-client-feature", "one")
+                .header("x-client-feature", "two")
+                .header("accept", "application/json, text/event-stream")
+                .header("content-type", "application/json; charset=utf-8")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            let _ = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let requests = captured.lock().unwrap();
+            let headers = requests.last().unwrap();
+            for (name, expected) in [
+                ("user-agent", "codex_cli_rs/9.9 (Linux; x86_64)"),
+                ("originator", "codex_cli_rs"),
+                ("session_id", "original-session"),
+                ("x-codex-turn-metadata", r#"{"turn_id":"original"}"#),
+                ("x-client-request-id", "original-request"),
+                ("anthropic-version", "2023-01-01"),
+                ("anthropic-beta", "original-feature"),
+                ("accept", "application/json, text/event-stream"),
+                ("content-type", "application/json; charset=utf-8"),
+                ("x-provider-default", "configured"),
+            ] {
+                assert_eq!(
+                    headers[name], expected,
+                    "{protocol}, stream={stream}, {name}"
+                );
+            }
+            let features: Vec<_> = headers
+                .get_all("x-client-feature")
+                .iter()
+                .map(|v| v.to_str().unwrap())
+                .collect();
+            assert_eq!(features, ["one", "two"]);
+            assert_ne!(headers["host"], "gateway.invalid");
+            assert!(!headers.contains_key("x-private-hop"));
+            if protocol == "messages" {
+                assert_eq!(headers["x-api-key"], "sk-mock-key");
+                assert!(!headers.contains_key("authorization"));
+            } else {
+                assert_eq!(headers["authorization"], "Bearer sk-mock-key");
+                assert!(!headers.contains_key("x-api-key"));
+            }
+        }
+        assert_eq!(captured.lock().unwrap().len(), 2);
+        task.abort();
+    }
 }

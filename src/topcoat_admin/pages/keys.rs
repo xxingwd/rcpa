@@ -388,7 +388,7 @@ pub async fn keys_table(cx: &Cx) -> Result {
     }
 
     let mut html = String::new();
-    html.push_str(r##"<div class="overflow-x-auto"><table class="w-full text-sm">
+    html.push_str(r##"<div class="data-table-scroll"><table class="w-full text-sm">
         <thead class="border-b border-zinc-200 bg-zinc-50">
             <tr>
                 <th class="w-12 px-2 py-3 text-left"><span class="sr-only">排序</span></th>
@@ -475,7 +475,7 @@ pub async fn keys_table(cx: &Cx) -> Result {
         let toggle_text = if is_enabled { "禁用" } else { "启用" };
 
         html.push_str(&format!(
-            r##"<tr class="hover:bg-zinc-50" data-sortable-row data-key-order-id="{}">
+            r##"<tr class="hover:bg-zinc-50" data-sortable-row data-key-order-id="{}" data-row-action="openEditModal" data-row-value="{id_html}" tabindex="0" aria-label="查看密钥 {name}">
                 <td class="px-2 py-2">
                     <button type="button" class="drag-handle" data-persist-order title="拖动调整顺序" aria-label="拖动调整密钥 {}" onpointerdown="beginSortablePointer(event, this, 'keys')" onpointermove="moveSortablePointer(event)" onpointerup="endSortablePointer(event)" onpointercancel="endSortablePointer(event)" onkeydown="moveSortableWithKeyboard(event, this, 'keys')">
                         <svg class="h-5 w-5" aria-hidden="true" viewBox="0 0 24 24" fill="currentColor"><circle cx="9" cy="5" r="1.5"/><circle cx="15" cy="5" r="1.5"/><circle cx="9" cy="12" r="1.5"/><circle cx="15" cy="12" r="1.5"/><circle cx="9" cy="19" r="1.5"/><circle cx="15" cy="19" r="1.5"/></svg>

@@ -22,6 +22,14 @@ const CHART_JS: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/static/chartjs/chart.umd.min.js"
 ));
+const MODEL_CATALOG_JS: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/static/admin/model-catalog.js"
+));
+const MODEL_CATALOG_CSS: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/static/admin/model-catalog.css"
+));
 const CODEMIRROR_JS: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/static/codemirror/codemirror.min.js"
@@ -99,6 +107,26 @@ pub fn build_topcoat_app(state: Arc<AppState>) -> Router {
                 "/_topcoat/chart.umd.min.js",
                 axum::routing::get(|| async {
                     static_asset_response(CHART_JS, "application/javascript; charset=utf-8")
+                }),
+            ),
+        ))
+        .route(TowerRoute::new(
+            Methods::Only(&[topcoat::router::Method::GET]),
+            Path::new("/_topcoat/model-catalog.js"),
+            axum::Router::new().route(
+                "/_topcoat/model-catalog.js",
+                axum::routing::get(|| async {
+                    static_asset_response(MODEL_CATALOG_JS, "application/javascript; charset=utf-8")
+                }),
+            ),
+        ))
+        .route(TowerRoute::new(
+            Methods::Only(&[topcoat::router::Method::GET]),
+            Path::new("/_topcoat/model-catalog.css"),
+            axum::Router::new().route(
+                "/_topcoat/model-catalog.css",
+                axum::routing::get(|| async {
+                    static_asset_response(MODEL_CATALOG_CSS, "text/css; charset=utf-8")
                 }),
             ),
         ))

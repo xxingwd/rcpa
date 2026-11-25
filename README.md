@@ -37,6 +37,8 @@ Gateway settings live in `config.yaml`:
 
 - `upstream.timeout_secs` is the maximum duration of a complete gateway request. It includes all upstream attempts, retry backoff, and the full streaming response.
 - `providers[]` is the provider-level object. `name`, `api_key`, `models[]`, `priority`, `status`, and `headers` are shared for that provider.
+- Forwarded requests preserve client identity, session, feature, and other end-to-end headers, including repeated values. Client values take precedence over `providers[].headers`; provider headers fill missing values. Gateway credentials/cookies are removed and upstream authentication uses provider credentials. Hop-by-hop headers, `Host`, `Content-Length`, and `Content-Encoding` are regenerated or removed; multipart boundaries are regenerated with the body.
+- Responses requests missing `User-Agent` or `originator` use the bundled CLIProxyAPI Codex defaults (`codex-tui/0.135.0` and `codex-tui`). Existing client values are preserved; provider headers can supply defaults. These HTTP identifiers do not reproduce TLS fingerprints or guarantee upstream acceptance.
 - `providers[].endpoints[]` defines upstream operation endpoints. Each endpoint declares exactly one `protocol` and one `base_url`.
 - `providers[].endpoints[].base_url` is sent to the upstream as-is.
 - `providers[].endpoints[].protocol` is operation-level: use `completions` for `/v1/chat/completions`; the other values are `responses`, `messages`, `embeddings`, `images_generations`, and `images_edits`.
@@ -80,7 +82,7 @@ There is no database migration and no change to the public LLM protocol routes.
 
 ## Database
 
-SQLite is the default storage backend. Schema changes are versioned through migrations. If the schema is out of date or migration order is invalid, startup fails until the database is migrated explicitly.
+SQLite is the default storage backend. On startup, SQLx applies pending embedded, versioned migrations in order and verifies the applied migration checksums. Missing migration versions, changed checksums, or failed migrations fail startup; the application does not repair or recreate business tables as a fallback. Back up the database before updating, and validate the new binary against a separate snapshot before replacing a running instance.
 
 Request and response bodies use a fixed retention policy: successful request bodies are cleared after 24 hours and failed request bodies after 7 days. Cleanup runs daily at 03:00 Asia/Shanghai in batches of 500; request log rows, metadata, token usage, cost, latency, and analytics metrics are retained. After cleanup, storage maintenance truncates the WAL and runs `VACUUM` when bodies were cleared or freelist pages are available, then truncates the WAL again so reclaimed space is returned to the filesystem.
 

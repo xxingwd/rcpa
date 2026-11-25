@@ -76,7 +76,6 @@ pub async fn config(cx: &Cx) -> Result {
         .CodeMirror-activeline-background {{ background: color-mix(in oklch, var(--accent) 65%, transparent); }}
         @media (max-width: 1023px) {{
             .config-path {{ max-width: 100%; flex: 1 1 14rem; }}
-            .config-editor-shell {{ min-height: 36rem; }}
         }}
     </style>
 </head>

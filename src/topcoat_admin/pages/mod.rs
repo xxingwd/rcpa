@@ -6,4 +6,5 @@ pub mod dashboard_analytics;
 pub mod keys;
 pub mod login;
 pub mod logs;
+pub mod model_catalog;
 pub mod providers;

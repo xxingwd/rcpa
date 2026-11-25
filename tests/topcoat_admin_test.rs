@@ -13,6 +13,8 @@ use rcpa::{
 fn empty_config() -> AppConfig {
     AppConfig {
         providers: Vec::new(),
+        model_catalog: Vec::new(),
+        model_catalog_enabled: false,
         upstream: UpstreamConfig { timeout_secs: 60 },
         routing: RoutingConfig {
             sticky: StickyConfig::default(),
@@ -46,6 +48,7 @@ fn populated_config() -> AppConfig {
                 output_per_1k: 0.25,
             }),
             aliases: vec!["public-model".to_string()],
+            platform_model: None,
         }],
         endpoints: vec![EndpointConfig {
             protocol: ProviderProtocol::Responses,
@@ -68,6 +71,7 @@ fn populated_config() -> AppConfig {
             status: "disabled".to_string(),
             pricing: None,
             aliases: Vec::new(),
+            platform_model: None,
         }],
         model_aliases: [("fast-fixture".to_string(), "public-model".to_string())]
             .into_iter()
@@ -126,7 +130,7 @@ async fn admin_pages_require_cookie_and_render_the_shared_rust_shell() {
         })
         .await
         .unwrap();
-    let app = build_topcoat_app(state);
+    let app = build_topcoat_app(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
@@ -155,6 +159,11 @@ async fn admin_pages_require_cookie_and_render_the_shared_rust_shell() {
             "/_topcoat/chart.umd.min.js",
             "application/javascript; charset=utf-8",
         ),
+        (
+            "/_topcoat/model-catalog.js",
+            "application/javascript; charset=utf-8",
+        ),
+        ("/_topcoat/model-catalog.css", "text/css; charset=utf-8"),
         (
             "/_topcoat/codemirror/codemirror.min.js",
             "application/javascript; charset=utf-8",
@@ -200,6 +209,10 @@ async fn admin_pages_require_cookie_and_render_the_shared_rust_shell() {
         "/keys/missing/edit",
         "/providers/table",
         "/providers/new",
+        "/model-catalog",
+        "/providers/create",
+        "/providers/missing/settings",
+        "/providers/missing/duplicate",
         "/providers/missing/edit",
         "/providers/missing/copy",
         "/logs/table",
@@ -323,7 +336,14 @@ async fn admin_pages_require_cookie_and_render_the_shared_rust_shell() {
         serde_json::from_str(&dashboard_analytics.text().await.unwrap()).unwrap();
     assert_eq!(dashboard_analytics["by_key"][0]["group_key"], "Fixture Key");
 
-    for path in ["/dashboard", "/keys", "/providers", "/logs", "/config"] {
+    for path in [
+        "/dashboard",
+        "/keys",
+        "/providers",
+        "/model-catalog",
+        "/logs",
+        "/config",
+    ] {
         let response = client
             .get(format!("{base}{path}"))
             .header("cookie", &cookie)
@@ -361,7 +381,8 @@ async fn admin_pages_require_cookie_and_render_the_shared_rust_shell() {
         );
         assert!(html.contains("order: ['system', 'light', 'dark']"));
         assert!(!html.contains("class=\"theme-switcher"), "path: {path}");
-        assert!(!html.contains("aria-pressed="), "path: {path}");
+        // Dashboard filter buttons legitimately expose their pressed state.
+        assert!(!html.contains("class=\"theme-switcher"), "path: {path}");
         assert!(html.contains("this.mode = this.normalize(localStorage.getItem(this.key))"));
         assert!(html.contains("this.media.addEventListener('change', onSystemChange)"));
         assert!(
@@ -385,18 +406,21 @@ async fn admin_pages_require_cookie_and_render_the_shared_rust_shell() {
             assert!(html.contains(".toFixed(2).replace(/\\.?0+$/, '') + 's'"));
             assert!(html.contains("tokenChart.update('none')"));
             assert!(html.contains("requestChart.update('none')"));
-            assert!(html.contains("if (analyticsLoading) return Promise.resolve()"));
+            assert!(html.contains("if (analyticsRequest) analyticsRequest.abort()"));
             assert!(html.contains("formatTimelineLabel(b.label || b.group_key)"));
             assert!(html.contains("const SHANGHAI_OFFSET_MS = 8 * 60 * 60 * 1000"));
             assert!(html.contains("chartDataSignature === nextSignature"));
             assert!(!html.contains("date.getFullYear()"));
             assert!(!html.contains("tokenChart.destroy()"));
             assert!(!html.contains("requestChart.destroy()"));
-            assert_eq!(html.matches("class=\"dashboard-table-card ").count(), 2);
-            assert_eq!(html.matches("class=\"dashboard-table-scroll\"").count(), 2);
+            assert_eq!(html.matches("class=\"dashboard-table-card\"").count(), 2);
+            assert_eq!(html.matches("class=\"dashboard-table-scroll\"").count(), 3);
             assert!(html.contains(".dashboard-table-scroll {"));
-            assert!(html.contains("overflow: auto; overscroll-behavior: contain;"));
-            assert!(html.contains(".dashboard-table-scroll thead th { position: sticky; top: 0;"));
+            assert!(html.contains("overflow:auto; overscroll-behavior:contain;"));
+            assert!(html.contains("position:sticky; top:0;"));
+            assert!(html.contains("dashboard-kpis"));
+            assert!(html.contains("id=\"channel-table-body\""));
+            assert!(html.contains("估算 TPS"));
             assert_eq!(html.matches("aria-sort=\"descending\"").count(), 2);
         }
         if path == "/providers" {
@@ -413,8 +437,8 @@ async fn admin_pages_require_cookie_and_render_the_shared_rust_shell() {
         }
         if path == "/logs" {
             assert!(html.contains("id=\"logs-list\""));
-            assert!(html.contains("class=\"dialog-shell log-dialog\""));
-            assert!(html.contains(".logs-page { min-width: 0; overflow: hidden; }"));
+            assert!(html.contains("class=\"modal-content log-detail-panel\""));
+            assert!(html.contains(".logs-page { min-width: 0; }"));
             assert!(html.contains(".toFixed(2).replace(/\\.?0+$/, '') + 's'"));
             assert!(html.contains("timeZone: 'Asia/Shanghai'"));
             assert!(html.contains("let logsRequest = null"));
@@ -447,6 +471,10 @@ async fn admin_pages_require_cookie_and_render_the_shared_rust_shell() {
         providers_page_html.contains("data.model_passthrough = data.model_passthrough === 'true';")
     );
     assert!(providers_page_html.contains("throw new Error(text || ('HTTP ' + response.status));"));
+    assert!(providers_page_html.contains("function collectProviderEndpoints()"));
+    assert!(
+        providers_page_html.contains("function updateProviderModelMatch(control, refresh = true)")
+    );
 
     let keys_table = client
         .get(format!("{base}/keys/table"))
@@ -487,9 +515,15 @@ async fn admin_pages_require_cookie_and_render_the_shared_rust_shell() {
         assert!(!html.contains("<!DOCTYPE"), "path: {path}");
 
         if path == "/providers/new" {
-            assert!(html.contains("var endpointIndex = 100"));
-            assert!(html.contains("function addEndpointRow()"));
-            assert!(html.contains("data-empty-state"));
+            assert!(html.contains(r#"pattern="[\p{L}\p{N}][\p{L}\p{N}._\-]*""#));
+            assert!(html.contains("maxlength=\"64\""));
+            assert!(html.contains("name=\"endpoint_base_url\""));
+            assert!(html.contains("data-provider-section=\"basic\""));
+            assert!(html.contains("data-provider-section=\"models\""));
+            assert!(html.contains("data-provider-protocol=\"completions\""));
+            assert!(html.contains("data-provider-protocol=\"messages\""));
+            assert!(html.contains("data-default-path=\"/v1/chat/completions\""));
+            assert!(html.contains("id=\"new-model-row\""));
             assert!(html.contains("div.dataset.orderRow = ''"));
             assert!(html.contains("div.dataset.sortableRow = ''"));
             assert!(html.contains("aria-label=\"拖动调整模型\""));
@@ -514,7 +548,11 @@ async fn admin_pages_require_cookie_and_render_the_shared_rust_shell() {
             "path: {path}"
         );
         assert!(
-            html.contains("<option value=\"responses\" selected>"),
+            html.contains("data-provider-protocol=\"responses\""),
+            "path: {path}"
+        );
+        assert!(
+            html.contains("name=\"endpoint_base_url\" value=\"https://fixture.example/v1\""),
             "path: {path}"
         );
         assert!(
@@ -564,6 +602,112 @@ async fn admin_pages_require_cookie_and_render_the_shared_rust_shell() {
     assert!(key_html.contains("data-sortable-row"));
     assert!(key_html.contains("aria-label=\"拖动调整模型规则\""));
     assert!(!key_html.contains("aria-label=\"上移模型规则\""));
+
+    let update_catalog = client
+        .put(format!("{base}/v1/admin/platform-models"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({
+            "enabled": true,
+            "models": [{
+                "name": "upstream-model",
+                "display_name": "Fixture Model",
+                "description": "Fixture catalog entry",
+                "aliases": ["public-model"],
+                "route_to": null,
+                "context_window": 128000,
+                "pricing": null,
+                "source": null,
+                "source_updated_at": null,
+                "status": "enabled"
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(update_catalog.status().is_success());
+    let catalog = client
+        .get(format!("{base}/v1/admin/platform-models"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let catalog: serde_json::Value = catalog.json().await.unwrap();
+    assert_eq!(catalog["enabled"], true);
+    assert_eq!(catalog["models"][0]["aliases"][0], "public-model");
+    let provider_edit = client
+        .get(format!("{base}/providers/fixture-provider/edit"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let provider_html = provider_edit.text().await.unwrap();
+    assert!(provider_html.contains("models[0][platform_model]"));
+    assert!(provider_html.contains("模型目录已启用，未绑定的上游模型不会透传"));
+    let alias = client
+        .post(format!("{base}/v1/admin/aliases"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({
+            "alias": "second-public",
+            "target_model": "upstream-model",
+            "provider_name": null
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(alias.status().is_success());
+    let catalog = client
+        .get(format!("{base}/v1/admin/platform-models"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let catalog: serde_json::Value = catalog.json().await.unwrap();
+    assert!(catalog["models"][0]["aliases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|alias| alias == "second-public"));
+    let draft = client
+        .put(format!("{base}/v1/admin/platform-models"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({ "enabled": false, "models": catalog["models"] }))
+        .send()
+        .await
+        .unwrap();
+    assert!(draft.status().is_success());
+    let provider_edit = client
+        .get(format!("{base}/providers/fixture-provider/edit"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let provider_html = provider_edit.text().await.unwrap();
+    assert!(provider_html.contains("name=\"models[0][aliases]\" value=\"public-model\""));
+    assert!(provider_html.contains("models[0][platform_model]"));
+
+    // Existing Unicode provider identities must remain editable through encoded routes.
+    state
+        .config_service
+        .update(|config| {
+            let mut provider = config.providers[0].clone();
+            provider.name = "供应商-临时分组".into();
+            config.providers.push(provider);
+            Ok(())
+        })
+        .unwrap();
+    for suffix in ["settings", "duplicate"] {
+        let response = client
+            .get(format!("{base}/providers/供应商-临时分组/{suffix}"))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let html = response.text().await.unwrap();
+        assert!(html.contains("class=\"provider-form\""));
+        assert!(html.contains("upstream-model"));
+        assert!(!html.contains("供应商不存在"));
+    }
 
     let _ = shutdown_tx.send(());
     server.await.unwrap();
@@ -650,6 +794,203 @@ async fn logs_table_shows_failure_label_instead_of_success_range_status_code() {
     assert!(!logs_table_html.contains("badge-success"));
     assert!(!logs_table_html.contains(">200</span>"));
 
+    let _ = shutdown_tx.send(());
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn local_filter_options_and_combined_selections_use_provider_model_routes() {
+    let mut config = populated_config();
+    let mut second = config.providers[0].clone();
+    second.name = "second-provider".into();
+    second.status = "disabled".into();
+    second.models[0].name = "second-deployment".into();
+    second.models[0].aliases = vec!["second-public".into()];
+    config.providers.push(second);
+    let state = Arc::new(AppState::from_config(config).await.unwrap());
+    for (id, provider, model, latency, success) in [
+        ("one", "fixture-provider", "upstream-model", 100, true),
+        ("two", "second-provider", "second-deployment", 500, false),
+        (
+            "historical",
+            "retired-provider",
+            "historical-model",
+            9999,
+            true,
+        ),
+        (
+            "wrong-route",
+            "fixture-provider",
+            "second-deployment",
+            9999,
+            true,
+        ),
+    ] {
+        state
+            .store
+            .insert_request_log_entry(NewRequestLog {
+                request_id: id,
+                api_key_id: "fixture-key",
+                session_hash: None,
+                provider_name: provider,
+                protocol: "responses",
+                model,
+                operation: "responses",
+                status_code: if success { 200 } else { 500 },
+                success,
+                input_tokens: 100,
+                output_tokens: 50,
+                total_tokens: 150,
+                cached_tokens: 20,
+                cache_write_tokens: 0,
+                cost_cents: 10,
+                latency_ms: latency,
+                first_byte_latency_ms: latency / 2,
+                metadata_json: if success {
+                    "{}"
+                } else {
+                    r#"{"retry":{"retry_count":2}}"#
+                },
+                request_body: None,
+                response_body: None,
+            })
+            .await
+            .unwrap();
+    }
+    let app = build_topcoat_app(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        topcoat::serve_until(listener, app, async {
+            let _ = shutdown_rx.await;
+        })
+        .await
+        .unwrap();
+    });
+    let client = reqwest::Client::new();
+    let request = |path: &str| {
+        client
+            .get(format!("{base}{path}"))
+            .header("x-admin-token", "admin-token")
+    };
+    let options: serde_json::Value = request("/v1/admin/filter-options")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        options["models"],
+        serde_json::json!(["public-model", "second-public"])
+    );
+    let models = serde_json::json!(["public-model", "second-public"]).to_string();
+    let dashboard: serde_json::Value = request("/v1/admin/analytics/dashboard")
+        .query(&[("models", models.as_str())])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(dashboard["total"]["request_count"], 2);
+    assert_eq!(dashboard["total"]["error_count"], 1);
+    assert_eq!(dashboard["performance"]["latency_p50_ms"], 100);
+    assert_eq!(dashboard["performance"]["latency_p95_ms"], 500);
+    assert_eq!(dashboard["performance"]["retried_requests"], 1);
+    assert_eq!(dashboard["performance"]["retry_attempts"], 2);
+    let providers = serde_json::json!(["second-provider"]).to_string();
+    let keys = serde_json::json!(["fixture-key"]).to_string();
+    let protocols = serde_json::json!(["responses"]).to_string();
+    let filters = [
+        ("models", models.as_str()),
+        ("providers", providers.as_str()),
+        ("keys", keys.as_str()),
+        ("protocols", protocols.as_str()),
+    ];
+    let dashboard: serde_json::Value = request("/v1/admin/analytics/dashboard")
+        .query(&filters)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(dashboard["total"]["request_count"], 1);
+    assert_eq!(dashboard["by_provider"][0]["group_key"], "second-provider");
+    let logs: serde_json::Value = request("/v1/admin/logs")
+        .query(&filters)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(logs["total"], 1);
+    assert_eq!(logs["items"][0]["request_id"], "two");
+    let response = request("/v1/admin/analytics/dashboard")
+        .query(&[("models", "[\"historical-model\"]")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let response = request("/v1/admin/analytics/dashboard")
+        .query(&[("models", "not-json")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let update = client
+        .put(format!("{base}/v1/admin/platform-models"))
+        .header("x-admin-token", "admin-token")
+        .json(&serde_json::json!({
+            "enabled": true,
+            "models": [
+                { "name": "upstream-model", "aliases": ["public-model"] },
+                { "name": "second-deployment", "aliases": ["second-public"] },
+                { "name": "unbound-model", "aliases": ["unbound-public"] }
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        update.status().is_success(),
+        "{}",
+        update.text().await.unwrap()
+    );
+    let options: serde_json::Value = request("/v1/admin/filter-options")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        options["models"],
+        serde_json::json!(["public-model", "second-public", "unbound-public"])
+    );
+    // Selecting a configured model without a supplier must never remove the model restriction.
+    let dashboard: serde_json::Value = request("/v1/admin/analytics/dashboard")
+        .query(&[("models", "[\"unbound-public\"]")])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(dashboard["total"]["request_count"], 0);
+    assert_eq!(dashboard["performance"]["latency_p99_ms"], 0);
+    let dashboard: serde_json::Value = request("/v1/admin/analytics/dashboard")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(dashboard["total"]["request_count"], 4);
     let _ = shutdown_tx.send(());
     server.await.unwrap();
 }

@@ -7,13 +7,18 @@ use axum::{
 use indexmap::IndexMap;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use crate::config::{AppConfig, AuthKey, EndpointConfig, ModelPricing, ModelRule, ProviderConfig};
+use crate::config::{
+    validate_provider_name, AppConfig, AuthKey, EndpointConfig, ModelPricing, ModelRule,
+    PlatformModel, ProviderConfig,
+};
 use crate::error::AppError;
 use crate::server::AppState;
 
 const ADMIN_COOKIE_NAME: &str = "rcpa_admin_token";
+static MODEL_SOURCE_LOGOS: OnceLock<tokio::sync::RwLock<HashMap<String, Vec<u8>>>> =
+    OnceLock::new();
 
 /// Extract admin token from either x-admin-token header or cookie.
 fn extract_admin_token(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
@@ -285,6 +290,7 @@ fn key_model_payloads_to_rules(models: Vec<KeyModelPayload>) -> Vec<ModelRule> {
             status: model.status,
             pricing: None,
             aliases: Vec::new(),
+            platform_model: None,
         })
         .collect()
 }
@@ -529,8 +535,88 @@ impl TimeRangeQuery {
     }
 }
 
+/// JSON arrays preserve arbitrary model names without comma splitting.
+#[derive(Debug, Default, Deserialize)]
+pub struct SelectionQuery {
+    pub models: Option<String>,
+    pub providers: Option<String>,
+    pub keys: Option<String>,
+    pub protocols: Option<String>,
+}
+
+impl SelectionQuery {
+    pub fn resolve(
+        &self,
+        snapshot: &crate::config_service::ConfigSnapshot,
+    ) -> Result<crate::store::models::LogSelection, AppError> {
+        let parse = |value: &Option<String>| -> Result<Vec<String>, AppError> {
+            match value {
+                None => Ok(Vec::new()),
+                Some(value) => serde_json::from_str::<Vec<String>>(value).map_err(|_| {
+                    AppError::BadRequest("Filters must be JSON arrays of strings".into())
+                }),
+            }
+        };
+        let names = parse(&self.models)?;
+        let restrict_models = !names.is_empty();
+        let catalog = snapshot.analytics_model_routes();
+        let mut routes = Vec::new();
+        for name in names {
+            let matches = catalog
+                .get(&name)
+                .ok_or_else(|| AppError::BadRequest(format!("Unknown local model '{name}'")))?;
+            routes.extend(matches.iter().cloned());
+        }
+        routes.sort();
+        routes.dedup();
+        Ok(crate::store::models::LogSelection {
+            restrict_models,
+            model_routes: routes,
+            providers: parse(&self.providers)?,
+            keys: parse(&self.keys)?,
+            protocols: parse(&self.protocols)?,
+        })
+    }
+}
+
+pub async fn list_filter_options(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    check_admin(&state, &headers)?;
+    let snapshot = state.config_service.snapshot();
+    let mut models: Vec<_> = snapshot.analytics_model_routes().into_keys().collect();
+    models.sort();
+    models.dedup();
+    let providers: Vec<_> = snapshot
+        .raw_config
+        .providers
+        .iter()
+        .map(|provider| &provider.name)
+        .collect();
+    let mut protocols: Vec<_> = snapshot
+        .raw_config
+        .providers
+        .iter()
+        .flat_map(|provider| {
+            provider
+                .endpoints
+                .iter()
+                .map(|endpoint| endpoint.protocol.to_string())
+        })
+        .collect();
+    protocols.sort();
+    protocols.dedup();
+    let keys: Vec<_> = snapshot.raw_config.keys.iter().map(|key| serde_json::json!({"value": key.id, "label": key.name.as_deref().unwrap_or(&key.id)})).collect();
+    Ok(Json(
+        serde_json::json!({"models": models, "providers": providers, "protocols": protocols, "keys": keys, "currency": snapshot.raw_config.cost.currency}),
+    ))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct DashboardAnalyticsQuery {
+    #[serde(flatten)]
+    pub selection: SelectionQuery,
     pub from: Option<String>,
     pub to: Option<String>,
     #[serde(default)]
@@ -540,6 +626,7 @@ pub struct DashboardAnalyticsQuery {
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DashboardAnalyticsBucket {
+    Minute,
     #[default]
     Hour,
     Day,
@@ -556,6 +643,7 @@ impl DashboardAnalyticsQuery {
 
     fn time_bucket(&self) -> crate::store::AnalyticsTimeBucket {
         match self.bucket {
+            DashboardAnalyticsBucket::Minute => crate::store::AnalyticsTimeBucket::Minute,
             DashboardAnalyticsBucket::Hour => crate::store::AnalyticsTimeBucket::Hour,
             DashboardAnalyticsBucket::Day => crate::store::AnalyticsTimeBucket::Day,
         }
@@ -638,7 +726,12 @@ pub async fn get_dashboard_analytics(
     let (from, to) = query.resolve_range();
     let mut data = state
         .store
-        .dashboard_analytics(&from, &to, query.time_bucket())
+        .dashboard_analytics_filtered(
+            &from,
+            &to,
+            query.time_bucket(),
+            &query.selection.resolve(&state.config_service.snapshot())?,
+        )
         .await?;
     apply_key_display_names(&state.config_service.snapshot(), &mut data.by_key);
     Ok(Json(data))
@@ -728,11 +821,7 @@ async fn fetch_upstream_model_ids(
         return Err(AppError::BadRequest("API key is required".into()));
     }
 
-    let url = if origin.ends_with("/models") {
-        origin.to_string()
-    } else {
-        format!("{origin}/models")
-    };
+    let url = upstream_models_url(origin)?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_secs.clamp(1, 20)))
         .build()
@@ -772,6 +861,28 @@ async fn fetch_upstream_model_ids(
     Ok((parse_upstream_model_ids(&body)?, url))
 }
 
+fn upstream_models_url(origin: &str) -> Result<String, AppError> {
+    let mut url = reqwest::Url::parse(origin)
+        .map_err(|error| AppError::BadRequest(format!("Invalid endpoint address: {error}")))?;
+    let mut path = url.path().trim_end_matches('/').to_string();
+    for protocol in crate::config::ProviderProtocol::ALL {
+        if let Some(prefix) = path.strip_suffix(protocol.default_path()) {
+            path = format!("{prefix}/v1");
+            break;
+        }
+    }
+    if path.is_empty() {
+        path = "/v1".to_string();
+    }
+    if !path.ends_with("/models") {
+        path.push_str("/models");
+    }
+    url.set_path(&path);
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.to_string())
+}
+
 fn parse_upstream_model_ids(body: &str) -> Result<Vec<String>, AppError> {
     let parsed: serde_json::Value = serde_json::from_str(body)
         .map_err(|_| AppError::BadRequest("Upstream models response is not JSON".into()))?;
@@ -805,7 +916,7 @@ fn parse_upstream_model_ids(body: &str) -> Result<Vec<String>, AppError> {
 
 #[cfg(test)]
 mod upstream_model_tests {
-    use super::parse_upstream_model_ids;
+    use super::{parse_upstream_model_ids, upstream_models_url};
 
     #[test]
     fn parses_openai_model_list_and_deduplicates_ids() {
@@ -814,6 +925,22 @@ mod upstream_model_tests {
         )
         .unwrap();
         assert_eq!(models, vec!["gpt-4o", "claude"]);
+    }
+
+    #[test]
+    fn discovers_models_from_a_full_protocol_endpoint() {
+        assert_eq!(
+            upstream_models_url("https://api.example.com/v1/chat/completions").unwrap(),
+            "https://api.example.com/v1/models"
+        );
+        assert_eq!(
+            upstream_models_url("https://api.example.com/tenant/v1/responses").unwrap(),
+            "https://api.example.com/tenant/v1/models"
+        );
+        assert_eq!(
+            upstream_models_url("https://api.example.com").unwrap(),
+            "https://api.example.com/v1/models"
+        );
     }
 }
 
@@ -922,6 +1049,8 @@ pub async fn create_provider(
     Json(payload): Json<CreateProviderPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     check_admin(&state, &headers)?;
+    validate_provider_name(&payload.name)
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
     let provider_name = payload.name.clone();
     let api_key = payload.api_key.clone();
     let models = payload.models.clone();
@@ -997,8 +1126,10 @@ pub async fn update_provider(
     Json(payload): Json<CreateProviderPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     check_admin(&state, &headers)?;
-    ensure_model_name_is_canonical(&original_name, "provider name")?;
-    ensure_model_name_is_canonical(&payload.name, "provider name")?;
+    validate_provider_name(&original_name)
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    validate_provider_name(&payload.name)
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
 
     let current = state.config_service.snapshot();
     if !current
@@ -1143,6 +1274,253 @@ pub async fn delete_provider(
 
 // === Model Aliases ===
 
+pub async fn list_platform_models(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    check_admin(&state, &headers)?;
+    let config = &state.config_service.snapshot().raw_config;
+    Ok(Json(serde_json::json!({
+        "models": config.model_catalog,
+        "enabled": config.model_catalog_enabled,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplacePlatformModelsPayload {
+    pub models: Vec<PlatformModel>,
+    pub enabled: bool,
+}
+
+pub async fn replace_platform_models(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<ReplacePlatformModelsPayload>,
+) -> Result<impl IntoResponse, AppError> {
+    check_admin(&state, &headers)?;
+    state
+        .config_service
+        .update(|config| {
+            config.model_catalog = payload.models;
+            config.model_catalog_enabled = payload.enabled;
+            Ok(())
+        })
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+#[derive(Debug, Serialize)]
+pub struct ModelSourceResult {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub provider: String,
+    pub context_window: Option<u64>,
+    pub last_updated: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ModelSourceProvider {
+    pub id: String,
+    pub name: String,
+    pub model_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ModelSourceCatalog {
+    pub providers: Vec<ModelSourceProvider>,
+    pub models: Vec<ModelSourceResult>,
+}
+
+pub async fn list_model_source(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    check_admin(&state, &headers)?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    let response = client
+        .get("https://models.dev/api.json")
+        .send()
+        .await
+        .map_err(|error| AppError::BadRequest(format!("Models.dev request failed: {error}")))?
+        .error_for_status()
+        .map_err(|error| AppError::BadRequest(format!("Models.dev request failed: {error}")))?;
+    let catalog: serde_json::Value = response.json().await.map_err(|error| {
+        AppError::BadRequest(format!("Models.dev response is invalid: {error}"))
+    })?;
+    Ok(Json(parse_model_source_catalog(&catalog)?))
+}
+
+pub async fn get_model_source_logo(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(provider): Path<String>,
+) -> Result<Response, AppError> {
+    check_admin(&state, &headers)?;
+    if provider.len() > 80
+        || provider.is_empty()
+        || !provider
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(AppError::BadRequest(
+            "Invalid models.dev provider ID".into(),
+        ));
+    }
+    let cache = MODEL_SOURCE_LOGOS.get_or_init(|| tokio::sync::RwLock::new(HashMap::new()));
+    if let Some(svg) = cache.read().await.get(&provider).cloned() {
+        return Ok(model_source_logo_response(svg));
+    }
+
+    let url = format!("https://models.dev/logos/{provider}.svg");
+    let response = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|error| AppError::Internal(error.to_string()))?
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| {
+            AppError::BadRequest(format!("Models.dev logo request failed: {error}"))
+        })?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(AppError::NotFound(format!(
+            "Models.dev logo for '{provider}' not found"
+        )));
+    }
+    let svg = response
+        .error_for_status()
+        .map_err(|error| AppError::BadRequest(format!("Models.dev logo request failed: {error}")))?
+        .bytes()
+        .await
+        .map_err(|error| AppError::BadRequest(format!("Models.dev logo is invalid: {error}")))?
+        .to_vec();
+    if svg.len() > 128 * 1024
+        || !std::str::from_utf8(&svg)
+            .map(str::trim_start)
+            .is_ok_and(|text| text.starts_with("<svg") || text.starts_with("<?xml"))
+    {
+        return Err(AppError::BadRequest("Models.dev logo is not SVG".into()));
+    }
+    cache.write().await.insert(provider, svg.clone());
+    Ok(model_source_logo_response(svg))
+}
+
+fn model_source_logo_response(svg: Vec<u8>) -> Response {
+    let mut response = Response::new(axum::body::Body::from(svg));
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("image/svg+xml"),
+    );
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("private, max-age=86400"),
+    );
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        axum::http::HeaderValue::from_static(
+            "sandbox; default-src 'none'; style-src 'unsafe-inline'",
+        ),
+    );
+    response
+}
+
+fn parse_model_source_catalog(catalog: &serde_json::Value) -> Result<ModelSourceCatalog, AppError> {
+    let source_providers = catalog.as_object().ok_or_else(|| {
+        AppError::BadRequest("Models.dev response has no provider catalog".into())
+    })?;
+    let mut providers = Vec::with_capacity(source_providers.len());
+    let mut results = Vec::new();
+    for (provider_id, provider) in source_providers {
+        let Some(models) = provider
+            .get("models")
+            .and_then(serde_json::Value::as_object)
+        else {
+            continue;
+        };
+        providers.push(ModelSourceProvider {
+            id: provider_id.clone(),
+            name: provider
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(provider_id)
+                .to_string(),
+            model_count: models.len(),
+        });
+        for (id, model) in models {
+            let name = model
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(id);
+            results.push(ModelSourceResult {
+                id: id.clone(),
+                name: name.to_string(),
+                description: model
+                    .get("description")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                provider: provider_id.clone(),
+                context_window: model
+                    .pointer("/limit/context")
+                    .and_then(serde_json::Value::as_u64),
+                last_updated: model
+                    .get("last_updated")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+            });
+        }
+    }
+    providers.sort_by_key(|provider| provider.name.to_lowercase());
+    results.sort_by(|left, right| {
+        right
+            .last_updated
+            .cmp(&left.last_updated)
+            .then_with(|| left.provider.cmp(&right.provider))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(ModelSourceCatalog {
+        providers,
+        models: results,
+    })
+}
+
+#[cfg(test)]
+mod model_source_tests {
+    use super::parse_model_source_catalog;
+
+    #[test]
+    fn groups_provider_names_and_keeps_all_models_for_client_side_filtering() {
+        let source = serde_json::json!({
+            "openai": {
+                "name": "OpenAI",
+                "models": {
+                    "gpt-4o": {"name": "GPT-4o", "limit": {"context": 128000}, "last_updated": "2024-05-13"},
+                    "gpt-mini": {"name": "GPT Mini"}
+                }
+            },
+            "anthropic": {"name": "Anthropic", "models": {"claude": {"name": "Claude", "last_updated": "2025-01-01"}}}
+        });
+        let catalog = parse_model_source_catalog(&source).unwrap();
+        assert_eq!(catalog.providers.len(), 2);
+        assert_eq!(catalog.providers[1].name, "OpenAI");
+        assert_eq!(catalog.providers[1].model_count, 2);
+        assert_eq!(catalog.models.len(), 3);
+        assert_eq!(catalog.models[0].id, "claude");
+        let gpt = catalog
+            .models
+            .iter()
+            .find(|model| model.id == "gpt-4o")
+            .unwrap();
+        assert_eq!(gpt.context_window, Some(128_000));
+        assert_eq!(gpt.provider, "openai");
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CreateAliasPayload {
     pub alias: String,
@@ -1232,6 +1610,21 @@ pub async fn create_alias(
     state
         .config_service
         .update(|config| {
+            if config.model_catalog_enabled {
+                if provider_name.is_some() {
+                    anyhow::bail!("Provider-scoped aliases are unavailable while the platform model catalog is enabled");
+                }
+                let target = config
+                    .model_catalog
+                    .iter()
+                    .position(|model| model.name == target_model)
+                    .ok_or_else(|| anyhow::anyhow!("Platform model '{}' not found", target_model))?;
+                for model in &mut config.model_catalog {
+                    model.aliases.retain(|alias| alias != &alias_name);
+                }
+                config.model_catalog[target].aliases.push(alias_name.clone());
+                return Ok(());
+            }
             if let Some(provider_name) = &provider_name {
                 let provider = config
                     .providers
@@ -1297,6 +1690,18 @@ pub async fn delete_alias(
     state
         .config_service
         .update(|config| {
+            if config.model_catalog_enabled {
+                let mut removed = false;
+                for model in &mut config.model_catalog {
+                    let before = model.aliases.len();
+                    model.aliases.retain(|item| item != &alias);
+                    removed |= before != model.aliases.len();
+                }
+                if !removed {
+                    anyhow::bail!("Alias '{}' not found", alias);
+                }
+                return Ok(());
+            }
             let mut removed = false;
             for provider in &mut config.providers {
                 for model in &mut provider.models {
@@ -1439,6 +1844,8 @@ pub async fn delete_pricing_rule(
 
 #[derive(Debug, Deserialize)]
 pub struct QueryLogsQuery {
+    #[serde(flatten)]
+    pub selection: SelectionQuery,
     pub from: Option<String>,
     pub to: Option<String>,
     pub api_key_id: Option<String>,
@@ -1466,6 +1873,7 @@ pub struct RequestLogView {
     #[serde(flatten)]
     pub log: crate::store::models::DbRequestLog,
     pub key_display_name: String,
+    pub logo_url: Option<String>,
     pub retry_count: u32,
 }
 
@@ -1473,9 +1881,13 @@ fn request_log_view(
     snapshot: &crate::config_service::ConfigSnapshot,
     log: crate::store::models::DbRequestLog,
 ) -> RequestLogView {
+    let logo_url = snapshot
+        .model_logo_url(&log.provider_name, &log.model)
+        .map(str::to_owned);
     let key_display_name = snapshot.auth_key_display_name(&log.api_key_id).to_string();
     let retry_count = u32::try_from(log.retry_count).unwrap_or(0);
     RequestLogView {
+        logo_url,
         log,
         key_display_name,
         retry_count,
@@ -1491,6 +1903,7 @@ pub async fn list_request_logs(
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
     let offset = query.offset.unwrap_or(0).max(0);
     let filter = crate::store::models::RequestLogFilter {
+        selection: query.selection.resolve(&state.config_service.snapshot())?,
         from: query.from,
         to: query.to,
         api_key_id: query.api_key_id,
@@ -1529,7 +1942,10 @@ pub struct LogDetailResponse {
 
 fn body_bytes_to_json(bytes: Option<&[u8]>) -> Option<serde_json::Value> {
     let b = bytes?;
-    serde_json::from_slice(b).ok()
+    Some(
+        serde_json::from_slice(b)
+            .unwrap_or_else(|_| serde_json::Value::String(String::from_utf8_lossy(b).into_owned())),
+    )
 }
 
 pub async fn get_request_log_detail(
@@ -1556,4 +1972,25 @@ pub async fn get_request_log_detail(
         request_body,
         response_body,
     }))
+}
+
+#[cfg(test)]
+mod log_body_tests {
+    use super::body_bytes_to_json;
+
+    #[test]
+    fn log_detail_preserves_json_and_stream_bodies() {
+        assert_eq!(
+            body_bytes_to_json(Some(br#"{"choices":[]}"#)),
+            Some(serde_json::json!({"choices":[]}))
+        );
+        let sse = b"data: {\"choices\":[]}\n\ndata: [DONE]\n";
+        assert_eq!(
+            body_bytes_to_json(Some(sse)),
+            Some(serde_json::Value::String(
+                String::from_utf8_lossy(sse).into_owned()
+            ))
+        );
+        assert_eq!(body_bytes_to_json(None), None);
+    }
 }

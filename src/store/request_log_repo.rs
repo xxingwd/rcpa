@@ -406,7 +406,47 @@ impl Store {
     }
 }
 
+pub(super) fn append_log_selection(
+    query: &mut QueryBuilder<'_, Sqlite>,
+    selection: &super::models::LogSelection,
+) {
+    if selection.restrict_models && selection.model_routes.is_empty() {
+        query.push(" AND 0");
+    }
+    if !selection.model_routes.is_empty() {
+        query.push(" AND (");
+        for (index, (provider, model)) in selection.model_routes.iter().enumerate() {
+            if index > 0 {
+                query.push(" OR ");
+            }
+            query
+                .push("(l.provider_name = ")
+                .push_bind(provider.clone())
+                .push(" AND l.model = ")
+                .push_bind(model.clone())
+                .push(")");
+        }
+        query.push(")");
+    }
+    for (column, values) in [
+        ("l.provider_name", &selection.providers),
+        ("l.api_key_id", &selection.keys),
+        ("l.protocol", &selection.protocols),
+    ] {
+        if values.is_empty() {
+            continue;
+        }
+        query.push(" AND ").push(column).push(" IN (");
+        let mut separated = query.separated(", ");
+        for value in values {
+            separated.push_bind(value.clone());
+        }
+        query.push(")");
+    }
+}
+
 fn append_request_log_filters(query: &mut QueryBuilder<'_, Sqlite>, filter: &RequestLogFilter) {
+    append_log_selection(query, &filter.selection);
     if let Some(from) = &filter.from {
         query.push(" AND l.created_at >= ").push_bind(from.clone());
     }

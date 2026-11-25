@@ -49,7 +49,7 @@ impl OpenAIProvider {
         TokenUsage::from_openai_body(body)
     }
 
-    fn build_header_map(&self) -> reqwest::header::HeaderMap {
+    fn build_header_map(&self, req: &ProxyRequest) -> reqwest::header::HeaderMap {
         let map = self
             .headers
             .iter()
@@ -62,6 +62,10 @@ impl OpenAIProvider {
                 }
                 map
             });
+        let mut map = super::headers::merge_request_headers(&req.headers, map);
+        if req.operation == crate::protocol::common::Operation::Responses {
+            super::headers::ensure_codex_identity(&mut map);
+        }
         map
     }
 
@@ -101,7 +105,7 @@ impl OpenAIProvider {
     }
 
     fn request_builder(&self, req: &ProxyRequest) -> AppResult<reqwest::RequestBuilder> {
-        let mut headers = self.build_header_map();
+        let mut headers = self.build_header_map(req);
         let request = self.client.post(self.resolve_url(&req.operation)?);
 
         let Some(multipart) = &req.multipart else {
@@ -369,6 +373,7 @@ mod tests {
                 "messages": [{ "role": "user", "content": "hi" }]
             }),
             multipart: None,
+            headers: Default::default(),
             stream: true,
         };
 
@@ -400,7 +405,16 @@ mod tests {
         .unwrap();
 
         assert!(!provider
-            .build_header_map()
+            .build_header_map(&ProxyRequest {
+                id: Uuid::new_v4(),
+                protocol: Protocol::Completions,
+                operation: Operation::Completions,
+                model: "gpt-4o".into(),
+                body: serde_json::json!({}),
+                multipart: None,
+                headers: Default::default(),
+                stream: false,
+            })
             .contains_key(reqwest::header::HOST));
     }
 }

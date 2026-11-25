@@ -1,5 +1,6 @@
 pub mod anthropic;
 pub mod client;
+pub(crate) mod headers;
 pub mod openai;
 
 use std::collections::HashMap;

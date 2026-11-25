@@ -300,37 +300,73 @@ impl ConfigSnapshot {
     ) -> (Vec<ModelEndpoint>, HashMap<String, Vec<ModelEndpoint>>) {
         let mut global: Vec<ModelEndpoint> = Vec::new();
 
-        for provider in &config.providers {
-            if !provider.is_enabled() || !provider.has_enabled_endpoint() {
-                continue;
+        if config.model_catalog_enabled {
+            for model in config
+                .model_catalog
+                .iter()
+                .filter(|model| model.is_enabled())
+            {
+                let target = model.route_to.as_deref().unwrap_or(&model.name);
+                for provider in config
+                    .providers
+                    .iter()
+                    .filter(|provider| provider.has_enabled_endpoint())
+                {
+                    let adapter_kind = provider_adapter_kind(provider);
+                    for rule in provider.models.iter().filter(|rule| {
+                        rule.is_enabled()
+                            && rule.platform_model.as_deref().unwrap_or(&rule.name) == target
+                    }) {
+                        for endpoint in &provider.endpoints {
+                            for public_name in model.public_names() {
+                                global.push(ModelEndpoint {
+                                    alias_name: public_name,
+                                    name: rule.name.clone(),
+                                    provider_name: provider.name.clone(),
+                                    priority: provider.priority,
+                                    protocol: endpoint.protocol,
+                                    base_url: endpoint.base_url.clone(),
+                                    adapter_kind,
+                                    is_passthrough: false,
+                                });
+                            }
+                        }
+                    }
+                }
             }
-            let adapter_kind = provider_adapter_kind(provider);
-            for endpoint in &provider.endpoints {
-                for model in provider.models.iter().filter(|m| m.is_enabled()) {
-                    for public_name in model.public_names() {
+        } else {
+            for provider in &config.providers {
+                if !provider.is_enabled() || !provider.has_enabled_endpoint() {
+                    continue;
+                }
+                let adapter_kind = provider_adapter_kind(provider);
+                for endpoint in &provider.endpoints {
+                    for model in provider.models.iter().filter(|m| m.is_enabled()) {
+                        for public_name in model.public_names() {
+                            global.push(ModelEndpoint {
+                                alias_name: public_name,
+                                name: model.name.clone(),
+                                provider_name: provider.name.clone(),
+                                priority: provider.priority,
+                                protocol: endpoint.protocol,
+                                base_url: endpoint.base_url.clone(),
+                                adapter_kind,
+                                is_passthrough: false,
+                            });
+                        }
+                    }
+                    if provider.model_passthrough {
                         global.push(ModelEndpoint {
-                            alias_name: public_name,
-                            name: model.name.clone(),
+                            alias_name: "*".to_string(),
+                            name: String::new(),
                             provider_name: provider.name.clone(),
                             priority: provider.priority,
                             protocol: endpoint.protocol,
                             base_url: endpoint.base_url.clone(),
                             adapter_kind,
-                            is_passthrough: false,
+                            is_passthrough: true,
                         });
                     }
-                }
-                if provider.model_passthrough {
-                    global.push(ModelEndpoint {
-                        alias_name: "*".to_string(),
-                        name: String::new(),
-                        provider_name: provider.name.clone(),
-                        priority: provider.priority,
-                        protocol: endpoint.protocol,
-                        base_url: endpoint.base_url.clone(),
-                        adapter_kind,
-                        is_passthrough: true,
-                    });
                 }
             }
         }
@@ -398,6 +434,18 @@ impl ConfigSnapshot {
 
     pub fn aliases(&self) -> Vec<AliasView> {
         let mut values = Vec::new();
+        if self.raw_config.model_catalog_enabled {
+            for model in &self.raw_config.model_catalog {
+                for alias in &model.aliases {
+                    values.push(AliasView {
+                        alias: alias.clone(),
+                        target_model: model.name.clone(),
+                        provider_name: None,
+                    });
+                }
+            }
+            return values;
+        }
         for provider in &self.raw_config.providers {
             for model in &provider.models {
                 for alias in &model.aliases {
@@ -410,6 +458,28 @@ impl ConfigSnapshot {
             }
         }
         values
+    }
+
+    /// Resolve presentation metadata from a provider's real model identity.
+    pub fn model_logo_url(&self, provider_name: &str, model_name: &str) -> Option<&str> {
+        let target = self
+            .raw_config
+            .providers
+            .iter()
+            .find(|provider| provider.name == provider_name)
+            .and_then(|provider| {
+                provider
+                    .models
+                    .iter()
+                    .find(|model| model.name == model_name)
+            })
+            .and_then(|model| model.platform_model.as_deref())
+            .unwrap_or(model_name);
+        self.raw_config
+            .model_catalog
+            .iter()
+            .find(|model| model.name == target || model.aliases.iter().any(|alias| alias == target))
+            .and_then(|model| model.logo_url.as_deref())
     }
 
     pub fn find_provider(&self, name: &str) -> Option<&ProviderConfig> {
@@ -519,8 +589,85 @@ impl ConfigSnapshot {
             .unwrap_or(false)
     }
 
+    /// Analytics keeps configured names available even when a provider or model is disabled.
+    pub fn analytics_model_routes(&self) -> HashMap<String, Vec<(String, String)>> {
+        let mut routes = HashMap::<String, Vec<(String, String)>>::new();
+        if self.raw_config.model_catalog_enabled {
+            for model in &self.raw_config.model_catalog {
+                let target = model.route_to.as_deref().unwrap_or(&model.name);
+                let bindings: Vec<_> = self
+                    .raw_config
+                    .providers
+                    .iter()
+                    .flat_map(|provider| {
+                        provider
+                            .models
+                            .iter()
+                            .filter(move |rule| {
+                                rule.platform_model.as_deref().unwrap_or(&rule.name) == target
+                            })
+                            .map(|rule| (provider.name.clone(), rule.name.clone()))
+                    })
+                    .collect();
+                for name in model.public_names() {
+                    routes
+                        .entry(name)
+                        .or_default()
+                        .extend(bindings.iter().cloned());
+                }
+            }
+        } else {
+            for provider in &self.raw_config.providers {
+                for model in &provider.models {
+                    for name in model.public_names() {
+                        routes
+                            .entry(name)
+                            .or_default()
+                            .push((provider.name.clone(), model.name.clone()));
+                    }
+                }
+            }
+        }
+        routes
+    }
+
     pub fn model_catalog(&self) -> Vec<ModelCatalogEntry> {
         let mut values = Vec::new();
+        if self.raw_config.model_catalog_enabled {
+            let mut seen = HashSet::new();
+            for model in self
+                .raw_config
+                .model_catalog
+                .iter()
+                .filter(|model| model.is_enabled())
+            {
+                for public_name in model.public_names() {
+                    for endpoint in self
+                        .model_endpoints
+                        .iter()
+                        .filter(|endpoint| endpoint.alias_name == public_name)
+                    {
+                        if !seen.insert((public_name.clone(), endpoint.provider_name.clone())) {
+                            continue;
+                        }
+                        values.push(ModelCatalogEntry {
+                            name: public_name.clone(),
+                            kind: "model".to_string(),
+                            provider_name: Some(endpoint.provider_name.clone()),
+                            protocols: self
+                                .find_provider(&endpoint.provider_name)
+                                .map(ProviderConfig::supported_protocols)
+                                .unwrap_or_default(),
+                            target_model: Some(endpoint.name.clone()),
+                            model_name: model.name.clone(),
+                            aliases: model.aliases.clone(),
+                            selectable_names: vec![public_name.clone()],
+                        });
+                    }
+                }
+            }
+            return values;
+        }
         for provider in &self.raw_config.providers {
             if !provider.is_enabled() || !provider.has_enabled_endpoint() {
                 continue;
@@ -554,13 +701,38 @@ impl ConfigSnapshot {
         &self,
         provider_name: &str,
         model_name: &str,
+        public_name: &str,
     ) -> Option<ModelPricing> {
+        let catalog_model = if self.config.model_catalog_enabled {
+            self.config
+                .model_catalog
+                .iter()
+                .find(|model| model.public_names().iter().any(|name| name == public_name))
+        } else {
+            None
+        };
+        let target = catalog_model.map(|model| model.route_to.as_deref().unwrap_or(&model.name));
         self.find_provider(provider_name).and_then(|provider| {
             provider
                 .models
                 .iter()
-                .find(|rule| rule.name == model_name)
-                .and_then(|rule| rule.pricing.clone())
+                .find(|rule| {
+                    rule.name == model_name
+                        && target.is_none_or(|name| {
+                            rule.platform_model.as_deref().unwrap_or(&rule.name) == name
+                        })
+                })
+                .and_then(|rule| {
+                    rule.pricing.clone().or_else(|| {
+                        target.and_then(|name| {
+                            self.config
+                                .model_catalog
+                                .iter()
+                                .find(|model| model.name == name)
+                                .and_then(|model| model.pricing.clone())
+                        })
+                    })
+                })
         })
     }
 }
@@ -610,8 +782,8 @@ fn auth_key_view(key: &AuthKey) -> AuthKeyView {
 mod tests {
     use super::*;
     use crate::config::{
-        AppConfig, CostConfig, EndpointConfig, ModelRule, ProviderConfig, RetryConfig,
-        RoutingConfig, StickyConfig, UpstreamConfig,
+        AppConfig, CostConfig, EndpointConfig, ModelRule, PlatformModel, ProviderConfig,
+        RetryConfig, RoutingConfig, StickyConfig, UpstreamConfig,
     };
 
     fn test_config(provider_name: &str) -> AppConfig {
@@ -630,6 +802,8 @@ mod tests {
                 reasoning_effort_map: Default::default(),
                 model_passthrough: false,
             }],
+            model_catalog: vec![],
+            model_catalog_enabled: false,
             upstream: UpstreamConfig { timeout_secs: 30 },
             routing: RoutingConfig {
                 sticky: StickyConfig::default(),
@@ -700,5 +874,122 @@ mod tests {
         let snapshot = ConfigSnapshot::build(config).unwrap();
         assert!(snapshot.endpoints_for_alias("gpt-4o", None).is_empty());
         assert_eq!(snapshot.endpoints_for_alias("public-gpt", None).len(), 1);
+    }
+
+    #[test]
+    fn model_logo_follows_explicit_provider_binding() {
+        let mut config = test_config("provider-a");
+        config.providers[0].models[0].platform_model = Some("platform-model".into());
+        config.model_catalog.push(
+            serde_json::from_value(serde_json::json!({
+                "name":"platform-model", "logo_url":"https://example.com/color.svg"
+            }))
+            .unwrap(),
+        );
+        let snapshot = ConfigSnapshot::build(config).unwrap();
+        assert_eq!(
+            snapshot.model_logo_url("provider-a", "gpt-4o"),
+            Some("https://example.com/color.svg")
+        );
+        assert_eq!(snapshot.model_logo_url("provider-a", "missing"), None);
+    }
+
+    #[test]
+    fn catalog_routes_public_aliases_to_real_provider_ids() {
+        let mut config = test_config("provider-a");
+        config.providers[0].models[0].aliases = vec!["legacy-name".into()];
+        let mut second = config.providers[0].clone();
+        second.name = "provider-b".into();
+        second.models = vec![ModelRule {
+            platform_model: Some("gpt-4o".into()),
+            ..ModelRule::enabled("deployment-42")
+        }];
+        config.providers.push(second);
+        config.model_catalog = vec![
+            PlatformModel {
+                name: "gpt-4o".into(),
+                display_name: "GPT-4o".into(),
+                description: String::new(),
+                aliases: vec!["smart".into()],
+                route_to: None,
+                context_window: Some(128_000),
+                logo_url: None,
+                pricing: Some(ModelPricing {
+                    input_per_1k: 0.01,
+                    output_per_1k: 0.02,
+                }),
+                source: None,
+                source_updated_at: None,
+                status: "enabled".into(),
+            },
+            PlatformModel {
+                name: "old-chat".into(),
+                display_name: String::new(),
+                description: String::new(),
+                aliases: Vec::new(),
+                route_to: Some("gpt-4o".into()),
+                context_window: None,
+                logo_url: None,
+                pricing: None,
+                source: None,
+                source_updated_at: None,
+                status: "enabled".into(),
+            },
+        ];
+        config.model_catalog_enabled = true;
+
+        let snapshot = ConfigSnapshot::build(config).unwrap();
+        assert!(snapshot.endpoints_for_alias("gpt-4o", None).is_empty());
+        assert!(snapshot.endpoints_for_alias("legacy-name", None).is_empty());
+        let matched = snapshot.endpoints_for_alias("smart", None);
+        assert_eq!(matched.len(), 2);
+        assert!(matched.iter().any(|endpoint| endpoint.name == "gpt-4o"));
+        assert!(matched
+            .iter()
+            .any(|endpoint| endpoint.name == "deployment-42"));
+        assert_eq!(snapshot.endpoints_for_alias("old-chat", None).len(), 2);
+        assert_eq!(
+            snapshot
+                .provider_model_pricing("provider-b", "deployment-42", "old-chat")
+                .unwrap()
+                .input_per_1k,
+            0.01
+        );
+        assert_eq!(
+            snapshot.key_visible_model_names(),
+            ["smart".to_string(), "old-chat".to_string()].into()
+        );
+    }
+
+    #[test]
+    fn catalog_rejects_unresolvable_routes_and_bindings() {
+        let mut config = test_config("provider-a");
+        config.model_catalog_enabled = true;
+        config.model_catalog = vec![PlatformModel {
+            name: "gpt-4o".into(),
+            display_name: String::new(),
+            description: String::new(),
+            aliases: vec!["smart".into()],
+            route_to: Some("missing".into()),
+            context_window: None,
+            logo_url: None,
+            pricing: None,
+            source: None,
+            source_updated_at: None,
+            status: "enabled".into(),
+        }];
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("unknown model"));
+
+        config.model_catalog[0].route_to = None;
+        config.providers[0].models[0].platform_model = Some("missing".into());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("binds unknown"));
     }
 }

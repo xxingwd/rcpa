@@ -50,7 +50,10 @@ impl AnthropicProvider {
         TokenUsage::from_anthropic_body(body)
     }
 
-    fn build_header_map(&self) -> reqwest::header::HeaderMap {
+    fn build_header_map(
+        &self,
+        incoming: &reqwest::header::HeaderMap,
+    ) -> reqwest::header::HeaderMap {
         let map = self
             .headers
             .iter()
@@ -63,7 +66,7 @@ impl AnthropicProvider {
                 }
                 map
             });
-        map
+        super::headers::merge_request_headers(incoming, map)
     }
 
     fn rewrite_model_in_body(&self, req: &ProxyRequest) -> serde_json::Value {
@@ -88,7 +91,7 @@ impl ProviderAdapter for AnthropicProvider {
             let _in_flight = super::InFlightGuard::new(&self.in_flight);
             self.client
                 .post(&url)
-                .headers(self.build_header_map())
+                .headers(self.build_header_map(&req.headers))
                 .json(&body)
                 .send()
                 .await
@@ -144,7 +147,7 @@ impl ProviderAdapter for AnthropicProvider {
             let _in_flight = super::InFlightGuard::new(&self.in_flight);
             self.client
                 .post(&url)
-                .headers(self.build_header_map())
+                .headers(self.build_header_map(&req.headers))
                 .json(&body)
                 .send()
                 .await
@@ -270,7 +273,7 @@ mod tests {
         .unwrap();
 
         assert!(!provider
-            .build_header_map()
+            .build_header_map(&Default::default())
             .contains_key(reqwest::header::HOST));
     }
 }

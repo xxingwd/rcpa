@@ -87,9 +87,20 @@ pub struct TotalStats {
     pub error_count: i64,
 }
 
+/// Multiple values within a dimension are OR-ed; dimensions are AND-ed.
+#[derive(Debug, Clone, Default)]
+pub struct LogSelection {
+    pub restrict_models: bool,
+    pub model_routes: Vec<(String, String)>,
+    pub providers: Vec<String>,
+    pub keys: Vec<String>,
+    pub protocols: Vec<String>,
+}
+
 /// Filters for querying request logs.
 #[derive(Debug, Clone, Default)]
 pub struct RequestLogFilter {
+    pub selection: LogSelection,
     pub from: Option<String>,
     pub to: Option<String>,
     pub api_key_id: Option<String>,

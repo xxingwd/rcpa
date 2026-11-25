@@ -426,6 +426,8 @@ mod tests {
     fn test_config() -> AppConfig {
         AppConfig {
             providers: vec![test_provider("provider-a"), test_provider("provider-b")],
+            model_catalog: vec![],
+            model_catalog_enabled: false,
             upstream: UpstreamConfig { timeout_secs: 30 },
             routing: RoutingConfig {
                 sticky: StickyConfig::default(),
@@ -547,6 +549,8 @@ mod tests {
                 test_provider_with_priority("provider-a", 10),
                 test_provider_with_priority("provider-b", 1),
             ],
+            model_catalog: vec![],
+            model_catalog_enabled: false,
             upstream: UpstreamConfig { timeout_secs: 30 },
             routing: RoutingConfig {
                 sticky: StickyConfig::default(),
@@ -603,6 +607,8 @@ mod tests {
                 test_provider_with_priority("provider-high", 0),
                 test_provider_with_priority("provider-low", 10),
             ],
+            model_catalog: vec![],
+            model_catalog_enabled: false,
             upstream: UpstreamConfig { timeout_secs: 30 },
             routing: RoutingConfig {
                 sticky: StickyConfig::default(),

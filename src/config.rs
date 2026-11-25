@@ -11,6 +11,10 @@ pub const LOG_DIR_NAME: &str = "logs";
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
     pub providers: Vec<ProviderConfig>,
+    #[serde(default)]
+    pub model_catalog: Vec<PlatformModel>,
+    #[serde(default)]
+    pub model_catalog_enabled: bool,
     pub upstream: UpstreamConfig,
     pub routing: RoutingConfig,
     pub retry: RetryConfig,
@@ -119,6 +123,48 @@ pub struct ModelRule {
     pub status: String,
     pub pricing: Option<ModelPricing>,
     pub aliases: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform_model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlatformModel {
+    pub name: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logo_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<ModelPricing>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_updated_at: Option<String>,
+    #[serde(default = "default_status")]
+    pub status: String,
+}
+
+impl PlatformModel {
+    pub fn is_enabled(&self) -> bool {
+        self.status == "enabled"
+    }
+
+    pub fn public_names(&self) -> Vec<String> {
+        if self.aliases.is_empty() {
+            vec![self.name.clone()]
+        } else {
+            self.aliases.clone()
+        }
+    }
 }
 
 impl ModelRule {
@@ -128,6 +174,7 @@ impl ModelRule {
             status: default_status(),
             pricing: None,
             aliases: Vec::new(),
+            platform_model: None,
         }
     }
 
@@ -373,6 +420,8 @@ impl AppConfig {
     fn bootstrap_config() -> Self {
         Self {
             providers: Vec::new(),
+            model_catalog: Vec::new(),
+            model_catalog_enabled: false,
             upstream: UpstreamConfig { timeout_secs: 300 },
             routing: RoutingConfig {
                 sticky: StickyConfig {
@@ -398,6 +447,25 @@ impl AppConfig {
     }
 
     pub fn key_visible_model_names(&self) -> HashSet<String> {
+        if self.model_catalog_enabled {
+            return self
+                .model_catalog
+                .iter()
+                .filter(|model| model.is_enabled())
+                .filter(|model| {
+                    let target = model.route_to.as_deref().unwrap_or(&model.name);
+                    self.providers.iter().any(|provider| {
+                        provider.has_enabled_endpoint()
+                            && provider.models.iter().any(|rule| {
+                                rule.is_enabled()
+                                    && rule.platform_model.as_deref().unwrap_or(&rule.name)
+                                        == target
+                            })
+                    })
+                })
+                .flat_map(PlatformModel::public_names)
+                .collect();
+        }
         let mut names = HashSet::new();
         for provider in self
             .providers
@@ -483,6 +551,73 @@ impl AppConfig {
         validate_retry_config(&self.retry)?;
         validate_cost_config(&self.cost)?;
 
+        let mut catalog_ids = HashSet::new();
+        let mut public_names = HashSet::new();
+        for model in &self.model_catalog {
+            validate_model_name(&model.name, "platform model")?;
+            if model.name.contains('*') || !catalog_ids.insert(model.name.as_str()) {
+                anyhow::bail!("Invalid or duplicate platform model '{}'", model.name);
+            }
+            match model.status.as_str() {
+                "enabled" | "disabled" => {}
+                other => anyhow::bail!(
+                    "Platform model '{}' has invalid status '{}'",
+                    model.name,
+                    other
+                ),
+            }
+            if let Some(pricing) = &model.pricing {
+                validate_pricing(pricing, &format!("Platform model '{}'", model.name))?;
+            }
+            if let Some(logo) = &model.logo_url {
+                let url = reqwest::Url::parse(logo).map_err(|_| {
+                    anyhow::anyhow!("Platform model '{}' has invalid logo URL", model.name)
+                })?;
+                if !matches!(url.scheme(), "http" | "https")
+                    || url.host_str().is_none()
+                    || !url.username().is_empty()
+                    || url.password().is_some()
+                    || logo.trim() != logo
+                {
+                    anyhow::bail!("Platform model '{}' logo URL must be an HTTP(S) image URL without credentials", model.name);
+                }
+            }
+            if model.context_window == Some(0) {
+                anyhow::bail!("Platform model '{}' has zero context window", model.name);
+            }
+            for name in std::iter::once(&model.name).chain(model.aliases.iter()) {
+                validate_model_name(name, "platform model public name")?;
+                if name.contains('*') || !public_names.insert(name.as_str()) {
+                    anyhow::bail!("Duplicate or invalid platform model name '{}'", name);
+                }
+            }
+        }
+        for model in &self.model_catalog {
+            if let Some(target) = &model.route_to {
+                let target_model = self
+                    .model_catalog
+                    .iter()
+                    .find(|candidate| candidate.name == *target)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Platform model '{}' routes to unknown model '{}'",
+                            model.name,
+                            target
+                        )
+                    })?;
+                if target == &model.name
+                    || target_model.route_to.is_some()
+                    || !target_model.is_enabled()
+                {
+                    anyhow::bail!(
+                        "Platform model '{}' has invalid route target '{}'",
+                        model.name,
+                        target
+                    );
+                }
+            }
+        }
+
         let mut seen_names = HashSet::new();
         for provider in &self.providers {
             validate_provider_config(provider)?;
@@ -491,6 +626,16 @@ impl AppConfig {
             }
             for model in &provider.models {
                 validate_model_name(&model.name, "provider model")?;
+                if let Some(target) = &model.platform_model {
+                    if !catalog_ids.contains(target.as_str()) {
+                        anyhow::bail!(
+                            "Provider '{}' model '{}' binds unknown platform model '{}'",
+                            provider.name,
+                            model.name,
+                            target
+                        );
+                    }
+                }
                 match model.status.as_str() {
                     "enabled" | "disabled" => {}
                     other => anyhow::bail!(
@@ -629,6 +774,20 @@ fn validate_model_name(value: &str, field: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn validate_provider_name(value: &str) -> anyhow::Result<()> {
+    validate_model_name(value, "provider name")?;
+    let mut chars = value.chars();
+    if value.chars().count() > 64
+        || !chars.next().is_some_and(char::is_alphanumeric)
+        || !chars.all(|ch| ch.is_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+    {
+        anyhow::bail!(
+            "provider name must be 1-64 characters, start with a letter or digit, and contain only letters, digits, '.', '_' or '-'"
+        );
+    }
+    Ok(())
+}
+
 fn validate_upstream_config(upstream: &UpstreamConfig) -> anyhow::Result<()> {
     if upstream.timeout_secs == 0 {
         anyhow::bail!("Upstream timeout_secs must be greater than 0");
@@ -679,7 +838,7 @@ fn validate_cost_config(cost: &CostConfig) -> anyhow::Result<()> {
 }
 
 fn validate_provider_config(provider: &ProviderConfig) -> anyhow::Result<()> {
-    validate_model_name(&provider.name, "provider name")?;
+    validate_provider_name(&provider.name)?;
     match provider.status.as_str() {
         "enabled" | "disabled" => {}
         other => anyhow::bail!(
@@ -751,11 +910,11 @@ fn validate_provider_config(provider: &ProviderConfig) -> anyhow::Result<()> {
 }
 
 fn validate_pricing(pricing: &ModelPricing, owner: &str) -> anyhow::Result<()> {
-    if pricing.input_per_1k < 0.0 {
-        anyhow::bail!("{} input price must be non-negative", owner);
+    if !pricing.input_per_1k.is_finite() || pricing.input_per_1k < 0.0 {
+        anyhow::bail!("{} input price must be finite and non-negative", owner);
     }
-    if pricing.output_per_1k < 0.0 {
-        anyhow::bail!("{} output price must be non-negative", owner);
+    if !pricing.output_per_1k.is_finite() || pricing.output_per_1k < 0.0 {
+        anyhow::bail!("{} output price must be finite and non-negative", owner);
     }
     Ok(())
 }
@@ -1004,6 +1163,7 @@ keys: []
                 status: "disabled".into(),
                 pricing: None,
                 aliases: Vec::new(),
+                platform_model: None,
             }],
             model_aliases: Default::default(),
             allowed_providers: Vec::new(),
@@ -1011,6 +1171,18 @@ keys: []
             labels: None,
         };
         assert!(!AppConfig::key_can_use_model(&key, "gpt-4o"));
+    }
+
+    #[test]
+    fn test_pricing_rejects_non_finite_values() {
+        assert!(validate_pricing(
+            &ModelPricing {
+                input_per_1k: f64::NAN,
+                output_per_1k: 0.0,
+            },
+            "platform model",
+        )
+        .is_err());
     }
 
     #[test]
@@ -1166,12 +1338,14 @@ keys: []
             status: "enabled".into(),
             pricing: None,
             aliases: vec!["gpt-4o-public-a".into()],
+            platform_model: None,
         });
         provider.models.push(ModelRule {
             name: "gpt-4o".into(),
             status: "enabled".into(),
             pricing: None,
             aliases: vec!["gpt-4o-public-b".into()],
+            platform_model: None,
         });
         config.providers.push(provider);
         config.keys.push(AuthKey {
@@ -1321,6 +1495,8 @@ keys: []
     fn test_config() -> AppConfig {
         AppConfig {
             providers: vec![],
+            model_catalog: vec![],
+            model_catalog_enabled: false,
             upstream: UpstreamConfig { timeout_secs: 300 },
             routing: RoutingConfig {
                 sticky: StickyConfig::default(),
@@ -1377,5 +1553,52 @@ keys: []
             .insert("".into(), "high".into());
         let err = validate_provider_config(&provider).unwrap_err().to_string();
         assert!(err.contains("empty key"));
+    }
+
+    #[test]
+    fn platform_model_logo_requires_an_http_image_url() {
+        let mut config = test_config();
+        let model: PlatformModel = serde_json::from_value(serde_json::json!({
+            "name": "test-model", "logo_url": "https://example.com/color.svg"
+        }))
+        .unwrap();
+        config.model_catalog.push(model);
+        assert!(config.validate().is_ok());
+        for invalid in [
+            "javascript:alert(1)",
+            "data:image/svg+xml,test",
+            "file:///tmp/icon",
+            "https://user:secret@example.com/icon",
+            " https://example.com/icon",
+        ] {
+            config.model_catalog[0].logo_url = Some(invalid.into());
+            assert!(config.validate().is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn test_provider_name_is_safe_as_a_url_path_segment() {
+        for name in [
+            "midcode",
+            "OpenAI-1",
+            "vendor_a.b",
+            "midaccs-临时分组",
+            "供应商1",
+        ] {
+            assert!(validate_provider_name(name).is_ok(), "{name}");
+        }
+        for name in [
+            "https://ai.midcode.cc/v1",
+            "a/b",
+            "a%2Fb",
+            ".",
+            "a b",
+            "a?b",
+        ] {
+            assert!(validate_provider_name(name).is_err(), "{name}");
+        }
+        assert!(validate_provider_name(&"a".repeat(65)).is_err());
+        assert!(validate_provider_name(&"供".repeat(64)).is_ok());
+        assert!(validate_provider_name(&"供".repeat(65)).is_err());
     }
 }
